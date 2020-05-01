@@ -185,7 +185,6 @@ class BangumiApi(private val client: OkHttpClient, interceptor: BangumiIntercept
         private const val clientId = "bgm10555cda0762e80ca"
         private const val clientSecret = ""
 
-        private const val baseUrl = "https://bangumi.org"
         private const val apiUrl = "https://api.bgm.tv"
         private const val oauthUrl = "https://bgm.tv/oauth/access_token"
         private const val loginUrl = "https://bgm.tv/oauth/authorize"
