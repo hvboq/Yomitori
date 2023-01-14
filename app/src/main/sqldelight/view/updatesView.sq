@@ -7,6 +7,7 @@ SELECT
     chapters.scanlator,
     chapters.read,
     chapters.bookmark,
+    chapters.last_page_read,
     mangas.source,
     mangas.favorite,
     mangas.thumbnail_url AS thumbnailUrl,
