@@ -172,7 +172,7 @@ class ShikimoriApi(private val client: OkHttpClient, interceptor: ShikimoriInter
         private const val clientId = "1aaf4cf232372708e98b5abc813d795b539c5a916dbbfe9ac61bf02a360832cc"
         private const val clientSecret = ""
 
-        private const val baseUrl = "https://shikimori.one"
+        private const val baseUrl = "https://shikimori.me"
         private const val apiUrl = "$baseUrl/api"
         private const val oauthUrl = "$baseUrl/oauth/token"
         private const val loginUrl = "$baseUrl/oauth/authorize"
