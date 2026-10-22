@@ -62,6 +62,7 @@ object StartupEnginePrewarm {
     /** ProcessLifecycleOwner 的 ON_START（使用者把 app 帶到前景）。 */
     @MainThread
     fun onForeground() {
+        Injekt.get<TranslationEngineService>().onForeground()
         controller.onForeground()
     }
 
@@ -69,6 +70,7 @@ object StartupEnginePrewarm {
     @MainThread
     fun onBackground() {
         controller.onBackground()
+        Injekt.get<TranslationEngineService>().onBackground()
     }
 
     /** MainActivity.ready 變 true（第一個分頁內容出來）。 */

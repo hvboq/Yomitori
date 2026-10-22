@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.Yakuyomi
@@ -30,7 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * 翻譯引擎的**常駐（warm）服務**（process singleton，於 [AppModule] 註冊）。
  *
  * 用途：讓整章翻（[PageTranslator.translateChapter] 逐章透過本服務）共用**同一顆**引擎實例，
- * 避免佇列一章接一章 drain 時、每章 `Yakuyomi.create(...).use { }` 都重載 ~100MB native + 重編譯 ORT 圖
+ * 避免佇列一章接一章 drain 時、每章 `Yakuyomi.create(...).use { }` 都重新載入 NCNN 模型
  * （M4 ⑦ 引擎生命週期）。即時翻譯開著時尤其關鍵：reader 連讀多章＝佇列連翻多章。
  *
  * **去字法可變**：[translatePage] 帶 `methodRaw` 參數（boxfill / auto_whole / auto_tile）。
@@ -42,10 +43,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * 淺併發（~4）達約 2× 循序速率（見 [PageTranslator] 的 pipelineDepth）。[mutex] 只序列化**引擎生命週期**
  * （建/重建/關），不再序列化每頁推論；在飛頁數由 [inFlight] 計數，關閉前等它歸零（見 [shutdown]/[shutdownBlocking]）。
  * **生命週期**：lazy 建（首次 [translatePage] 或 [warmUp] 才建、不拖 app 冷啟）；設定改了（簽章變）下次呼叫重建；
- *   **不在翻完一頁/一章後關**（這就是常駐的意義）。釋放由三個外部觸發負責（見 [shutdown]/[shutdownBlocking]）：
- *   即時翻關 / 真記憶體壓力（onTrimMemory）/ 即時翻關時佇列清空。
+ *   **不在翻完一頁/一章後關**。背景閒置 60 秒、前景閒置 5 分鐘後釋放；系統背景回收或舊版記憶體壓力訊號
+ *   提前要求釋放。即時翻關或不需保暖的佇列收尾仍可呼叫 [shutdown]。
  *
- * **記憶體**：warm 引擎在常駐期間持有 ~100MB native；上述三觸發任一發生即釋放，下次呼叫再 lazy 重建。
+ * **記憶體**：模型的實際常駐成本依後端、執行設定及裝置而異，不能以模型檔案大小估計。
+ * 釋放只在所有已登記的操作結束後進行；新操作可取消過時的閒置決定，下次需要時 lazy 重建。
  */
 class TranslationEngineService(private val context: Context) {
 
@@ -63,13 +65,17 @@ class TranslationEngineService(private val context: Context) {
     /**
      * 目前這個 build 是否已完成過**至少一次**推論（各原生 session 的首次 lazy 初始化都在單緒跑過了）。
      * false＝冷引擎（剛建好、還沒推論過）→ 第一頁**持鎖單緒**跑完再放行併發，避免多頁同時打進未初始化的
-     * NCNN/ORT session → 原生 SIGSEGV（「開 app 後第一本翻譯就閃退」的真凶）。重建（[closeEngine]）會重置成 false。
+     * NCNN session → 原生 SIGSEGV（「開 app 後第一本翻譯就閃退」的真凶）。重建（[closeEngine]）會重置成 false。
      * 只在 [mutex] 下讀寫。
      */
     private var warmedUp = false
 
-    /** 暖機/關閉的背景 scope（IO）：給 UI（即時翻開關）fire-and-forget，**絕不**在主執行緒上跑 ~100MB 載入/關閉或等鎖（會 ANR）。 */
+    /** Warmup/release always use IO; main-thread lifecycle callbacks never close native models. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val idleRelease: IdleModelReleaseController = IdleModelReleaseController(scope, release = { request ->
+        scope.launch { releaseRequestedEngine(request) }
+    })
 
     /** 常駐引擎（lazy 建、跨頁/章復用）。null＝還沒建或已 [shutdown]。只在 [mutex] 下讀寫。 */
     private var engine: TranslationEngine? = null
@@ -77,7 +83,7 @@ class TranslationEngineService(private val context: Context) {
     /** 上次建引擎時的設定簽章（含去字法）；與當前簽章不同 → 設定/去字法改過 → 重建。只在 [mutex] 下讀寫。 */
     private var builtSignature: String? = null
 
-    /** 引擎是否正在建構（載入 ~100MB native）：給 reader 角落指示器顯示「引擎載入中…」。建構期間 true、完成/失敗轉 false。 */
+    /** 引擎是否正在建構：給 reader 角落指示器顯示「引擎載入中…」。建構期間 true、完成/失敗轉 false。 */
     private val _loading = MutableStateFlow(false)
     val loading: StateFlow<Boolean> = _loading.asStateFlow()
 
@@ -113,9 +119,9 @@ class TranslationEngineService(private val context: Context) {
      * @param methodRaw 去字法原始字串（boxfill / auto_whole / auto_tile）；與 warm 引擎當前去字法不同 → 重建引擎。
      *   同一章逐頁去字法相同 → 首頁後 [ensureEngine] 是 no-op、不重建（重建只在章邊界、此時 [inFlight]=0）。
      */
-    suspend fun translatePage(src: Bitmap, methodRaw: String): PageResult {
+    suspend fun translatePage(src: Bitmap, methodRaw: String): PageResult = withEngineWork {
         // 在鎖下：確保引擎已建、註冊在飛頁，並判定「這是不是這個 build 的第一次推論」（[warmedUp]，鎖下讀無 TOCTOU）。
-        // 冷引擎的第一頁 → **持鎖單緒**跑完（讓 NCNN/ORT 各 session 首次 lazy 初始化在單緒完成），之後才放行併發。
+        // 冷引擎的第一頁 → **持鎖單緒**跑完（讓 NCNN 各 session 首次 lazy 初始化在單緒完成），之後才放行併發。
         // 修「開 app 後第一本翻譯（下載/即時皆是），多頁同時打進剛載好、還沒推論過的原生 session → SIGSEGV 閃退」。
         TraceLog.log(
             "svc",
@@ -144,11 +150,11 @@ class TranslationEngineService(private val context: Context) {
                 null
             }
         }
-        if (handled != null) return handled
+        if (handled != null) return@withEngineWork handled
         // 已暖 → 放鎖、多頁並發進引擎（跨頁流水線）。
         val engine = engineForConcurrent!!
         TraceLog.log("svc", "translatePage.concurrent.call inFlight=${inFlight.get()}")
-        return try {
+        try {
             engine.translatePage(src)
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -168,9 +174,22 @@ class TranslationEngineService(private val context: Context) {
      * @param methodRaw 預暖用的去字法（預設＝目前全域去字偏好；為即時翻譯預暖走 [warmUpAsync] 的 forLive，用即時翻譯的去字法）；
      * 之後 [translatePage] 帶不同去字法仍會按簽章重建。
      */
-    suspend fun warmUp(methodRaw: String = translationPreferences.inpaintMethod.get()) = mutex.withLock {
-        ensureEngine(methodRaw)
-        Unit
+    suspend fun warmUp(methodRaw: String = translationPreferences.inpaintMethod.get()) = withEngineWork {
+        mutex.withLock {
+            ensureEngine(methodRaw)
+            Unit
+        }
+    }
+
+    private suspend fun <T> withEngineWork(block: suspend () -> T): T {
+        idleRelease.onWorkStarted()
+        return try {
+            block()
+        } finally {
+            // Synchronous bookkeeping survives cancellation. Deferred close runs in the service's
+            // independent IO scope, rather than inheriting the cancelled page's Job.
+            idleRelease.onWorkFinished()
+        }
     }
 
     /**
@@ -198,12 +217,12 @@ class TranslationEngineService(private val context: Context) {
             signature = configSignature(methodRaw, preferences)
             if (signature == builtSignature) return current
         }
-        // inFlight==0（或還沒建過）→ 安全關舊重建（釋放舊 native session 才不疊加 ~100MB）。
+        // inFlight==0（或還沒建過）→ 安全關舊重建，舊 native sessions 釋放後才建立新模型。
         // ★ 診斷紀錄是給使用者分享的：簽章含 API key，只能記遮蔽版（0.16.8–0.22.0 曾整串明文寫進紀錄）
         TraceLog.log("svc", "ensureEngine.rebuild method=${signatureMethod(methodRaw)} hadEngine=${current != null}")
         closeEngine()
 
-        // 真正建構（載入 ~100MB）期間 → loading=true，給 reader 指示器顯示「引擎載入中…」。finally 確保任何出口都歸位。
+        // 真正建構期間 → loading=true，給 reader 指示器顯示「引擎載入中…」。finally 確保任何出口都歸位。
         _loading.value = true
         return try {
             // 模型解析 + 字元表（SAF→filesDir 複製在此；缺模型回 null）。與離線翻共用同一份解析。
@@ -257,7 +276,7 @@ class TranslationEngineService(private val context: Context) {
     /**
      * 簽章裡的去字法用映射後的引擎 method（boxfill／aot），不用原始字串：引擎只看映射後的值，auto_whole 與舊版的
      * auto_tile／auto_aot 建出來是同一個引擎。用原始字串的話，舊使用者的即時翻去字法還是 auto_tile、一般去字法已遷移成
-     * auto_whole，reader「翻譯這頁」與即時翻整章交替時每次都整顆引擎重建（約 100 MB 加暖機）。
+     * auto_whole，reader「翻譯這頁」與即時翻整章交替時每次都重新載入模型並暖機。
      */
     private fun signatureMethod(methodRaw: String): String = EngineConfigMapping.mapInpaintMethod(methodRaw)
 
@@ -270,37 +289,76 @@ class TranslationEngineService(private val context: Context) {
         preferences: TranslationPreferences,
     ): List<String> = EngineConfigMapping.signatureFields(preferences)
 
-    /** 釋放引擎的原生資源（3 顆 ONNX session）。僅在 [mutex] 下呼叫。 */
-    private fun closeEngine() {
-        try {
-            engine?.close()
-        } catch (e: Throwable) {
-            logcat(LogPriority.WARN, e) { "關閉翻譯引擎時例外" }
-        }
+    /** Clear observable state under [mutex]; no native work while holding the policy's short lock. */
+    private fun detachEngine(): TranslationEngine? {
+        val detached = engine
         engine = null
         builtSignature = null
         _warm.value = false
-        warmedUp = false // 新引擎的 session 又是冷的 → 下次首頁重新單緒暖過再放行併發
+        warmedUp = false
+        return detached
     }
 
-    /**
-     * 對外關閉（即時翻關 / 即時翻關時佇列清空）：在 [mutex] 下釋放 warm 引擎。下次 [translatePage]/[warmUp] 會 lazy 重建。
-     */
-    suspend fun shutdown() = mutex.withLock {
-        // 持鎖期間沒有新頁能註冊（translatePage 的 inFlight++ 也要此鎖）；等已在飛的頁翻完再關（跨頁併發下可能多頁在飛）。
-        // delay 不釋放 Mutex → 新翻譯續阻塞、在飛頁自然遞減，歸零即關。上限 ~30s 保險：避免某頁卡死永不歸零。
-        var spins = 0
-        while (inFlight.get() > 0 && spins++ < 1500) delay(20)
-        // ★ 只有 inFlight==0 才關——即使上限到了仍有頁在飛也**不**關（否則 native session 被關掉、在飛頁 use-after-close crash）。
-        if (inFlight.get() == 0) {
-            closeEngine()
-        } else {
-            logcat(LogPriority.WARN) { "shutdown 略過關閉：仍有 ${inFlight.get()} 頁在飛（避免 use-after-close，引擎續 warm）" }
+    /** Native close stays serialized with acquisition, so old/new model generations never overlap. */
+    private fun closeDetachedEngine(detached: TranslationEngine?) {
+        try {
+            detached?.close()
+        } catch (e: Throwable) {
+            logcat(LogPriority.WARN, e) { "關閉翻譯引擎時例外" }
+        }
+    }
+
+    /** Existing configuration replacement already holds [mutex] and has drained [inFlight]. */
+    private fun closeEngine() = closeDetachedEngine(detachEngine())
+
+    private data class ReleaseTarget(val engine: TranslationEngine?)
+
+    private suspend fun releaseRequestedEngine(request: IdleModelReleaseController.Request): Unit = withContext(
+        Dispatchers.IO,
+    ) {
+        mutex.withLock {
+            // consume() rechecks generation and *all* registered operations after acquiring the
+            // lifecycle mutex. New work/foreground can invalidate a queued idle close meanwhile.
+            val target = idleRelease.consume(request) {
+                check(inFlight.get() == 0) { "Cannot release an engine with active pages" }
+                ReleaseTarget(detachEngine())
+            }
+            if (target != null) {
+                try {
+                    closeDetachedEngine(target.engine)
+                } finally {
+                    request.completed.complete(Unit)
+                }
+                if (target.engine != null) {
+                    TraceLog.log("svc", "engine.release reason=${request.reason.name.lowercase()}")
+                }
+            }
         }
     }
 
     /**
-     * [warmUp] 的 fire-and-forget 版（背景 IO、不阻塞呼叫端）：給 UI 即時翻開關用，避免在主執行緒上載 ~100MB → ANR/crash。
+     * Explicit shutdown never interrupts current work and is not cancelled by foreground reentry.
+     * If pages are active, their final completion consumes the retained request asynchronously.
+     * This suspending entry waits for native close to finish; no lifecycle lock is held while
+     * waiting for pages, and cancellation of the caller does not cancel the retained request.
+     */
+    suspend fun shutdown() {
+        val request = idleRelease.request(IdleModelReleaseController.Reason.EXPLICIT)
+        releaseRequestedEngine(request)
+        request.completed.await()
+    }
+
+    fun onForeground() = idleRelease.onForeground()
+
+    fun onBackground() = idleRelease.onBackground()
+
+    /** Safe from memory callbacks: queue IO close, or defer it until current work drains. */
+    fun onMemoryPressure() {
+        idleRelease.request(IdleModelReleaseController.Reason.MEMORY_PRESSURE)
+    }
+
+    /**
+     * [warmUp] 的 fire-and-forget 版（背景 IO、不阻塞呼叫端）：給 UI 即時翻開關用，避免在主執行緒載入模型。
      *
      * [forLive]＝為即時翻譯預暖（預設：即時翻譯開著就是）：用即時翻譯的去字法（[TranslationPreferences.liveInpaintMethod]）
      * 建——即時翻譯的頁帶這個去字法進來，用全域去字法建的話兩者設得不同時第一頁就整個重建、預暖白做（2026-10-07 審查）。
@@ -318,28 +376,14 @@ class TranslationEngineService(private val context: Context) {
 
     /** [shutdown] 的 fire-and-forget 版（背景 IO、不阻塞呼叫端）：給 UI 即時翻開關用，避免在主執行緒上等鎖/關閉 → ANR/crash。 */
     fun shutdownAsync() {
-        scope.launch { runCatching { shutdown() } }
+        idleRelease.request(IdleModelReleaseController.Reason.EXPLICIT)
     }
 
     /**
-     * 非 suspend 關閉（給 [App.onTrimMemory] 等不能 suspend 的 callback 用）：
-     * 用 `tryLock` 嘗試拿鎖後關。**拿不到鎖（正在翻某頁）就略過本次**——不阻塞系統的記憶體回收 callback，
-     * 也不打斷正在飛的單頁推論；下次真有壓力時系統會再叫一次，或翻完該頁後下個觸發再關。
+     * Compatibility entry point. Despite its old name, it never blocks a callback or closes on
+     * main. Unlike the old tryLock/drop path, a busy engine retains the pressure request.
      */
     fun shutdownBlocking() {
-        if (mutex.tryLock()) {
-            try {
-                // 有頁在飛就別關（非 suspend、不能等）——留給下次觸發或翻完後再關，避免 use-after-close。
-                if (inFlight.get() == 0) {
-                    closeEngine()
-                } else {
-                    logcat(LogPriority.DEBUG) { "shutdownBlocking 略過：有頁在飛（記憶體回收稍後重試）" }
-                }
-            } finally {
-                mutex.unlock()
-            }
-        } else {
-            logcat(LogPriority.DEBUG) { "shutdownBlocking 略過：引擎生命週期鎖忙（記憶體回收稍後重試）" }
-        }
+        onMemoryPressure()
     }
 }

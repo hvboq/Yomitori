@@ -55,6 +55,9 @@ class PhysicalDevicePerformanceTest {
         val warmPages = (args.getString("physicalWarmPages")?.toIntOrNull() ?: 20).coerceIn(10, 60)
         val method = args.getString("physicalInpaintMethod") ?: "auto_whole"
         require(method in setOf("auto_whole", "auto_tile", "boxfill"))
+        val ocrConcurrency = args.getString("physicalOcrConcurrency")?.let { value ->
+            requireNotNull(value.toIntOrNull()?.takeIf { it in 1..16 }) { "physicalOcrConcurrency must be 1..16" }
+        }
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val directory = File(context.getExternalFilesDir(null), "physical-performance-${System.currentTimeMillis()}")
         check(directory.mkdir()) { "Cannot create unique benchmark directory" }
@@ -104,6 +107,7 @@ class PhysicalDevicePerformanceTest {
             val initial = TranslationEngineConfig.buildEngineConfig(prefs, method)
             // Capture settings into immutable engine config; never change the global endpoint or credentials.
             val config = initial.copy(
+                ocr = ocrConcurrency?.let { initial.ocr.copy(concurrent = true, concurrency = it) } ?: initial.ocr,
                 translator = initial.translator.copy(
                     provider = "custom",
                     apiBase = LlmProviders.chatUrlOf(LlmProviders.byId("custom"), base),
@@ -118,6 +122,8 @@ class PhysicalDevicePerformanceTest {
                 render = initial.render.copy(orientation = TextOrientation.HORIZONTAL),
             )
             report.put("ocrConcurrency", config.ocr.concurrency)
+                .put("ocrConcurrent", config.ocr.concurrent)
+                .put("ocrConcurrencyOverride", ocrConcurrency ?: JSONObject.NULL)
                 .put("ocrMixedRequested", config.ocr.ncnnMixed)
                 .put("cpuSupportsFp16", Yakuyomi.ncnnCpuSupportsFp16())
                 .put("renderOrientation", "horizontal")

@@ -175,7 +175,7 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
         // 即時翻譯的引擎預暖**不在這裡做**：背景工作（WorkManager、廣播、前景服務）把行程叫起來時也會跑到這裡，
         // 以前照樣預暖、白吃約 15 秒 CPU 與 1.3–2 GB 原生記憶體。改成使用者把 app 開到前景、第一個畫面出來後才預暖
         // （見 StartupEnginePrewarm，由下面的 onStart／onStop 與 MainActivity.ready 推動）；這裡只記一行原因。
-        // 釋放仍由原機制管（即時翻關 / onTrimMemory / 佇列空且即時翻關）。
+        // Model release also follows foreground/background idle deadlines, not just trim callbacks.
         runCatching {
             val translationPrefs = Injekt.get<TranslationPreferences>()
             StartupEnginePrewarm.onProcessStart(
@@ -265,24 +265,23 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
     }
 
     /**
-     * 記憶體壓力時釋放常駐（warm）翻譯引擎（~100MB native）。只在**真壓力**等級釋放
-     * （RUNNING_LOW/RUNNING_CRITICAL/COMPLETE）——**不**在 UI_HIDDEN/BACKGROUND 等「只是退到背景」的等級釋放，
-     * 讓引擎能撐過正常背景化（即時翻關 reader 後仍 warm 給下一章）。引擎之後會在下次翻譯 lazy 重建。
-     *
-     * 用非 suspend 的 [TranslationEngineService.shutdownBlocking]（tryLock；正在翻則略過本次，不阻塞系統回收 callback）。
-     * 服務於 [AppModule] 註冊；這裡 lazy 取，避免 callback 在 Injekt 就緒前被呼叫時崩。
-     *
-     * [Suppress]：API 34 起 `TRIM_MEMORY_RUNNING_*`/`COMPLETE` 標為 deprecated，但這幾個是偵測「前景/整個 process
-     * 記憶體吃緊」唯一可用的訊號（無非 deprecated 替代），且仍正常運作 → 刻意沿用。
+     * Android 14+ no longer delivers RUNNING_LOW/CRITICAL/COMPLETE. UI_HIDDEN starts the same
+     * background grace as process ON_STOP; BACKGROUND requests immediate idle release. Older
+     * pressure levels remain supported. Every path queues IO work and defers close while busy.
      */
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        val realPressure = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
-            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
-            level == ComponentCallbacks2.TRIM_MEMORY_COMPLETE
-        if (realPressure) {
-            runCatching { Injekt.get<TranslationEngineService>().shutdownBlocking() }
+        runCatching {
+            val engine = Injekt.get<TranslationEngineService>()
+            when {
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
+                    (
+                        level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW &&
+                            level < ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+                        ) -> engine.onMemoryPressure()
+                level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> engine.onBackground()
+            }
         }
     }
 
