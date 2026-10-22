@@ -224,6 +224,8 @@ fun BrowseSourceFloatingBall(
     onMenuExpandedChange: (Boolean) -> Unit,
     onSearchFocusChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
+    searchSelection: TextRange? = null,
+    onSearchSelectionChange: (TextRange) -> Unit = {},
 ) {
     AnimatedContent(
         targetState = expanded,
@@ -276,13 +278,14 @@ fun BrowseSourceFloatingBall(
                         Spacer(Modifier.width(12.dp))
                         val queryText = searchQuery.orEmpty()
                         var editingValue by remember {
-                            mutableStateOf(TextFieldValue(queryText, TextRange(queryText.length)))
+                            mutableStateOf(TextFieldValue(queryText, searchSelection ?: TextRange(queryText.length)))
                         }
-                        val displayedValue = if (editingValue.text == queryText) {
-                            editingValue
-                        } else {
-                            // Move to the end only for an external replacement, not for local edits.
-                            TextFieldValue(queryText, TextRange(queryText.length))
+                        val displayedValue = when {
+                            editingValue.text != queryText ->
+                                TextFieldValue(queryText, searchSelection ?: TextRange(queryText.length))
+                            searchSelection != null && editingValue.selection != searchSelection ->
+                                editingValue.copy(selection = searchSelection, composition = null)
+                            else -> editingValue
                         }
                         SideEffect {
                             if (editingValue != displayedValue) editingValue = displayedValue
@@ -293,6 +296,7 @@ fun BrowseSourceFloatingBall(
                                 val textChanged = value.text != editingValue.text
                                 editingValue = value
                                 if (textChanged) onSearchQueryChange(value.text)
+                                onSearchSelectionChange(value.selection)
                             },
                             modifier = Modifier
                                 .weight(1f)

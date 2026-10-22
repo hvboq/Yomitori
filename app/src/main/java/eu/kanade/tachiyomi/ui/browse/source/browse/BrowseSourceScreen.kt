@@ -60,6 +60,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.CreationExtras
@@ -192,15 +193,21 @@ data class BrowseSourceScreen(
         // Suggestions are source-specific and never submit a search or rewrite a title by themselves.
         val hitomiSource = viewModel.source as? HitomiSource
         var hitomiQueryEdited by remember { mutableStateOf(false) }
+        var hitomiSelection by remember { mutableStateOf<TextRange?>(null) }
         var hitomiRequest by remember { mutableStateOf<HitomiSearchQuery.ActiveToken?>(null) }
         var hitomiSuggestions by remember { mutableStateOf(emptyList<HitomiSearchSuggestion>()) }
         val hitomiAutocompleteEnabled = hitomiSource != null && hitomiQueryEdited &&
             !isSnapshotListing && (!floatingBar || ballExpanded)
-        LaunchedEffect(sourceId, state.toolbarQuery, hitomiAutocompleteEnabled) {
+        val hitomiToken = HitomiSearchQuery.activeToken(
+            state.toolbarQuery,
+            hitomiSelection?.start ?: state.toolbarQuery.orEmpty().length,
+            hitomiSelection?.end ?: state.toolbarQuery.orEmpty().length,
+        )
+        LaunchedEffect(sourceId, hitomiToken, hitomiAutocompleteEnabled) {
             hitomiRequest = null
             hitomiSuggestions = emptyList()
             if (!hitomiAutocompleteEnabled) return@LaunchedEffect
-            val token = HitomiSearchQuery.activeToken(state.toolbarQuery) ?: return@LaunchedEffect
+            val token = hitomiToken ?: return@LaunchedEffect
             delay(250)
             try {
                 val suggestions = withContext(Dispatchers.IO) {
@@ -215,14 +222,21 @@ data class BrowseSourceScreen(
                 // Suggestion availability must not prevent ordinary searches or expose network errors.
             }
         }
-        val visibleHitomiSuggestions = if (hitomiAutocompleteEnabled && hitomiRequest?.query == state.toolbarQuery) {
+        val visibleHitomiSuggestions = if (hitomiAutocompleteEnabled && hitomiRequest == hitomiToken) {
             hitomiSuggestions
         } else {
             emptyList()
         }
         val changeSearchQuery: (String?) -> Unit = { query ->
             hitomiQueryEdited = query != null
+            hitomiSelection = TextRange(query.orEmpty().length)
             viewModel.setToolbarQuery(query)
+        }
+        val changeSearchSelection: (TextRange) -> Unit = { selection ->
+            if (selection != hitomiSelection) {
+                hitomiSelection = selection
+                hitomiQueryEdited = true
+            }
         }
         val submitSearch: (String) -> Unit = { query ->
             hitomiQueryEdited = false
@@ -231,12 +245,13 @@ data class BrowseSourceScreen(
         val chooseHitomiSuggestion: (HitomiSearchSuggestion) -> Unit = choose@{ suggestion ->
             val token = hitomiRequest ?: return@choose
             val query = viewModel.state.value.toolbarQuery ?: return@choose
-            val replacement = HitomiSearchQuery.replace(query, token, suggestion.value)
-            if (replacement != query) {
-                hitomiQueryEdited = false
-                viewModel.setToolbarQuery(replacement)
-                if (floatingBar) runCatching { ballFocusRequester.requestFocus() }
-            }
+            val selection = hitomiSelection ?: TextRange(query.length)
+            if (token != HitomiSearchQuery.activeToken(query, selection.start, selection.end)) return@choose
+            val replacement = HitomiSearchQuery.replaceAt(query, token, suggestion.value) ?: return@choose
+            hitomiQueryEdited = false
+            hitomiSelection = TextRange(replacement.caret)
+            if (replacement.query != query) viewModel.setToolbarQuery(replacement.query)
+            if (floatingBar) runCatching { ballFocusRequester.requestFocus() }
         }
         val listingKind = when (state.listing) {
             is Listing.Latest -> BrowseListingKind.LATEST
@@ -444,6 +459,8 @@ data class BrowseSourceScreen(
                         BrowseSourceToolbar(
                             searchQuery = state.toolbarQuery,
                             onSearchQueryChange = changeSearchQuery,
+                            searchSelection = hitomiSelection,
+                            onSearchSelectionChange = changeSearchSelection,
                             source = viewModel.source,
                             displayMode = viewModel.displayMode,
                             onDisplayModeChange = { viewModel.displayMode = it },
@@ -721,6 +738,8 @@ data class BrowseSourceScreen(
                             focusRequester = ballFocusRequester,
                             searchQuery = state.toolbarQuery,
                             onSearchQueryChange = changeSearchQuery,
+                            searchSelection = hitomiSelection,
+                            onSearchSelectionChange = changeSearchSelection,
                             onSubmitSearch = submitSearch,
                             onClearSearch = {
                                 // 清除＝清搜尋框並離開搜尋結果，回到搜尋前所在的列表清單（Search 當隱藏頁）。

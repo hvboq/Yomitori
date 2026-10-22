@@ -14,7 +14,13 @@ internal class ArchivePageLoader(private val reader: ArchiveReader) : PageLoader
 
     override suspend fun getPages(): List<ReaderPage> = reader.useEntries { entries ->
         entries
-            .filter { it.isFile && ImageUtil.isImage(it.name) { reader.getInputStream(it.name)!! } }
+            .filter { entry ->
+                // Translation archives retain originals/masks alongside pages. Those materials
+                // are never reader pages; normal nested manga folders remain readable.
+                val material = entry.name.replace('\\', '/').split('/').dropLast(1)
+                    .any { it.equals(".yakuyomi", ignoreCase = true) }
+                entry.isFile && !material && ImageUtil.isImage(entry.name) { reader.getInputStream(entry.name)!! }
+            }
             .sortedWith { f1, f2 -> f1.name.compareToCaseInsensitiveNaturalOrder(f2.name) }
             .mapIndexed { i, entry ->
                 ReaderPage(i).apply {

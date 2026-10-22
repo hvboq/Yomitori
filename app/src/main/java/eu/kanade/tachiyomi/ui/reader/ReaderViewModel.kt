@@ -33,6 +33,7 @@ import eu.kanade.tachiyomi.data.translation.TranslationManager
 import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.ui.reader.loader.ArchivePageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.ChapterLoader
 import eu.kanade.tachiyomi.ui.reader.loader.DirectoryPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.DownloadPageLoader
@@ -99,6 +100,8 @@ import tachiyomi.domain.manga.interactor.GetManga
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.domain.translation.service.TranslationPreferences
+import tachiyomi.source.local.LocalSource
+import tachiyomi.source.local.io.Format
 import tachiyomi.source.local.isLocal
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -412,6 +415,40 @@ class ReaderViewModel @JvmOverloads constructor(
         // 這段時間在角落顯示載入中、讓使用者知道延遲是在掛載模型（非卡死）。建好後轉「翻譯中 X/Y」。
         translationEngineService.loading
             .onEach { loading -> mutableState.update { it.copy(engineLoading = loading) } }
+            .launchIn(viewModelScope)
+
+        // Local directories are not wrapped in TranslatingPageLoader. Refresh their actual file
+        // streams as the managed queue completes pages, without routing them through Downloader.
+        translationManager.donePageEvents
+            .onEach { (chapterId, name) ->
+                val chapter = getCurrentChapter()?.takeIf { it.chapter.id == chapterId } ?: return@onEach
+                val directory = chapter.pageLoader as? DirectoryPageLoader ?: return@onEach
+                val uri = withIOContext { runCatching { directory.file.findFile(name)?.uri }.getOrNull() }
+                chapter.pages.orEmpty().filter { it.uri == uri && uri != null }.forEach {
+                    it.clearOriginalPreview()
+                    it.reload()
+                }
+            }
+            .launchIn(viewModelScope)
+
+        // Archives keep an open reader over the old bytes. Reopen only after the queue has finished
+        // replacement/rollback (including partial success reported as ERROR), retaining page position.
+        var activeLocalTranslations = emptySet<Long>()
+        translationManager.queueState
+            .onEach { queue ->
+                val active = queue.filter {
+                    it.kind != TranslationItem.Kind.NIGHT && it.status != TranslationItem.Status.ERROR
+                }.mapTo(HashSet()) { it.chapter.id }
+                val finished = activeLocalTranslations - active
+                activeLocalTranslations = active
+                val chapter = getCurrentChapter() ?: return@onEach
+                if (manga?.isLocal() != true || chapter.chapter.id !in finished) return@onEach
+                when (chapter.pageLoader) {
+                    is ArchivePageLoader -> withIOContext { reloadCurrentChapterPreservingPage() }
+                    is DirectoryPageLoader -> chapter.pages.orEmpty().forEach { it.reload() }
+                    else -> Unit
+                }
+            }
             .launchIn(viewModelScope)
 
         // 有效夜讀模式（總開關 AND 夜讀模式）切換 → 對 curr/prev/next 三章已載入的頁逐頁 reload()（holder 就地重 decode、
@@ -1710,19 +1747,14 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     /**
-     * Finds a downloaded page by the URI assigned by its loader, including split-page parents.
+     * Finds a downloaded or local directory page by its loader URI, including split-page parents.
      * Returns null when the chapter directory or exact child file no longer exists. Performs IO.
      */
     private fun resolveDownloadedPageFile(page: ReaderPage): Pair<UniFile, String>? {
-        val manga = manga ?: return null
         val chapter = page.chapter
-        val chapterDir = downloadProvider.findChapterDir(
-            chapter.chapter.name,
-            chapter.chapter.scanlator,
-            chapter.chapter.url,
-            manga.title,
-            sourceManager.getOrStub(manga.source),
-        ) ?: return null
+        // DirectoryPageLoader owns the real local chapter. Archives deliberately have no loose
+        // page URI and cannot use destructive single-page operations or original-file preview.
+        val chapterDir = resolveChapterDir(chapter)?.takeIf { it.isDirectory } ?: return null
         val fileUri = ((page as? InsertPage)?.parent ?: page).uri ?: return null
         val name = chapterDir.listFiles()
             ?.firstOrNull { it.isFile && it.uri == fileUri }
@@ -2019,6 +2051,27 @@ class ReaderViewModel @JvmOverloads constructor(
                 return@launchIO
             }
             try {
+                val local = sourceManager.getOrStub(manga.source) as? LocalSource
+                if (local != null) {
+                    // Local chapters already exist outside downloads. Never mark them as pending
+                    // HTTP downloads; TranslationManager resolves and safely commits their format.
+                    val format = local.getFormat(readerChapter.chapter)
+                    if (format !is Format.Directory && format !is Format.Archive) {
+                        eventChannel.send(Event.TranslatePageResult(false))
+                        return@launchIO
+                    }
+                    synchronized(onlineTranslationLock) {
+                        if ((translationStopVersions[domainChapter.id] ?: 0L) != stopVersion) return@launchIO
+                        translationManager.translate(
+                            manga,
+                            listOf(domainChapter),
+                            atFront = true,
+                            method = translationManager.liveInpaintMethod(),
+                        )
+                    }
+                    eventChannel.send(Event.ChapterTranslateStarted)
+                    return@launchIO
+                }
                 val isDownloaded = downloadManager.isChapterDownloaded(
                     readerChapter.chapter.name,
                     readerChapter.chapter.scanlator,

@@ -73,4 +73,96 @@ class HitomiSearchQueryTest {
             HitomiSearchQuery.replace(token.query, token, it) shouldBe token.query
         }
     }
+
+    @Test
+    fun `editing an earlier token preserves every following filter and places caret after its separator`() {
+        val query = "jap type:manga -tag:full_color"
+        val token = HitomiSearchQuery.activeToken(query, 3, 3)!!
+        token.text shouldBe "jap"
+        token.start shouldBe 0
+        token.end shouldBe 3
+        val result = HitomiSearchQuery.replaceAt(query, token, "language:japanese")!!
+        result.query shouldBe "language:japanese type:manga -tag:full_color"
+        result.caret shouldBe 18
+        result.query.substring(result.caret) shouldBe "type:manga -tag:full_color"
+    }
+
+    @Test
+    fun `middle prefix replaces the entire current term rather than retaining its old tail`() {
+        val query = "language:jaBROKEN type:manga"
+        val token = HitomiSearchQuery.activeToken(query, 11)!!
+        token.text shouldBe "language:ja"
+        token.end shouldBe 17
+        token.caret shouldBe 11
+        HitomiSearchQuery.replaceAt(query, token, "language:japanese") shouldBe
+            HitomiSearchQuery.Replacement("language:japanese type:manga", 18)
+    }
+
+    @Test
+    fun `earlier excluded term remains negative when selected from its middle`() {
+        val query = "type:manga -langgarbage artist:test"
+        val token = HitomiSearchQuery.activeToken(query, "type:manga -lang".length)!!
+        token.text shouldBe "lang"
+        token.excluded shouldBe true
+        HitomiSearchQuery.replaceAt(query, token, "language:korean") shouldBe
+            HitomiSearchQuery.Replacement("type:manga -language:korean artist:test", 28)
+    }
+
+    @Test
+    fun `multiple spaces and tabs survive replacing a term in the middle`() {
+        val query = "title\t\tjap   \ttype:manga"
+        val token = HitomiSearchQuery.activeToken(query, 10)!!
+        val result = HitomiSearchQuery.replaceAt(query, token, "language:japanese")!!
+        result.query shouldBe "title\t\tlanguage:japanese   \ttype:manga"
+        result.caret shouldBe 25
+        result.query.substring(result.caret) shouldBe "  \ttype:manga"
+
+        val tabQuery = "title jap\t\tartist:test"
+        val tabToken = HitomiSearchQuery.activeToken(tabQuery, 9)!!
+        HitomiSearchQuery.replaceAt(tabQuery, tabToken, "language:japanese") shouldBe
+            HitomiSearchQuery.Replacement("title language:japanese\t\tartist:test", 24)
+    }
+
+    @Test
+    fun `final term replacement normalizes multiword value and returns the appended-space caret`() {
+        val query = "type:manga tag:fuBROKEN"
+        val token = HitomiSearchQuery.activeToken(query, "type:manga tag:fu".length)!!
+        val result = HitomiSearchQuery.replaceAt(query, token, "  tag:full\tcolor  ")!!
+        result.query shouldBe "type:manga tag:full_color "
+        result.caret shouldBe 26
+        result.caret shouldBe result.query.length
+    }
+
+    @Test
+    fun `ranges invalid selection bounds and whitespace positions do not request suggestions`() {
+        val query = "alpha  beta"
+        listOf(0 to 0, -1 to -1, 12 to 12, 2 to 4, 4 to 2, 3 to 99, 6 to 6, 7 to 7)
+            .forEach { (start, end) -> HitomiSearchQuery.activeToken(query, start, end) shouldBe null }
+        HitomiSearchQuery.activeToken("alpha\tbeta", 6) shouldBe null
+        HitomiSearchQuery.activeToken(null, 2, 2) shouldBe null
+        HitomiSearchQuery.activeToken("", 0, 0) shouldBe null
+    }
+
+    @Test
+    fun `earlier token response is stale when any other part of the query changed`() {
+        val query = "jap type:manga"
+        val token = HitomiSearchQuery.activeToken(query, 3)!!
+        listOf("jap type:doujinshi", "jap  type:manga", "jap type:manga ", "kor type:manga")
+            .forEach { changed ->
+                HitomiSearchQuery.replaceAt(changed, token, "language:japanese") shouldBe null
+                HitomiSearchQuery.replace(changed, token, "language:japanese") shouldBe changed
+            }
+        HitomiSearchQuery.replaceAt(query, token.copy(end = query.length), "language:japanese") shouldBe null
+        HitomiSearchQuery.replaceAt(query, token.copy(caret = 2), "language:japanese") shouldBe null
+    }
+
+    @Test
+    fun `urls paths and numeric ids remain excluded when editing before later terms`() {
+        listOf("https://hitomi.la/g/123.html", "/reader/123.html", "123456", "-123456")
+            .forEach { term ->
+                val query = "$term type:manga"
+                HitomiSearchQuery.activeToken(query, term.length) shouldBe null
+                HitomiSearchQuery.activeToken(query, 3) shouldBe null
+            }
+    }
 }

@@ -10,6 +10,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.Test
 import java.io.IOException
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -194,6 +195,64 @@ class HitomiImageInterceptorTest {
                 requests.count { it.url.host == "btn.gold-usergeneratedcontent.net" } shouldBe 4
             } finally {
                 releaseLookup.countDown()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun `cancelling routing owner does not fail other covers waiting for the same lookup`() {
+        val lookupStarted = CountDownLatch(1)
+        val followersStarted = CountDownLatch(2)
+        val followerThreads = ConcurrentHashMap.newKeySet<Thread>()
+        val lookups = AtomicInteger()
+        val executor = Executors.newFixedThreadPool(3)
+        val client = OkHttpClient.Builder().addInterceptor(HitomiImageInterceptor()).addInterceptor { chain ->
+            val request = chain.request()
+            if (request.isRouting() && lookups.incrementAndGet() == 1) {
+                lookupStarted.countDown()
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (!chain.call().isCanceled() && System.nanoTime() < deadline) Thread.sleep(5)
+                chain.call().isCanceled() shouldBe true
+                throw IOException("Cancelled fixture lookup")
+            }
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body((if (request.isRouting()) CURRENT_ROUTE else "image").toResponseBody()).build()
+        }.build()
+        client.useClient {
+            val ownerCall = client.newCall(Request.Builder().url(OLD_THUMB).build())
+            try {
+                val owner = executor.submit<Boolean> {
+                    shouldThrow<IOException> { ownerCall.execute().close() }
+                    true
+                }
+                lookupStarted.await(2, TimeUnit.SECONDS) shouldBe true
+                val followers = List(2) {
+                    executor.submit {
+                        followerThreads.add(Thread.currentThread())
+                        followersStarted.countDown()
+                        client.fetch(OLD_THUMB)
+                    }
+                }
+                followersStarted.await(2, TimeUnit.SECONDS) shouldBe true
+                // Both live calls must have joined the first future before its owner is cancelled.
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                var joinedLookup = false
+                while (System.nanoTime() < deadline) {
+                    if (followerThreads.all { it.state == Thread.State.TIMED_WAITING }) {
+                        joinedLookup = true
+                        break
+                    }
+                    Thread.sleep(5)
+                }
+                joinedLookup shouldBe true
+                lookups.get() shouldBe 1
+                ownerCall.cancel()
+                owner.get(2, TimeUnit.SECONDS) shouldBe true
+                followers.forEach { it.get(2, TimeUnit.SECONDS) }
+                lookups.get() shouldBe 2
+            } finally {
+                ownerCall.cancel()
                 executor.shutdownNow()
             }
         }

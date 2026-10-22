@@ -2,20 +2,21 @@
 // Copyright 2025 Aidoku community source contributors. SPDX-License-Identifier: MIT
 package mihon.source.hitomi
 
-import eu.kanade.tachiyomi.network.await
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.security.MessageDigest
@@ -34,48 +35,64 @@ internal class HitomiClient(private val client: OkHttpClient, private val header
         last: Long? = null,
         allowEnd: Boolean = false,
         allowMissing: Boolean = false,
-    ): ByteArray =
-        withContext(Dispatchers.IO) {
-            val request = Request.Builder().url(url).headers(headers()).apply {
-                if (first != null) header("Range", "bytes=$first-$last")
-            }.build()
-            client.newCall(request).await().use { response ->
-                if (allowMissing && response.code == 404) return@withContext byteArrayOf()
-                if (!response.isSuccessful && !(allowEnd && response.code == 416)) {
-                    throw IOException("Hitomi request failed (HTTP ${response.code})")
+    ): ByteArray {
+        val request = Request.Builder().url(url).headers(headers()).apply {
+            if (first != null) header("Range", "bytes=$first-$last")
+        }.build()
+        // Keep the call attached to cancellation until the body is consumed, including stalled reads.
+        return suspendCancellableCoroutine { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    continuation.resumeWith(Result.failure(e))
                 }
-                val body = response.body
-                require(body.contentLength() <= HitomiProtocol.MAX_BYTES) { "Hitomi response too large" }
-                val data = body.byteStream().use { input ->
-                    val output = ByteArrayOutputStream()
-                    val buffer = ByteArray(8192)
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        require(output.size().toLong() + count <= HitomiProtocol.MAX_BYTES) {
-                            "Hitomi response too large"
-                        }
-                        output.write(buffer, 0, count)
-                    }
-                    output.toByteArray()
-                }
-                require(data.size <= HitomiProtocol.MAX_BYTES) { "Hitomi response too large" }
-                currentCoroutineContext().ensureActive()
-                if (first == null) {
-                    data
-                } else {
-                    HitomiProtocol.range(
-                        data,
-                        response.code,
-                        response.header("Content-Range"),
-                        first,
-                        last!!,
-                        allowEnd,
+
+                override fun onResponse(call: Call, response: Response) {
+                    continuation.resumeWith(
+                        runCatching {
+                            response.use { readBytes(it, call, first, last, allowEnd, allowMissing) }
+                        },
                     )
                 }
-            }
+            })
         }
+    }
+
+    private fun readBytes(
+        response: Response,
+        call: Call,
+        first: Long?,
+        last: Long?,
+        allowEnd: Boolean,
+        allowMissing: Boolean,
+    ): ByteArray {
+        if (allowMissing && response.code == 404) return byteArrayOf()
+        if (!response.isSuccessful && !(allowEnd && response.code == 416)) {
+            throw IOException("Hitomi request failed (HTTP ${response.code})")
+        }
+        val body = response.body
+        require(body.contentLength() <= HitomiProtocol.MAX_BYTES) { "Hitomi response too large" }
+        val data = body.byteStream().use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            while (true) {
+                if (call.isCanceled()) throw IOException("Canceled")
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(output.size().toLong() + count <= HitomiProtocol.MAX_BYTES) { "Hitomi response too large" }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        }
+        require(data.size <= HitomiProtocol.MAX_BYTES) { "Hitomi response too large" }
+        if (call.isCanceled()) throw IOException("Canceled")
+        return if (first == null) {
+            data
+        } else {
+            HitomiProtocol.range(data, response.code, response.header("Content-Range"), first, last!!, allowEnd)
+        }
+    }
 
     suspend fun gallery(id: Long): JsonObject {
         require(id > 0)
@@ -100,7 +117,7 @@ internal class HitomiClient(private val client: OkHttpClient, private val header
         val positives = terms.filterNot { it.startsWith('-') }.toMutableList()
         val negatives = terms.filter { it.startsWith('-') && it.length > 1 }.map { it.drop(1) }
         if (language != "all" &&
-            terms.none { it.removePrefix("-").startsWith("language:") }
+            positives.none { it.startsWith("language:") }
         ) {
             positives += "language:$language"
         }

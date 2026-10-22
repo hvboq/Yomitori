@@ -277,6 +277,8 @@ fun SearchToolbar(
     scrollBehavior: TopAppBarScrollBehavior? = null,
     visualTransformation: VisualTransformation = VisualTransformation.None,
     interactionSource: MutableInteractionSource = remember { MutableInteractionSource() },
+    searchSelection: TextRange? = null,
+    onSearchSelectionChange: (TextRange) -> Unit = {},
 ) {
     val focusRequester = remember { FocusRequester() }
 
@@ -288,14 +290,16 @@ fun SearchToolbar(
             val keyboardController = LocalSoftwareKeyboardController.current
             val focusManager = LocalFocusManager.current
             var editingValue by remember {
-                mutableStateOf(TextFieldValue(searchQuery, TextRange(searchQuery.length)))
+                mutableStateOf(TextFieldValue(searchQuery, searchSelection ?: TextRange(searchQuery.length)))
             }
-            // An explicit replacement (for example a suggestion) ends at the new text's trailing space.
+            // An explicit replacement (for example a suggestion) uses its requested caret.
             // Locally edited text keeps its selection and IME composition unchanged.
-            val displayedValue = if (editingValue.text == searchQuery) {
-                editingValue
-            } else {
-                TextFieldValue(searchQuery, TextRange(searchQuery.length))
+            val displayedValue = when {
+                editingValue.text != searchQuery ->
+                    TextFieldValue(searchQuery, searchSelection ?: TextRange(searchQuery.length))
+                searchSelection != null && editingValue.selection != searchSelection ->
+                    editingValue.copy(selection = searchSelection, composition = null)
+                else -> editingValue
             }
             SideEffect {
                 if (editingValue != displayedValue) editingValue = displayedValue
@@ -315,6 +319,7 @@ fun SearchToolbar(
                     val textChanged = value.text != editingValue.text
                     editingValue = value
                     if (textChanged) onChangeSearchQuery(value.text)
+                    onSearchSelectionChange(value.selection)
                 },
                 modifier = Modifier
                     .fillMaxWidth()

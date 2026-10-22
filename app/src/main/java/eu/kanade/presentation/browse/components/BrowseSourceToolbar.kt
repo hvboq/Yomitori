@@ -14,6 +14,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.TextRange
 import eu.kanade.presentation.components.AppBar
 import eu.kanade.presentation.components.AppBarActions
 import eu.kanade.presentation.components.AppBarTitle
@@ -50,6 +51,8 @@ fun BrowseSourceToolbar(
     onClearSnapshot: (() -> Unit)? = null,
     // Yakuyomi：滑到錨點（已設錨點時非空；快照/一般清單皆可，錨點未載入時由呼叫端提示）。
     onScrollToAnchor: (() -> Unit)? = null,
+    searchSelection: TextRange? = null,
+    onSearchSelectionChange: (TextRange) -> Unit = {},
 ) {
     // Avoid capturing unstable source in actions lambda
     val title = source?.name
@@ -63,6 +66,8 @@ fun BrowseSourceToolbar(
         titleContent = { AppBarTitle(title) },
         searchQuery = searchQuery,
         onChangeSearchQuery = onSearchQueryChange,
+        searchSelection = searchSelection,
+        onSearchSelectionChange = onSearchSelectionChange,
         onSearch = onSearch,
         onClickCloseSearch = navigateUp,
         actions = {

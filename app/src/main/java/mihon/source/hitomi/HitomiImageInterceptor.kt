@@ -39,6 +39,17 @@ internal class HitomiImageInterceptor(
     }
 
     private fun routing(chain: Interceptor.Chain, request: Request, refresh: Boolean): HitomiProtocol.Routing {
+        return try {
+            routingOnce(chain, request, refresh)
+        } catch (error: RoutingOwnerCancelledException) {
+            // The shared lookup belongs to another image call. Its cancellation must not cancel
+            // this cover too. Retry ownership once; repeated cancellations cannot loop indefinitely.
+            if (chain.call().isCanceled()) throw IOException("Canceled", error)
+            routingOnce(chain, request, refresh)
+        }
+    }
+
+    private fun routingOnce(chain: Interceptor.Chain, request: Request, refresh: Boolean): HitomiProtocol.Routing {
         var owner = false
         val future = synchronized(routingLock) {
             val cached = cachedRouting
@@ -60,6 +71,8 @@ internal class HitomiImageInterceptor(
                     Thread.currentThread().interrupt()
                     throw InterruptedIOException("Interrupted awaiting image routing").apply { initCause(error) }
                 } catch (error: ExecutionException) {
+                    val cause = error.cause
+                    if (cause is RoutingOwnerCancelledException) throw cause
                     throw IOException("Image routing refresh failed", error.cause)
                 }
             }
@@ -89,7 +102,13 @@ internal class HitomiImageInterceptor(
             future.complete(route)
             return route
         } catch (error: Throwable) {
-            future.completeExceptionally(error)
+            // Release ownership before waking waiters so their retry cannot join this failed future.
+            synchronized(routingLock) {
+                if (loading === future) loading = null
+            }
+            future.completeExceptionally(
+                if (chain.call().isCanceled()) RoutingOwnerCancelledException(error) else error,
+            )
             throw error
         } finally {
             synchronized(routingLock) {
@@ -97,6 +116,9 @@ internal class HitomiImageInterceptor(
             }
         }
     }
+
+    private class RoutingOwnerCancelledException(cause: Throwable) :
+        IOException("Image routing owner was cancelled", cause)
 
     private data class ImageRequest(val hash: String, val extension: String, val thumbnailSize: String? = null) {
         fun url(route: HitomiProtocol.Routing): String = if (thumbnailSize != null) {

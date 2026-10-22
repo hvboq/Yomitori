@@ -21,6 +21,14 @@ internal class DirectoryPageLoader(val file: UniFile) : PageLoader(), NightPageS
 
     override var isLocal: Boolean = true
 
+    override fun retryPage(page: ReaderPage) {
+        if (isRecycled) return
+        // Manual translation always restores display through retryPage, including failure/cancel.
+        // The local stream still points at the same file, whose bytes may now have changed.
+        page.status = Page.State.Ready
+        page.reload()
+    }
+
     override suspend fun getPages(): List<ReaderPage> {
         return file.listFiles()
             ?.filter { !it.isDirectory && ImageUtil.isImage(it.name) { it.openInputStream() } }
@@ -30,6 +38,7 @@ internal class DirectoryPageLoader(val file: UniFile) : PageLoader(), NightPageS
                 // 夜讀：每次解碼都重查（開關 + 檔位 + 夜讀檔是否存在），沒夜讀版退回原檔。
                 val streamFn = { night.open(i) { pageFile.openInputStream() } }
                 ReaderPage(i).apply {
+                    uri = pageFile.uri
                     stream = streamFn
                     status = Page.State.Ready
                 }
