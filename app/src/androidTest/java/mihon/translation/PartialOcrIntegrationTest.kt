@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.data.translation.CompletionManifestCodec
 import eu.kanade.tachiyomi.data.translation.OcrProgressCodec
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.PartialPageStore
+import eu.kanade.tachiyomi.data.translation.StoredTranslationContext
 import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
 import eu.kanade.tachiyomi.data.translation.TranslationManager
@@ -48,6 +49,7 @@ import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.Translator
 import li.joye.yakuyomi.engine.TranslatorConfig
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -714,14 +716,33 @@ class PartialOcrIntegrationTest {
 
     private enum class MigratedSource { EXACT, LEGACY_WEBP }
 
-    internal suspend fun verifyLiveStoredLifecycle(translator: Translator, requestCount: () -> Int) =
-        storedLifecycle(singlePage = true, externalTranslator = translator, externalRequestCount = requestCount)
+    internal suspend fun verifyLiveStoredLifecycle(
+        translator: Translator,
+        exportPending: Boolean = false,
+        requestCount: () -> Int,
+    ): JSONObject? {
+        var exported: JSONObject? = null
+        storedLifecycle(
+            singlePage = true,
+            externalTranslator = translator,
+            externalRequestCount = requestCount,
+            onFirstPending = if (exportPending) {
+                { directory, pending, store, actualContext ->
+                    exported = exportPendingForReleaseReader(directory, pending, store, actualContext)
+                }
+            } else {
+                null
+            },
+        )
+        return exported
+    }
 
     private suspend fun storedLifecycle(
         singlePage: Boolean,
         migrated: MigratedSource? = null,
         externalTranslator: Translator? = null,
         externalRequestCount: (() -> Int)? = null,
+        onFirstPending: ((File, PartialPageStore.State, PartialPageStore, TranslationContext) -> Unit)? = null,
     ) {
         FixtureTranslationServer().use { server ->
             val requestCount = externalRequestCount ?: { server.requests.size }
@@ -849,6 +870,14 @@ class PartialOcrIntegrationTest {
                     assertEquals(initialProgress, pendingProgress)
                     val rawMask = store.readRawMask(pending)
                     val maskHash = PartialPageStore.sha256(rawMask)
+                    val actualContext = requireNotNull(pipeline.translationContext)
+                    assertEquals(
+                        actualContext,
+                        StoredTranslationContext.decode(requireNotNull(pending.safeContextPayload)),
+                    )
+                    // Export only after the durable first pending has passed all normal checks.
+                    // The native OCR decorator forced one first-pass blank; this is not a natural failure sample.
+                    onFirstPending?.invoke(directory, pending, store, actualContext)
                     val restoreBeforeResume = !singlePage || migrated != null
                     if (restoreBeforeResume) {
                         assertTrue(first.reRenderPage(chapter, "001.png", "original"))
@@ -927,6 +956,107 @@ class PartialOcrIntegrationTest {
                     directory.deleteRecursively()
                 }
             }
+        }
+    }
+
+    /** Test-only opt-in export. The helper's original fixture is still removed by its normal finally. */
+    private fun exportPendingForReleaseReader(
+        sourceDirectory: File,
+        pending: PartialPageStore.State,
+        sourceStore: PartialPageStore,
+        actualContext: TranslationContext,
+    ): JSONObject {
+        assertFalse(pending.complete)
+        assertEquals(pending, sourceStore.load(pending.pageName, recover = false))
+        val progress = OcrProgressCodec.decode(pending.progressPayload, pending.width, pending.height)
+        assertTrue(progress.hasPending)
+        assertTrue(progress.regions.any { it.state == RegionState.TRANSLATED })
+        assertEquals(
+            actualContext,
+            StoredTranslationContext.decode(requireNotNull(pending.safeContextPayload)),
+        )
+        val external = requireNotNull(context.getExternalFilesDir(null))
+        val exportParent = File(external, "release-partial-export").apply { check(isDirectory || mkdirs()) }
+        val exportRoot = File(exportParent, "native-${UUID.randomUUID()}").apply { check(mkdir()) }
+        val chapterDirectory = File(exportRoot, "chapter").apply { check(mkdir()) }
+        check(exportRoot.canonicalPath.startsWith(exportParent.canonicalPath + File.separator))
+        try {
+            val sourcePrefix = sourceDirectory.canonicalPath + File.separator
+            val destinationPrefix = chapterDirectory.canonicalPath + File.separator
+            val sourceFiles = sourceDirectory.walkTopDown().filter { it.isFile }
+                .sortedBy { it.relativeTo(sourceDirectory).invariantSeparatorsPath }.toList()
+            assertTrue("The whole neutral chapter must contain files", sourceFiles.isNotEmpty())
+            val fileMetadata = JSONArray()
+            val sourceHashes = linkedMapOf<String, String>()
+            for (sourceFile in sourceFiles) {
+                check(sourceFile.canonicalPath.startsWith(sourcePrefix))
+                val relative = sourceFile.relativeTo(sourceDirectory).invariantSeparatorsPath
+                val destination = File(chapterDirectory, relative)
+                check(destination.canonicalPath.startsWith(destinationPrefix))
+                check(requireNotNull(destination.parentFile).let { it.isDirectory || it.mkdirs() })
+                val bytes = sourceFile.readBytes()
+                val expectedHash = PartialPageStore.sha256(bytes)
+                destination.outputStream().use { it.write(bytes) }
+                val readback = destination.readBytes()
+                assertEquals("Copied file length must match", bytes.size, readback.size)
+                assertEquals("Copied file SHA must match", expectedHash, PartialPageStore.sha256(readback))
+                sourceHashes[relative] = expectedHash
+                fileMetadata.put(
+                    JSONObject().put("name", relative).put("length", bytes.size).put("sha256", expectedHash),
+                )
+            }
+            val copiedNames = chapterDirectory.walkTopDown().filter { it.isFile }
+                .map { it.relativeTo(chapterDirectory).invariantSeparatorsPath }.toSet()
+            assertEquals("Export must include every chapter file", sourceHashes.keys, copiedNames)
+            for ((relative, hash) in sourceHashes) {
+                assertEquals(hash, PartialPageStore.sha256(File(sourceDirectory, relative).readBytes()))
+                assertEquals(hash, PartialPageStore.sha256(File(chapterDirectory, relative).readBytes()))
+            }
+            val copiedChapter = requireNotNull(UniFile.fromFile(chapterDirectory))
+            val copiedMaterials = requireNotNull(copiedChapter.findFile(".yakuyomi"))
+            val copiedStore = PartialPageStore.forUniFile(context, copiedChapter, copiedMaterials)
+            val copiedPending = requireNotNull(copiedStore.load(pending.pageName, recover = false))
+            assertEquals("Copied durable record must match", pending, copiedPending)
+            assertArrayEquals(sourceStore.readRawMask(pending), copiedStore.readRawMask(copiedPending))
+            assertArrayEquals(sourceStore.readOutput(pending), copiedStore.readOutput(copiedPending))
+            assertEquals(
+                actualContext,
+                StoredTranslationContext.decode(requireNotNull(copiedPending.safeContextPayload)),
+            )
+            val recordName = pending.outputSnapshotName.removeSuffix(".output") + ".record"
+            val commitName = pending.outputSnapshotName.removeSuffix(".output") + ".commit"
+            assertTrue("Preserved original must be copied", ".yakuyomi/${pending.original.name}" in copiedNames)
+            assertTrue("Durable record must be copied", ".yakuyomi/$recordName" in copiedNames)
+            assertTrue("Durable commit must be copied", ".yakuyomi/$commitName" in copiedNames)
+            assertTrue(
+                "Output snapshot must be copied",
+                ".yakuyomi/${pending.outputSnapshotName}" in copiedNames,
+            )
+            assertTrue("Raw mask must be copied", ".yakuyomi/${pending.rawMaskSnapshotName}" in copiedNames)
+            assertEquals(pending.outputSha256, sourceHashes[pending.pageName])
+            assertEquals(pending.original.sha256, sourceHashes[".yakuyomi/${pending.original.name}"])
+            assertEquals(pending.rawMaskSha256, sourceHashes[".yakuyomi/${pending.rawMaskSnapshotName}"])
+            val metadata = JSONObject().put("schemaVersion", 1).put("exportVerified", true)
+                .put("directory", chapterDirectory.path).put("fileCount", copiedNames.size).put("files", fileMetadata)
+                .put("nativeOcr", true).put("externalServer", true).put("forcedFirstPassBlank", true)
+                .put("actualReaderActivity", false).put("pageName", pending.pageName)
+                .put("revision", pending.revision).put("generation", pending.generation).put("complete", false)
+                .put("successfulRegionCount", progress.regions.count { it.state == RegionState.TRANSLATED })
+                .put("pendingRegionCount", progress.regions.count { it.state == RegionState.OCR_PENDING })
+                .put("semanticFingerprint", actualContext.semanticFingerprint)
+                .put("contextSource", "registeredNativePipeline")
+                .put("originalSha256", pending.original.sha256)
+                .put("originalProvenance", pending.original.provenance.name)
+                .put("outputSha256", pending.outputSha256).put("rawMaskSha256", pending.rawMaskSha256)
+            val manifestFile = File(exportRoot, "manifest.json")
+            val manifestBytes = metadata.toString(2).toByteArray(Charsets.UTF_8)
+            manifestFile.writeBytes(manifestBytes)
+            assertArrayEquals(manifestBytes, manifestFile.readBytes())
+            return metadata
+        } catch (failure: Throwable) {
+            check(exportRoot.canonicalPath.startsWith(exportParent.canonicalPath + File.separator))
+            exportRoot.deleteRecursively()
+            throw failure
         }
     }
 

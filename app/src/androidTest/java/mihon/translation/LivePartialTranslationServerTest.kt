@@ -27,7 +27,16 @@ class LivePartialTranslationServerTest {
         val arguments = InstrumentationRegistry.getArguments()
         val base = arguments.getString("liveTranslationBase").orEmpty()
         val model = arguments.getString("liveTranslationModel").orEmpty()
-        assumeTrue("Requires explicit server and model", base.isNotBlank() && model.isNotBlank())
+        val exportArgument = arguments.getString("exportReleasePartial")
+        require(exportArgument == null || exportArgument == "true" || exportArgument == "false") {
+            "exportReleasePartial must be true or false"
+        }
+        val exportPending = exportArgument == "true"
+        if (exportPending) {
+            assertTrue("Export requires explicit server and model", base.isNotBlank() && model.isNotBlank())
+        } else {
+            assumeTrue("Requires explicit server and model", base.isNotBlank() && model.isNotBlank())
+        }
         val preset = LlmProviders.byId("custom")
         val models = LlmModels.list(LlmProviders.modelsUrlOf(preset, base), ModelSource.OPENAI, "")
         assertTrue("The selected model must be discoverable", models.any { it.id == model })
@@ -66,7 +75,9 @@ class LivePartialTranslationServerTest {
         val reportFile = File(context.getExternalFilesDir(null), "live-partial-context.json")
         reportFile.writeText(JSONObject().put("passed", false).put("nativeOcr", true).toString())
         val start = SystemClock.elapsedRealtime()
-        PartialOcrIntegrationTest().verifyLiveStoredLifecycle(probe) { batches.size }
+        val exportedPending = PartialOcrIntegrationTest().verifyLiveStoredLifecycle(probe, exportPending) {
+            batches.size
+        }
         assertEquals("First partial and pending-only resume each use one logical batch", 2, batches.size)
         val report = JSONObject().put("passed", true).put("nativeOcr", true).put("externalServer", true)
             .put("forcedFirstPassBlank", true).put("actualReaderActivity", false)
@@ -75,6 +86,8 @@ class LivePartialTranslationServerTest {
             .put("requestWallMs", JSONArray(requestMs)).put("totalWallMs", SystemClock.elapsedRealtime() - start)
             .put("successfulTargetsPreserved", true).put("originalBytesPreserved", true)
             .put("savedActualContextPreserved", true).put("userSettingsChanged", false)
+            .put("pendingExportRequested", exportPending)
+        if (exportPending) report.put("pendingExport", requireNotNull(exportedPending))
         reportFile.writeText(report.toString(2))
     }
 }
