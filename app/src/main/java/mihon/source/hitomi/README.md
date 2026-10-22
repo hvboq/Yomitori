@@ -43,7 +43,7 @@ Search autocomplete uses the site's character-index JSON protocol at
 all searchable namespaces (`language`, `artist`, `group`, `series`,
 `character`, `tag`, `female`, `male`, `type`) use remote candidates rather
 than a curated tag list. Both search bars debounce input, cancel obsolete
-requests, and replace only the final token when a candidate is selected.
+requests, and replace only the token at the cursor when a candidate is selected.
 Multiple-word values use underscores and negative filters retain `-`.
 Responses are bounded to 256 KiB and at most 20 candidates are displayed.
 
