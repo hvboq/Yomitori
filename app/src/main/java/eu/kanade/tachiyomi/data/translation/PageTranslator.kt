@@ -64,7 +64,8 @@ import kotlin.math.abs
  *   走 SAF 讀取、串流複製到 filesDir 後以路徑 off-heap 載入（[ensureLocal]）。
  * key（BYOK）+ 語言對：從設定頁（[TranslationPreferences]）讀；key 空白時 fallback build-time key。
  * 字型：null → 系統 CJK fallback。
- * §11：僅成功的頁覆蓋；略過/失敗留原圖。回傳翻成功頁數。
+ * Durable translated/partial results replace the display; failed work preserves it. A fresh
+ * analysis of a preserved original may restore that source and commit final skipped progress.
  */
 class PageTranslator(private val context: Context) {
 
@@ -319,21 +320,33 @@ class PageTranslator(private val context: Context) {
                     throw failure
                 }
             }
-            result = runTranslationUntilStopped(shouldStop, ::recyclePageResult) {
-                borrowedAnalysis?.let { engineService.resumePage(bitmap, it, method) }
-                    ?: engineService.translatePage(bitmap, method)
+            val inference = runTranslationUntilStopped(
+                shouldStop,
+                { operation: StoredPageResult -> recyclePageResult(operation.result) },
+            ) {
+                engineService.translateStoredPage(bitmap, borrowedAnalysis, previous?.safeContextPayload, method)
             } ?: return PageAttempt(AttemptKind.STOPPED)
+            result = inference.result
             return when (val pageResult = result!!) {
                 is PageResult.Translated -> persistStoredResult(
                     chapterDir, pageFile, input, pageResult.page, pageResult.analysis, pageResult.stats,
-                    method, false, keepMaterials, nightOnly,
+                    method, false, keepMaterials, nightOnly, inference.contextPayload,
                 )
                 is PageResult.Partial -> persistStoredResult(
                     chapterDir, pageFile, input, pageResult.page, pageResult.analysis, pageResult.stats,
-                    method, true, true, false,
+                    method, true, true, false, inference.contextPayload,
                 )
                 is PageResult.Skipped -> {
-                    if (previous != null && !previous.complete) {
+                    if (input.keepExistingOriginal && (previous?.complete != false || inference.restarted)) {
+                        // A fresh pass can intentionally keep every region or detect no text.
+                        // Replace any previous translated display with the preserved source and
+                        // bind its final analysis to the new context, including completed legacy
+                        // pages and journals. Same-context pending resumes cannot skip old work.
+                        persistStoredResult(
+                            chapterDir, pageFile, input, bitmap, checkNotNull(pageResult.analysis), pageResult.stats,
+                            method, false, keepMaterials, nightOnly, inference.contextPayload,
+                        )
+                    } else if (previous != null && !previous.complete) {
                         PageAttempt(
                             AttemptKind.PARTIAL,
                             pageResult.stats,
@@ -417,6 +430,7 @@ class PageTranslator(private val context: Context) {
         partial: Boolean,
         keepMaterials: Boolean,
         nightOnly: Boolean,
+        safeContextPayload: String? = null,
     ): PageAttempt {
         val name = pageFile.name ?: throw java.io.IOException("Missing page name")
         val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
@@ -432,7 +446,8 @@ class PageTranslator(private val context: Context) {
             ) {
                 return@withLock PageAttempt(AttemptKind.ALREADY_DONE, stats)
             }
-            check(PartialPageStore.sha256(readPageBytes(pageFile)) == input.expectedPageSha256) {
+            val previousOutputBytes = readPageBytes(pageFile)
+            check(PartialPageStore.sha256(previousOutputBytes) == input.expectedPageSha256) {
                 "Page changed during translation"
             }
             val materialDir = materialsDir(chapterDir) ?: throw java.io.IOException("Cannot preserve page materials")
@@ -449,31 +464,42 @@ class PageTranslator(private val context: Context) {
             ) {
                 "Original changed during translation"
             }
-            val journaled = partial || latest != null
+            val journaled = partial || latest != null || (input.keepExistingOriginal && analysis?.progress != null)
             if (journaled) {
                 val resumableAnalysis = checkNotNull(analysis) { "Missing resumable OCR analysis" }
                 val progress = checkNotNull(resumableAnalysis.progress) { "Missing resumable OCR progress" }
                 progress.validateFor(input.decoded.bitmap.width, input.decoded.bitmap.height)
                 check(progress.hasPending == partial) { "OCR result completion disagrees with its progress" }
-                check(saved.file.name == OriginalMaterial.exactName(name)) {
-                    "Partial OCR resume requires an exact original; the existing legacy output was preserved"
-                }
                 val encodedOutput = encodePage(name, output)
                 val rawMask = encodeRawMask(resumableAnalysis.mask)
-                val descriptor = PartialPageStore.Original(
+                val descriptor = latest?.original ?: PartialPageStore.Original(
                     saved.file.name!!,
                     input.decoded.sha256,
                     input.decoded.length,
+                    when {
+                        !input.keepExistingOriginal -> PartialPageStore.OriginalProvenance.EXACT_BYTES
+                        OriginalMaterial.extension(name).equals("webp", ignoreCase = true) ->
+                            PartialPageStore.OriginalProvenance.WEBP_COMPATIBLE_UNKNOWN
+                        saved.file.name.equals(OriginalMaterial.exactName(name), ignoreCase = true) ->
+                            PartialPageStore.OriginalProvenance.EXACT_BYTES
+                        else -> PartialPageStore.OriginalProvenance.LEGACY_REENCODED
+                    },
                 )
                 val journalStore = store ?: PartialPageStore.forUniFile(context, chapterDir, materialDir)
                 journalStore.commit(
                     name, descriptor, output.width, output.height, OcrProgressCodec.encode(progress),
                     encodedOutput, rawMask, input.journal?.revision, !partial,
+                    initialBaseline = if (latest == null && input.expectedPageSha256 != input.decoded.sha256) {
+                        PartialPageStore.InitialBaseline(previousOutputBytes, input.expectedPageSha256)
+                    } else {
+                        null
+                    },
+                    safeContextPayload = safeContextPayload,
                     checkCancellation = { coroutineContext.ensureActive() },
                 )
             } else {
                 coroutineContext.ensureActive()
-                writeBackOrRestore(pageFile, output, saved)
+                writeBackOrRestore(pageFile, output, saved, previousOutputBytes)
             }
             invalidateNightPage(materialDir, name)
             val materialsWarning = if ((keepMaterials || journaled) && analysis != null) {
@@ -520,6 +546,7 @@ class PageTranslator(private val context: Context) {
         val mask = when (result) {
             is PageResult.Translated -> result.analysis?.mask
             is PageResult.Partial -> result.analysis.mask
+            is PageResult.Skipped -> result.analysis?.mask
             else -> null
         }
         page?.let { if (!it.isRecycled) it.recycle() }
@@ -622,8 +649,10 @@ class PageTranslator(private val context: Context) {
      *  - **引擎鎖**：走 [engineService.translatePage]，內部 [Mutex] 與佇列 drain 序列化（同實例不會並發翻多頁）。
      *  - **manifest 鎖**：[persistLivePage] 的 manifest 讀-改-寫經 [manifestMutex] 序列化（與佇列逐頁落地不互相蓋掉）。
      *
-     * §11：只有 [PageResult.Translated] 才覆蓋；[PageResult.Skipped]（無字）/[PageResult.Failed]（網路/引擎）→
-     * 不動原圖、回 false（呼叫端據此提示、頁面維持原圖）。只對「已下載章（頁圖在磁碟、鬆散資料夾）」有意義。
+     * Translated and partial results are persisted with their completion state. A fresh skipped
+     * analysis of a preserved original restores the source and commits its new final progress.
+     * Other skipped/failed results preserve the existing display. Only loose downloaded pages
+     * have an independently writable page URI.
      *
      * @param method 去字法原始字串（boxfill / auto_whole / auto_tile）；預設＝目前全域偏好。傳給引擎、也存進素材。
      * @return [SinglePageResult.TRANSLATED]＝翻成功並已覆蓋落地；[SinglePageResult.NOT_TRANSLATED]＝略過/失敗/解析不到檔
@@ -737,6 +766,7 @@ class PageTranslator(private val context: Context) {
 
     private fun loadJournal(chapterDir: UniFile, pageName: String, recover: Boolean = true): PartialPageStore.State? =
         partialStore(chapterDir)?.load(pageName, recover = recover)?.also { state ->
+            state.safeContextPayload?.let(StoredTranslationContext::decode)
             val progress = OcrProgressCodec.decode(state.progressPayload, state.width, state.height)
             check(progress.hasPending != state.complete) { "Page journal completion disagrees with OCR progress" }
         }
@@ -2001,24 +2031,33 @@ class PageTranslator(private val context: Context) {
             val originalBytes = readPageBytes(originalFile)
             val rawMaskBytes = store.readRawMask(journal)
             val progress = OcrProgressCodec.decode(journal.progressPayload, journal.width, journal.height)
-            val output = if (method == ORIGINAL_METHOD) {
+            val canCopyOriginal = journal.original.provenance != PartialPageStore.OriginalProvenance.LEGACY_REENCODED ||
+                OriginalMaterial.extension(journal.pageName).equals("webp", ignoreCase = true)
+            val output = if (method == ORIGINAL_METHOD && canCopyOriginal) {
                 originalBytes
             } else {
                 val original = BitmapFactory.decodeByteArray(originalBytes, 0, originalBytes.size) ?: return false
                 owned += original
-                val mask = BitmapFactory.decodeByteArray(rawMaskBytes, 0, rawMaskBytes.size) ?: return false
-                owned += mask
-                val regions = progress.toTextRegions()
-                val cleaned = checkNotNull(inpainter).inpaint(original, regions, mask)
-                owned += cleaned
-                val rendered = Renderer.render(cleaned, regions, checkNotNull(renderConfig), null)
-                owned += rendered
-                encodePage(image.name, rendered)
+                if (method == ORIGINAL_METHOD) {
+                    // Legacy material may be WebP while the visible page is PNG/JPEG. Preserve
+                    // the actual source and encode a compatible visible page without promotion.
+                    encodePage(image.name, original)
+                } else {
+                    val mask = BitmapFactory.decodeByteArray(rawMaskBytes, 0, rawMaskBytes.size) ?: return false
+                    owned += mask
+                    val regions = progress.toTextRegions()
+                    val cleaned = checkNotNull(inpainter).inpaint(original, regions, mask)
+                    owned += cleaned
+                    val rendered = Renderer.render(cleaned, regions, checkNotNull(renderConfig), null)
+                    owned += rendered
+                    encodePage(image.name, rendered)
+                }
             }
             val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
             store.commit(
                 journal.pageName, journal.original, journal.width, journal.height, journal.progressPayload,
                 output, rawMaskBytes, journal.revision, journal.complete,
+                safeContextPayload = journal.safeContextPayload,
                 checkCancellation = { coroutineContext.ensureActive() },
             )
             invalidateNightPage(matDir, journal.pageName)
@@ -2262,6 +2301,7 @@ class PageTranslator(private val context: Context) {
             val os = openTruncating(file) ?: throw java.io.IOException("Cannot open page for replacement")
             os.use { it.write(encoded) }
             check(file.length() == encoded.size.toLong()) { "Page replacement length mismatch" }
+            check(readPageBytes(file).contentEquals(encoded)) { "Page replacement readback mismatch" }
         } catch (t: Throwable) {
             throw PageWriteInterrupted("頁檔寫到一半失敗 ${file.name}", t)
         }
@@ -2281,19 +2321,25 @@ class PageTranslator(private val context: Context) {
     }
 
     /**
-     * 用譯圖覆蓋頁檔；失敗（例外或編碼不成）而手上有剛存好的原檔 [saved] 時，立刻把原檔寫回頁檔（§11：不留半截檔在
-     * 那裡等下一輪），寫得回去就順手刪掉進行中記號。然後照樣把例外往外拋（呼叫端記錯、這頁不進清單）。
-     * 沒有 [saved] 時先拋出，下載的原頁檔不會被寫入。
+     * Keep the mandatory preserved source independent of rollback. Failed replacement restores
+     * the captured previous visible bytes, which may already be a successful translation. This
+     * also avoids copying a legacy WebP source verbatim into a PNG/JPEG target during recovery.
+     * Rollback deliberately finishes without checking cancellation, then propagates the failure.
      */
-    private fun writeBackOrRestore(page: UniFile, bmp: Bitmap, saved: SavedOriginal?) {
+    private fun writeBackOrRestore(page: UniFile, bmp: Bitmap, saved: SavedOriginal?, previousOutputBytes: ByteArray) {
         checkNotNull(saved) {
             "Cannot preserve the original page. Translation was not saved; check storage access and free space."
         }
         try {
             writeBack(page, bmp)
         } catch (t: Throwable) {
-            if (restoreOriginalBytes(saved.file, page)) {
-                TraceLog.log("page", "${page.name} writeBack failed, original restored")
+            val restored = runCatching {
+                val stream = openTruncating(page) ?: throw java.io.IOException("Cannot restore previous page")
+                stream.use { it.write(previousOutputBytes) }
+                check(readPageBytes(page).contentEquals(previousOutputBytes)) { "Previous page rollback mismatch" }
+            }.isSuccess
+            if (restored) {
+                TraceLog.log("page", "${page.name} writeBack failed, previous output restored")
                 deleteFileOnly(saved.marker, OriginalMaterial.inflightName(page.name.orEmpty()))
             }
             throw t

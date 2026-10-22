@@ -11,6 +11,29 @@ import org.junit.jupiter.api.Test
 
 class OcrProgressCodecTest {
     @Test
+    fun `explicit no text detection round trips as final empty progress`() {
+        val original = PageProgress(1200, 1600, emptyList(), noTextDetected = true)
+        val decoded = OcrProgressCodec.decode(OcrProgressCodec.encode(original), 1200, 1600)
+        decoded shouldBe original
+        decoded.hasPending shouldBe false
+        decoded.toTextRegions() shouldBe emptyList()
+    }
+
+    @Test
+    fun `empty progress without detection proof and no text with regions are rejected`() {
+        val noText = PageProgress(1200, 1600, emptyList(), noTextDetected = true)
+        shouldThrow<IllegalArgumentException> { OcrProgressCodec.encode(noText.copy(noTextDetected = false)) }
+        shouldThrow<IllegalArgumentException> { OcrProgressCodec.encode(progress().copy(noTextDetected = true)) }
+        rejected(OcrProgressCodec.encode(noText).replace("\"noTextDetected\":true", "\"noTextDetected\":false"))
+    }
+
+    @Test
+    fun `existing nonempty schema one payload defaults missing no text flag to false`() {
+        val payload = OcrProgressCodec.encode(progress()).replace(",\"noTextDetected\":false", "")
+        OcrProgressCodec.decode(payload, 1200, 1600) shouldBe progress()
+    }
+
+    @Test
     fun `all states geometry line metadata targets and unicode round trip losslessly`() {
         val original = progress()
         val payload = OcrProgressCodec.encode(original)

@@ -122,6 +122,30 @@ class ArchiveTranslationStateTest {
         ArchiveTranslationState.isComplete(emptySet(), emptySet()) { null } shouldBe false
     }
 
+    @Test
+    fun `completed migration verifies its captured baseline without modifying the archive`() {
+        val fixture = Fixture()
+        val previousOutput = "previous successful translation".toByteArray()
+        fixture.files[PAGE] = previousOutput
+        val baseline = PartialPageStore.InitialBaseline(previousOutput, PartialPageStore.sha256(previousOutput))
+        val state = fixture.commit(complete = true, baseline = baseline)
+        fixture.isComplete() shouldBe true
+        val baselinePath = ".yakuyomi/${state.initialBaselineSnapshotName}"
+        fixture.files[baselinePath] = fixture.files.getValue(baselinePath) + byteArrayOf(1)
+        val before = fixture.files.mapValues { it.value.copyOf() }
+        fixture.isComplete() shouldBe false
+        fixture.assertUnchanged(before)
+    }
+
+    @Test
+    fun `unknown stored translation context cannot validate archive completion`() {
+        val fixture = Fixture()
+        fixture.commit(complete = true, safeContext = "{\"schemaVersion\":999}")
+        val before = fixture.files.mapValues { it.value.copyOf() }
+        fixture.isComplete() shouldBe false
+        fixture.assertUnchanged(before)
+    }
+
     private class Fixture {
         val files = mutableMapOf(PAGE to "exact source bytes".toByteArray())
         var lastWip: Pair<String, ByteArray>? = null
@@ -166,9 +190,13 @@ class ArchiveTranslationStateTest {
             complete: Boolean = false,
             pendingPayload: Boolean = !complete,
             payload: String = progress(pendingPayload),
+            baseline: PartialPageStore.InitialBaseline? = null,
+            safeContext: String? = null,
         ): PartialPageStore.State = store.commit(
             PAGE, original, WIDTH, HEIGHT, payload,
             (if (complete) "complete output" else "partial output").toByteArray(), mask(), base, complete,
+            initialBaseline = baseline,
+            safeContextPayload = safeContext,
         )
 
         fun isComplete(): Boolean = ArchiveTranslationState.isComplete(

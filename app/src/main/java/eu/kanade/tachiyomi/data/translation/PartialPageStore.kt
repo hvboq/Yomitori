@@ -17,7 +17,9 @@ import java.util.UUID
  * store only verifies them and never creates or replaces them. SAF rename is deliberately unused.
  * A commit consists of immutable output/mask/record files followed by a verified WIP, replacement
  * of the visible page, and a final commit record. Before that last record, recovery restores the
- * previous committed snapshot (or the exact original). After it, a changed page is an external
+ * previous committed snapshot (or the explicitly captured first baseline, otherwise the original).
+ * The OCR original retains its exact/legacy/unknown provenance and is never promoted by copying.
+ * After the commit point, a changed page is an external
  * modification and must not be silently replaced, even if WIP cleanup was interrupted.
  *
  * Call load and commit under the shared page lock. Inference may run outside it; `baseRevision`
@@ -34,7 +36,21 @@ internal class PartialPageStore(private val io: Io) {
     }
 
     @Serializable
-    data class Original(val name: String, val sha256: String, val length: Long)
+    enum class OriginalProvenance { EXACT_BYTES, LEGACY_REENCODED, WEBP_COMPATIBLE_UNKNOWN }
+
+    @Serializable
+    data class Original(
+        val name: String,
+        val sha256: String,
+        val length: Long,
+        val provenance: OriginalProvenance = OriginalProvenance.EXACT_BYTES,
+    )
+
+    /** Explicit capture of the visible output before the first journal generation exists. */
+    data class InitialBaseline(val bytes: ByteArray, val expectedTargetSha256: String)
+
+    @Serializable
+    data class Baseline(val revision: String, val sha256: String, val length: Int)
 
     @Serializable
     data class State(
@@ -52,9 +68,13 @@ internal class PartialPageStore(private val io: Io) {
         val height: Int,
         val progressPayload: String,
         val complete: Boolean,
+        val initialBaseline: Baseline? = null,
+        /** Caller-owned safe JSON. Credentials must never be placed in this payload. */
+        val safeContextPayload: String? = null,
     ) {
         val outputSnapshotName: String get() = names(pageName, revision).output
         val rawMaskSnapshotName: String get() = names(pageName, revision).mask
+        val initialBaselineSnapshotName: String? get() = initialBaseline?.let { names(pageName, it.revision).baseline }
     }
 
     /**
@@ -71,14 +91,26 @@ internal class PartialPageStore(private val io: Io) {
             // A torn WIP never authorized a target write. It is safe to discard only when the
             // visible page is already exactly the last committed snapshot/original. Otherwise
             // its missing authority cannot be invented from a filename or a damaged record.
-            val original = scan.latest?.original ?: expectedOriginal ?: scan.invalidWips.mapNotNull { name ->
+            val prepared = scan.invalidWips.mapNotNull { name ->
                 runCatching {
                     readPreparedState(name.substringBeforeLast('.') + ".record", pageName)
-                }.getOrNull()?.original
-            }.distinct().singleOrNull() ?: fail("Cannot establish original for torn recovery marker")
+                }.getOrNull()
+            }
+            val original = scan.latest?.original ?: expectedOriginal ?: prepared.map { it.original }
+                .distinct().singleOrNull() ?: fail("Cannot establish original for torn recovery marker")
             if (expectedOriginal != null && original != expectedOriginal) fail("Original descriptor changed")
             val originalBytes = readOriginal(pageName, original)
-            val previous = scan.latest?.let(::readOutput) ?: originalBytes
+            val committedLatest = scan.latest
+            val previous = if (committedLatest != null) {
+                readOutput(committedLatest)
+            } else {
+                if (prepared.any { it.baseRevision != null || it.generation != 1L } ||
+                    prepared.map { it.initialBaseline }.distinct().size > 1
+                ) {
+                    fail("Cannot establish baseline for torn recovery marker")
+                }
+                prepared.singleOrNull()?.let(::readInitialBaseline) ?: originalBytes
+            }
             val current = io.readPage(pageName, MAX_IMAGE_BYTES) ?: fail("Cannot read current page")
             if (!current.contentEquals(previous)) fail("Torn recovery marker cannot authorize page replacement")
             for (name in scan.invalidWips) {
@@ -99,7 +131,7 @@ internal class PartialPageStore(private val io: Io) {
             if (candidate.original != original) fail("Pending journal has a different original")
             if (expectedOriginal != null && original != expectedOriginal) fail("Original descriptor changed")
             val originalBytes = readOriginal(pageName, original)
-            val previous = scan.latest?.let(::readOutput) ?: originalBytes
+            val previous = scan.latest?.let(::readOutput) ?: readInitialBaseline(candidate) ?: originalBytes
             replaceVerified(pageName, previous)
             // A torn final commit is not a commit. Remove it before removing recovery authority.
             val candidateNames = names(pageName, candidate.revision)
@@ -111,6 +143,7 @@ internal class PartialPageStore(private val io: Io) {
         if (latest != null) {
             if (expectedOriginal != null && latest.original != expectedOriginal) fail("Original descriptor changed")
             readOriginal(pageName, latest.original)
+            readInitialBaseline(latest)
             readOutput(latest)
             readRawMask(latest)
             val page = io.readPage(pageName, MAX_IMAGE_BYTES) ?: fail("Cannot read current page")
@@ -165,7 +198,11 @@ internal class PartialPageStore(private val io: Io) {
     /**
      * Persist one generation. [progressPayload] is engine-owned JSON and [rawMaskBytes] is the
      * original DBNet PNG, not a mask already modified by inpainting. Successful translations can
-     * therefore be rendered again from the exact original without OCR of translated pixels.
+     * therefore be rendered again from the preserved OCR source without OCR of translated pixels.
+     * [initialBaseline] is only for the first generation: both its captured bytes and expected SHA
+     * must match the visible target. It preserves a previous translation separately from the OCR
+     * source, which may be a legacy image. Later generations always use the last committed output.
+     * [safeContextPayload] is never inferred or inherited; callers explicitly preserve or replace it.
      * The cancellation hook is checked before the commit point; rollback never calls it.
      */
     fun commit(
@@ -178,24 +215,43 @@ internal class PartialPageStore(private val io: Io) {
         rawMaskBytes: ByteArray,
         baseRevision: String?,
         complete: Boolean,
+        initialBaseline: InitialBaseline? = null,
+        safeContextPayload: String? = null,
         checkCancellation: () -> Unit = {},
     ): State {
         requirePageName(pageName)
         validateOriginal(pageName, original)
         validateDimensions(width, height)
         validatePayload(progressPayload)
+        validateSafeContext(safeContextPayload)
         if (outputBytes.isEmpty() || outputBytes.size > MAX_IMAGE_BYTES) fail("Invalid output snapshot size")
         validateMask(rawMaskBytes, width, height)
         val previous = load(pageName, original)
         if (previous?.revision != baseRevision) fail("Stale partial page revision")
+        if (previous != null &&
+            initialBaseline != null
+        ) {
+            fail("Initial baseline is only valid for a first journal generation")
+        }
         if (previous != null && (previous.width != width || previous.height != height)) fail("Page dimensions changed")
         val originalBytes = readOriginal(pageName, original)
-        val previousBytes = previous?.let(::readOutput) ?: originalBytes
         val current = io.readPage(pageName, MAX_IMAGE_BYTES) ?: fail("Cannot read current page")
+        if (initialBaseline != null && (
+                initialBaseline.bytes.isEmpty() || initialBaseline.bytes.size > MAX_IMAGE_BYTES ||
+                    !SHA256.matches(initialBaseline.expectedTargetSha256) ||
+                    digest(initialBaseline.bytes) != initialBaseline.expectedTargetSha256 ||
+                    !current.contentEquals(initialBaseline.bytes) ||
+                    digest(current) != initialBaseline.expectedTargetSha256
+                )
+        ) {
+            fail("Captured initial output no longer matches the current page")
+        }
+        val previousBytes = previous?.let(::readOutput) ?: if (initialBaseline != null) current else originalBytes
         if (!current.contentEquals(previousBytes)) fail("Page changed before partial commit")
+        val revision = UUID.randomUUID().toString()
         val state = State(
             pageName = pageName,
-            revision = UUID.randomUUID().toString(),
+            revision = revision,
             baseRevision = baseRevision,
             generation = (previous?.generation ?: 0) + 1,
             original = original,
@@ -208,6 +264,10 @@ internal class PartialPageStore(private val io: Io) {
             height = height,
             progressPayload = progressPayload,
             complete = complete,
+            initialBaseline = previous?.initialBaseline ?: initialBaseline?.let {
+                Baseline(revision, digest(previousBytes), previousBytes.size)
+            },
+            safeContextPayload = safeContextPayload,
         )
         val fileNames = names(pageName, state.revision)
         val record = encodeState(state)
@@ -217,6 +277,11 @@ internal class PartialPageStore(private val io: Io) {
         var commitAttempted = false
         try {
             checkCancellation()
+            if (previous == null && state.initialBaseline != null) {
+                createVerified(fileNames.baseline, previousBytes, MAX_IMAGE_BYTES)
+                readInitialBaseline(state)
+                checkCancellation()
+            }
             createVerified(fileNames.output, outputBytes, MAX_IMAGE_BYTES)
             checkCancellation()
             createVerified(fileNames.mask, rawMaskBytes, MAX_IMAGE_BYTES)
@@ -273,6 +338,13 @@ internal class PartialPageStore(private val io: Io) {
         }
     }
 
+    /** Verifies the preserved pre-journal output separately from the OCR source image. */
+    fun readInitialBaseline(state: State): ByteArray? {
+        validateState(state)
+        val baseline = state.initialBaseline ?: return null
+        return readVerified(names(state.pageName, baseline.revision).baseline, baseline.length, baseline.sha256)
+    }
+
     private fun scan(pageName: String): Scan {
         val all = io.materialNames().filter { it.startsWith(prefix(pageName) + "-") && JOURNAL_NAME.matches(it) }
         if (all.size > MAX_JOURNAL_FILES) fail("Too many partial page journal files")
@@ -305,12 +377,14 @@ internal class PartialPageStore(private val io: Io) {
             }
             if (previous != null && (
                     state.original != previous.original || state.width != previous.width ||
-                        state.height != previous.height
+                        state.height != previous.height || state.initialBaseline != previous.initialBaseline
                     )
             ) {
                 fail("Partial page source changed between revisions")
             }
-            if (state.previousOutputSha256 != (previous?.outputSha256 ?: state.original.sha256)) {
+            if (state.previousOutputSha256 !=
+                (previous?.outputSha256 ?: state.initialBaseline?.sha256 ?: state.original.sha256)
+            ) {
                 fail("Partial page parent output does not match")
             }
             previous = state
@@ -354,7 +428,8 @@ internal class PartialPageStore(private val io: Io) {
         val currentSha256 = digest(current)
         for (name in records) {
             val prepared = runCatching { readPreparedState(name, pageName) }.getOrNull() ?: continue
-            if (currentSha256 == prepared.outputSha256 && currentSha256 != prepared.original.sha256) {
+            val previousSha256 = prepared.initialBaseline?.sha256 ?: prepared.original.sha256
+            if (currentSha256 == prepared.outputSha256 && currentSha256 != previousSha256) {
                 fail("Output snapshot has lost its page commit and recovery authority")
             }
         }
@@ -410,6 +485,7 @@ internal class PartialPageStore(private val io: Io) {
         val record: String,
         val wip: String,
         val commit: String,
+        val baseline: String,
     )
 
     companion object {
@@ -417,10 +493,12 @@ internal class PartialPageStore(private val io: Io) {
         private const val HEADER = "YOMITORI-PARTIAL-1\n"
         private const val MAX_RECORD_BYTES = 8 * 1024 * 1024
         private const val MAX_IMAGE_BYTES = 192 * 1024 * 1024
+        private const val MAX_CONTEXT_BYTES = 8 * 1024
         private const val MAX_JOURNAL_FILES = 32768
         private val REVISION = Regex("[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")
         private val SHA256 = Regex("[a-f0-9]{64}")
-        private val JOURNAL_NAME = Regex("$PREFIX[a-f0-9]{64}-${REVISION.pattern}\\.(output|mask|record|wip|commit)")
+        private val JOURNAL_NAME =
+            Regex("$PREFIX[a-f0-9]{64}-${REVISION.pattern}\\.(output|mask|record|wip|commit|baseline)")
         private val JSON = Json { ignoreUnknownKeys = false }
         private val PNG_SIGNATURE = byteArrayOf(-119, 80, 78, 71, 13, 10, 26, 10)
 
@@ -433,7 +511,7 @@ internal class PartialPageStore(private val io: Io) {
 
         private fun names(pageName: String, revision: String): Names {
             val base = "${prefix(pageName)}-$revision"
-            return Names("$base.output", "$base.mask", "$base.record", "$base.wip", "$base.commit")
+            return Names("$base.output", "$base.mask", "$base.record", "$base.wip", "$base.commit", "$base.baseline")
         }
 
         private fun revisionFromName(name: String): String = name.substring(PREFIX.length + 65).substringBeforeLast('.')
@@ -447,10 +525,21 @@ internal class PartialPageStore(private val io: Io) {
         }
 
         private fun validateOriginal(pageName: String, original: Original) {
-            if (original.name != OriginalMaterial.exactName(pageName) || !SHA256.matches(original.sha256) ||
+            val allowedName = when (original.provenance) {
+                OriginalProvenance.EXACT_BYTES -> original.name == OriginalMaterial.exactName(pageName)
+                OriginalProvenance.LEGACY_REENCODED -> original.name.equals(
+                    OriginalMaterial.legacyName(pageName),
+                    ignoreCase = true,
+                )
+                OriginalProvenance.WEBP_COMPATIBLE_UNKNOWN -> OriginalMaterial.extension(
+                    pageName,
+                ).equals("webp", ignoreCase = true) &&
+                    original.name.equals(OriginalMaterial.exactName(pageName), ignoreCase = true)
+            }
+            if (!allowedName || !SHA256.matches(original.sha256) ||
                 original.length !in 1..MAX_IMAGE_BYTES.toLong()
             ) {
-                fail("Invalid exact original descriptor")
+                fail("Invalid preserved original descriptor")
             }
         }
 
@@ -469,6 +558,15 @@ internal class PartialPageStore(private val io: Io) {
                 }.getOrNull() !is JsonObject
             ) {
                 fail("Invalid partial progress JSON")
+            }
+        }
+
+        private fun validateSafeContext(payload: String?) {
+            if (payload == null) return
+            if (payload.toByteArray(Charsets.UTF_8).size > MAX_CONTEXT_BYTES ||
+                runCatching { JSON.parseToJsonElement(payload) }.getOrNull() !is JsonObject
+            ) {
+                fail("Invalid safe translation context JSON")
             }
         }
 
@@ -491,6 +589,15 @@ internal class PartialPageStore(private val io: Io) {
             validateOriginal(state.pageName, state.original)
             validateDimensions(state.width, state.height)
             validatePayload(state.progressPayload)
+            validateSafeContext(state.safeContextPayload)
+            state.initialBaseline?.let { baseline ->
+                if (!REVISION.matches(baseline.revision) || !SHA256.matches(baseline.sha256) ||
+                    baseline.length !in 1..MAX_IMAGE_BYTES ||
+                    (state.generation == 1L && baseline.revision != state.revision)
+                ) {
+                    fail("Invalid initial output baseline")
+                }
+            }
             if (!REVISION.matches(state.revision) || state.baseRevision?.let { !REVISION.matches(it) } == true ||
                 state.generation < 1 || !SHA256.matches(state.previousOutputSha256) ||
                 !SHA256.matches(state.outputSha256) || !SHA256.matches(state.rawMaskSha256) ||

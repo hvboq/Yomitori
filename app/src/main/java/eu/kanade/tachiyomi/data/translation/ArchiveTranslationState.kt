@@ -61,6 +61,7 @@ internal object ArchiveTranslationState {
                     false
                 } else {
                     val state = store.load(name, recover = false)
+                    state?.safeContextPayload?.let(StoredTranslationContext::decode)
                     state == null || (
                         state.complete &&
                             !OcrProgressCodec.decode(state.progressPayload, state.width, state.height).hasPending

@@ -399,6 +399,287 @@ class PartialPageStoreTest {
         fixture.io.page.decodeToString() shouldBe "first partial"
     }
 
+    @Test
+    fun `first partial separates its OCR original from the preceding completed output baseline`() {
+        val fixture = Fixture()
+        fixture.io.page = "previous completed translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        val state = fixture.commit("new partial", baseline = capture(prior), context = "{\"fingerprint\":\"first\"}")
+
+        state.previousOutputSha256 shouldBe PartialPageStore.sha256(prior)
+        state.initialBaseline!!.revision shouldBe state.revision
+        fixture.store.readInitialBaseline(state)!!.contentEquals(prior) shouldBe true
+        fixture.store.load(PAGE, recover = false) shouldBe state
+        state.safeContextPayload shouldBe "{\"fingerprint\":\"first\"}"
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+        fixture.io.page.decodeToString() shouldBe "new partial"
+        fixture.store.applyDoneOverlay(setOf(PAGE)) shouldBe emptySet()
+    }
+
+    @Test
+    fun `first transition cancellation restores preceding translation instead of erasing it with the OCR source`() {
+        val fixture = Fixture()
+        fixture.io.page = "previous completed translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        shouldThrow<CancellationException> {
+            fixture.commit("new partial", baseline = capture(prior), cancel = {
+                if (fixture.io.page.decodeToString() == "new partial") throw CancellationException("stop")
+            })
+        }
+
+        fixture.io.page.contentEquals(prior) shouldBe true
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+        fixture.store.load(PAGE) shouldBe null
+        fixture.store.applyDoneOverlay(setOf(PAGE)) shouldBe setOf(PAGE)
+    }
+
+    @Test
+    fun `restart rolls back a truncated first transition to its separate verified baseline`() {
+        val fixture = Fixture()
+        fixture.io.page = "previous completed translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        fixture.io.replace = { bytes ->
+            fixture.io.page = bytes.copyOf(2)
+            throw ProcessDeath()
+        }
+        shouldThrow<ProcessDeath> { fixture.commit("new partial", baseline = capture(prior)) }
+        fixture.io.replace = null
+        shouldThrow<IOException> { fixture.store.load(PAGE, recover = false) }
+        fixture.io.page.size shouldBe 2
+
+        PartialPageStore(fixture.io).load(PAGE) shouldBe null
+
+        fixture.io.page.contentEquals(prior) shouldBe true
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+    }
+
+    @Test
+    fun `torn baseline blocks first transition before visible output is touched`() {
+        val fixture = Fixture()
+        fixture.io.page = "previous completed translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        fixture.io.truncateSuffix = ".baseline"
+
+        shouldThrow<IOException> { fixture.commit("new partial", baseline = capture(prior)) }
+
+        fixture.io.page.contentEquals(prior) shouldBe true
+        fixture.io.replacementCount shouldBe 0
+        fixture.io.materials.keys.none { it.endsWith(".wip") || it.endsWith(".commit") } shouldBe true
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+    }
+
+    @Test
+    fun `stale captured output or digest cannot authorize first journal migration`() {
+        val fixture = Fixture()
+        fixture.io.page = "current completed translation".toByteArray()
+        val old = capture("older completed translation".toByteArray())
+        shouldThrow<IOException> { fixture.commit("partial", baseline = old) }
+        shouldThrow<IOException> {
+            fixture.commit(
+                "partial",
+                baseline = PartialPageStore.InitialBaseline(fixture.io.page.copyOf(), old.expectedTargetSha256),
+            )
+        }
+
+        fixture.io.replacementCount shouldBe 0
+        fixture.io.page.decodeToString() shouldBe "current completed translation"
+        fixture.io.materials.keys shouldBe setOf(ORIGINAL)
+    }
+
+    @Test
+    fun `subsequent failed generations restore the latest committed partial rather than first baseline`() {
+        val fixture = Fixture()
+        fixture.io.page = "old completed translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        val partial = fixture.commit(
+            "first new partial",
+            baseline = capture(prior),
+            context = "{\"fingerprint\":\"old-context\"}",
+        )
+        shouldThrow<CancellationException> {
+            fixture.commit(
+                "second new partial",
+                base = partial.revision,
+                context = "{\"fingerprint\":\"new-context\"}",
+                cancel = {
+                    if (fixture.io.page.decodeToString() == "second new partial") throw CancellationException("stop")
+                },
+            )
+        }
+
+        fixture.store.load(PAGE) shouldBe partial
+        fixture.io.page.decodeToString() shouldBe "first new partial"
+        fixture.store.readInitialBaseline(partial)!!.contentEquals(prior) shouldBe true
+        partial.safeContextPayload shouldBe "{\"fingerprint\":\"old-context\"}"
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+    }
+
+    @Test
+    fun `completion inherits immutable baseline while context is explicitly supplied per generation`() {
+        val fixture = Fixture()
+        fixture.io.page = "old completed translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        val partial = fixture.commit("partial", baseline = capture(prior), context = "{\"fingerprint\":\"old\"}")
+        val completed = fixture.commit(
+            "complete",
+            base = partial.revision,
+            complete = true,
+            context = "{\"fingerprint\":\"new\"}",
+        )
+
+        completed.initialBaseline shouldBe partial.initialBaseline
+        fixture.store.readInitialBaseline(completed)!!.contentEquals(prior) shouldBe true
+        completed.safeContextPayload shouldBe "{\"fingerprint\":\"new\"}"
+        fixture.store.load(PAGE, recover = false) shouldBe completed
+        fixture.store.applyDoneOverlay(emptySet()) shouldBe setOf(PAGE)
+        shouldThrow<IOException> {
+            fixture.commit("cannot reset baseline", base = completed.revision, baseline = capture(fixture.io.page))
+        }
+        fixture.io.page.decodeToString() shouldBe "complete"
+    }
+
+    @Test
+    fun `readonly verification rejects a damaged first baseline without altering current partial or original`() {
+        val fixture = Fixture()
+        fixture.io.page = "old completed translation".toByteArray()
+        val partial = fixture.commit("new partial", baseline = capture(fixture.io.page))
+        fixture.io.materials[partial.initialBaselineSnapshotName!!] = "damaged baseline".toByteArray()
+        val replacements = fixture.io.replacementCount
+
+        shouldThrow<IOException> { fixture.store.load(PAGE, recover = false) }
+
+        fixture.io.replacementCount shouldBe replacements
+        fixture.io.page.decodeToString() shouldBe "new partial"
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+    }
+
+    @Test
+    fun `legacy reencoded original retains its actual filename and provenance across cancellation and resume`() {
+        val fixture = Fixture()
+        fixture.io.materials.remove(ORIGINAL)
+        val legacyBytes = "legacy reencoded WebP source".toByteArray()
+        val legacyName = "001.orig.webp"
+        fixture.io.materials[legacyName] = legacyBytes.copyOf()
+        val legacy = PartialPageStore.Original(
+            legacyName,
+            PartialPageStore.sha256(legacyBytes),
+            legacyBytes.size.toLong(),
+            PartialPageStore.OriginalProvenance.LEGACY_REENCODED,
+        )
+        fixture.io.page = "existing PNG translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        shouldThrow<CancellationException> {
+            fixture.commit("first partial", original = legacy, baseline = capture(prior), cancel = {
+                if (fixture.io.page.decodeToString() == "first partial") throw CancellationException("stop")
+            })
+        }
+        fixture.io.page.contentEquals(prior) shouldBe true
+        val state = fixture.commit("partial retry", original = legacy, baseline = capture(prior))
+
+        fixture.store.load(PAGE) shouldBe state
+        state.original shouldBe legacy
+        fixture.io.materials.getValue(legacyName).contentEquals(legacyBytes) shouldBe true
+        (ORIGINAL in fixture.io.materials) shouldBe false
+        shouldThrow<IOException> {
+            fixture.commit(
+                "invalid promotion",
+                base = state.revision,
+                original = legacy.copy(provenance = PartialPageStore.OriginalProvenance.EXACT_BYTES),
+            )
+        }
+        fixture.io.page.decodeToString() shouldBe "partial retry"
+    }
+
+    @Test
+    fun `existing WebP source with indistinguishable provenance retains its real filename without exact promotion`() {
+        val fixture = Fixture()
+        fixture.io.materials.remove(ORIGINAL)
+        val source = "existing WebP source of unknown encoding history".toByteArray()
+        val sourceName = "001.orig.webp"
+        fixture.io.materials[sourceName] = source.copyOf()
+        val original = PartialPageStore.Original(
+            sourceName,
+            PartialPageStore.sha256(source),
+            source.size.toLong(),
+            PartialPageStore.OriginalProvenance.WEBP_COMPATIBLE_UNKNOWN,
+        )
+        fixture.io.page = "existing upper-case WebP output".toByteArray()
+        val baseline = capture(fixture.io.page)
+        val state = fixture.commit("partial WebP output", page = "001.WEBP", original = original, baseline = baseline)
+
+        fixture.store.load("001.WEBP") shouldBe state
+        state.original.provenance shouldBe PartialPageStore.OriginalProvenance.WEBP_COMPATIBLE_UNKNOWN
+        state.original.name shouldBe sourceName
+        fixture.io.materials.getValue(sourceName).contentEquals(source) shouldBe true
+        fixture.io.materials.keys.none { it == "001.orig.WEBP" || it == ORIGINAL } shouldBe true
+        shouldThrow<IOException> {
+            fixture.commit(
+                "invalid exact promotion",
+                page = "001.WEBP",
+                base = state.revision,
+                original = original.copy(provenance = PartialPageStore.OriginalProvenance.EXACT_BYTES),
+            )
+        }
+        fixture.io.page.decodeToString() shouldBe "partial WebP output"
+    }
+
+    @Test
+    fun `WebP unknown provenance cannot be attached to a PNG page or a foreign source name`() {
+        val fixture = Fixture()
+        val unknown = fixture.original.copy(provenance = PartialPageStore.OriginalProvenance.WEBP_COMPATIBLE_UNKNOWN)
+        shouldThrow<IOException> { fixture.commit("bad provenance", original = unknown) }
+        shouldThrow<IOException> {
+            fixture.commit("bad source", page = "001.webp", original = unknown.copy(name = "002.orig.webp"))
+        }
+
+        fixture.io.materials.keys shouldBe setOf(ORIGINAL)
+        fixture.io.replacementCount shouldBe 0
+    }
+
+    @Test
+    fun `failed transition equal to baseline leaves legacy completion unchanged`() {
+        val fixture = Fixture()
+        fixture.io.page = "existing PNG translation".toByteArray()
+        val prior = fixture.io.page.copyOf()
+        fixture.io.truncateSuffix = ".wip"
+        shouldThrow<IOException> { fixture.commit("existing PNG translation", baseline = capture(prior)) }
+        fixture.io.truncateSuffix = null
+
+        fixture.store.load(PAGE) shouldBe null
+        fixture.store.applyDoneOverlay(setOf(PAGE)) shouldBe setOf(PAGE)
+        fixture.io.page.contentEquals(prior) shouldBe true
+        fixture.io.materials.getValue(ORIGINAL).decodeToString() shouldBe "exact original bytes"
+    }
+
+    @Test
+    fun `schema one records without provenance baseline or context remain readable without invented context`() {
+        val fixture = Fixture()
+        val state = fixture.commit("old-schema partial")
+        val record = fixture.io.materials.entries.single { it.key.endsWith(".record") }.value.decodeToString()
+        record.contains("\"provenance\"") shouldBe false
+        record.contains("\"initialBaseline\"") shouldBe false
+        record.contains("\"safeContextPayload\"") shouldBe false
+
+        val reopened = PartialPageStore(fixture.io).load(PAGE)!!
+        reopened shouldBe state
+        reopened.original.provenance shouldBe PartialPageStore.OriginalProvenance.EXACT_BYTES
+        reopened.initialBaseline shouldBe null
+        reopened.safeContextPayload shouldBe null
+        fixture.store.readInitialBaseline(reopened) shouldBe null
+    }
+
+    @Test
+    fun `translation context must be a bounded JSON object before any generation is written`() {
+        val fixture = Fixture()
+        for (context in listOf("[]", "null", "{truncated", "{\"large\":\"${"x".repeat(8192)}\"}")) {
+            shouldThrow<IOException> { fixture.commit("output", context = context) }
+        }
+
+        fixture.io.materials.keys shouldBe setOf(ORIGINAL)
+        fixture.io.replacementCount shouldBe 0
+        fixture.io.page.decodeToString() shouldBe "exact original bytes"
+    }
+
     private class ProcessDeath : Error("simulated process termination without catch/finally")
 
     private class Fixture {
@@ -420,6 +701,8 @@ class PartialPageStoreTest {
             width: Int = 4,
             payload: String = "{\"recognized\":[\"successful group\"],\"retry\":[\"failed group\"]}",
             rawMask: ByteArray = mask(),
+            baseline: PartialPageStore.InitialBaseline? = null,
+            context: String? = null,
         ): PartialPageStore.State = store.commit(
             pageName = page,
             original = original,
@@ -430,6 +713,8 @@ class PartialPageStoreTest {
             rawMaskBytes = rawMask,
             baseRevision = base,
             complete = complete,
+            initialBaseline = baseline,
+            safeContextPayload = context,
             checkCancellation = cancel,
         )
     }
@@ -485,6 +770,9 @@ class PartialPageStoreTest {
     companion object {
         private const val PAGE = "001.png"
         private const val ORIGINAL = "001.orig.png"
+
+        private fun capture(bytes: ByteArray): PartialPageStore.InitialBaseline =
+            PartialPageStore.InitialBaseline(bytes.copyOf(), PartialPageStore.sha256(bytes))
 
         // Sufficient PNG header for storage-contract dimensions. Native image decoding is tested
         // separately; the store does not claim to validate PNG pixels or replace the native codec.

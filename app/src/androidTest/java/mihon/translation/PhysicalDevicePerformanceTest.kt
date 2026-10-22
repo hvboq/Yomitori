@@ -231,6 +231,7 @@ class PhysicalDevicePerformanceTest {
                         row.put("pageBytesUnchangedAfterFailure", digest(pageFile) == originalHash)
                     }
                 } finally {
+                    (result as? PageResult.Skipped)?.analysis?.mask?.let { if (!it.isRecycled) it.recycle() }
                     val output = when (val outcome = result) {
                         is PageResult.Translated -> outcome.page to outcome.analysis?.mask
                         is PageResult.Partial -> outcome.page to outcome.analysis.mask

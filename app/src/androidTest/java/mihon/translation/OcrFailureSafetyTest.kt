@@ -24,8 +24,10 @@ import li.joye.yakuyomi.engine.Renderer
 import li.joye.yakuyomi.engine.TextLine
 import li.joye.yakuyomi.engine.TextOrientation
 import li.joye.yakuyomi.engine.TextRegion
+import li.joye.yakuyomi.engine.TranslationContext
 import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.Translator
+import li.joye.yakuyomi.engine.TranslatorConfig
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -82,6 +84,7 @@ class OcrFailureSafetyTest {
             val chapter = requireNotNull(UniFile.fromFile(dir))
             var engineCalls = 0
             val noTranslation = object : Translator {
+                override val translationContext = TranslationContext.fromTranslator(TranslatorConfig())
                 override suspend fun translate(queries: List<String>): List<String> =
                     error("Capacity failure must occur before translation")
             }
@@ -92,6 +95,7 @@ class OcrFailureSafetyTest {
                     Inpainter(model("mit_aot_fixed512"), InpainterConfig(method = "boxfill")).use { inpainter ->
                         val pipeline = Pipeline(detector, ocr, noTranslation, inpainter)
                         val engine = object : TranslationEngine {
+                            override val translationContext get() = pipeline.translationContext
                             override suspend fun translatePage(page: Bitmap): PageResult {
                                 engineCalls++
                                 return pipeline.translatePage(page).also { result ->

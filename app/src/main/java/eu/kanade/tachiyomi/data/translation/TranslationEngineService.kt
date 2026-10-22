@@ -121,7 +121,9 @@ class TranslationEngineService(private val context: Context) {
      *   同一章逐頁去字法相同 → 首頁後 [ensureEngine] 是 no-op、不重建（重建只在章邊界、此時 [inFlight]=0）。
      */
     suspend fun translatePage(src: Bitmap, methodRaw: String): PageResult =
-        executePage(src, methodRaw, "translatePage") { it.translatePage(src) }
+        executePage(src, methodRaw, "translatePage") { engine ->
+            PageRequest.Run(null, false) { engine.translatePage(src) }
+        }.result
 
     /**
      * Resume pending OCR against the preserved original. The original and borrowed analysis mask
@@ -129,14 +131,66 @@ class TranslationEngineService(private val context: Context) {
      * idle-release protection as a new page; it never creates a separate unmanaged engine.
      */
     suspend fun resumePage(src: Bitmap, analysis: PageAnalysis, methodRaw: String): PageResult =
-        executePage(src, methodRaw, "resumePage") { it.resumePage(src, analysis) }
+        executePage(src, methodRaw, "resumePage") { engine ->
+            PageRequest.Run(null, false) { engine.resumePage(src, analysis) }
+        }.result
+
+    /**
+     * Select resume or fresh inference using the actual engine registered for this operation.
+     * A missing legacy context or changed semantics starts from the caller's preserved original;
+     * unknown/malformed context fails before page inference and never reuses saved targets.
+     * The caller owns [src] and any borrowed [savedAnalysis] mask, including when restarting.
+     */
+    internal suspend fun translateStoredPage(
+        src: Bitmap,
+        savedAnalysis: PageAnalysis?,
+        savedContextPayload: String?,
+        methodRaw: String,
+    ): StoredPageResult {
+        // Validate before ensureEngine's native warm-up, without reading preferences separately.
+        val savedContext = try {
+            savedContextPayload?.let(StoredTranslationContext::decode)
+        } catch (_: IllegalArgumentException) {
+            return StoredPageResult(
+                PageResult.Failed("Invalid stored translation context; previous output retained"),
+                null,
+                false,
+            )
+        }
+        return executePage(src, methodRaw, "translateStoredPage") { engine ->
+            val context = engine.translationContext
+            if (context == null) {
+                PageRequest.Rejected("Translation engine context is unknown; previous output retained")
+            } else {
+                val payload = StoredTranslationContext.encode(context)
+                val restarted = savedAnalysis != null && savedContext != context
+                PageRequest.Run(payload, restarted) {
+                    if (savedAnalysis != null && !restarted) {
+                        engine.resumePage(src, savedAnalysis)
+                    } else {
+                        engine.translatePage(src)
+                    }
+                }
+            }
+        }
+    }
+
+    private sealed interface PageRequest {
+        data class Run(
+            val contextPayload: String?,
+            val restarted: Boolean,
+            val infer: suspend () -> PageResult,
+        ) : PageRequest
+
+        data class Rejected(val reason: String) : PageRequest
+    }
 
     private suspend fun executePage(
         src: Bitmap,
         methodRaw: String,
         operation: String,
-        run: suspend (TranslationEngine) -> PageResult,
-    ): PageResult = withEngineWork {
+        prepare: (TranslationEngine) -> PageRequest,
+    ): StoredPageResult = withEngineWork {
         // 在鎖下：確保引擎已建、註冊在飛頁，並判定「這是不是這個 build 的第一次推論」（[warmedUp]，鎖下讀無 TOCTOU）。
         // 冷引擎的第一頁 → **持鎖單緒**跑完（讓 NCNN 各 session 首次 lazy 初始化在單緒完成），之後才放行併發。
         // 修「開 app 後第一本翻譯（下載/即時皆是），多頁同時打進剛載好、還沒推論過的原生 session → SIGSEGV 閃退」。
@@ -144,44 +198,60 @@ class TranslationEngineService(private val context: Context) {
             "svc",
             "$operation.enter ${src.width}x${src.height} method=$methodRaw warm=$warmedUp if=${inFlight.get()}",
         )
-        var engineForConcurrent: TranslationEngine? = null
-        val handled: PageResult? = mutex.withLock {
+        var requestForConcurrent: PageRequest.Run? = null
+        val handled: StoredPageResult? = mutex.withLock {
             val e = ensureEngine(methodRaw)
-                ?: return@withLock PageResult.Failed(context.stringResource(MR.strings.engine_unavailable))
+                ?: return@withLock StoredPageResult(
+                    PageResult.Failed(context.stringResource(MR.strings.engine_unavailable)),
+                    null,
+                    false,
+                )
+            // prepare captures e.translationContext while the same lifecycle mutex still protects
+            // registration. A later settings change cannot relabel this result as a newer engine.
+            val request = when (val prepared = prepare(e)) {
+                is PageRequest.Rejected -> return@withLock StoredPageResult(
+                    PageResult.Failed(prepared.reason),
+                    null,
+                    false,
+                )
+                is PageRequest.Run -> prepared
+            }
             inFlight.incrementAndGet() // 在鎖下註冊 → 關閉不會在註冊中途插入而漏算在飛頁
             if (!warmedUp) {
                 // 冷引擎首次推論：整段持鎖跑（其他頁在 mutex.withLock 上等），暖完設 warmedUp=true 才放行併發。
                 // 代價＝只有冷啟動後第一本的第一頁不被跨頁重疊（含一次網路往返）；換得不再撞冷 session。
                 try {
-                    run(e).also { warmedUp = true }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (ex: Throwable) {
-                    logcat(LogPriority.ERROR, ex) { "warm 引擎翻譯單頁失敗（冷引擎首次）" }
-                    PageResult.Failed(ex.message ?: context.stringResource(MR.strings.translate_exception))
+                    inferPage(request) { warmedUp = true }
                 } finally {
                     inFlight.decrementAndGet()
                 }
             } else {
-                engineForConcurrent = e // 已暖 → 放鎖後併發跑
+                requestForConcurrent = request // 已暖 → 放鎖後併發跑
                 null
             }
         }
         if (handled != null) return@withEngineWork handled
         // 已暖 → 放鎖、多頁並發進引擎（跨頁流水線）。
-        val engine = engineForConcurrent!!
+        val request = requestForConcurrent!!
         TraceLog.log("svc", "$operation.concurrent.call inFlight=${inFlight.get()}")
         try {
-            run(engine)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e) { "warm 引擎翻譯單頁失敗" }
-            PageResult.Failed(e.message ?: context.stringResource(MR.strings.translate_exception))
+            inferPage(request)
         } finally {
             inFlight.decrementAndGet()
             TraceLog.log("svc", "$operation.concurrent.done inFlight=${inFlight.get()}")
         }
+    }
+
+    private suspend fun inferPage(request: PageRequest.Run, onReturned: () -> Unit = {}): StoredPageResult {
+        val result = try {
+            request.infer().also { onReturned() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            logcat(LogPriority.ERROR, failure) { "warm 引擎翻譯單頁失敗" }
+            PageResult.Failed(failure.message ?: context.stringResource(MR.strings.translate_exception))
+        }
+        return StoredPageResult(result, request.contextPayload, request.restarted)
     }
 
     /**

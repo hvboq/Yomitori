@@ -175,12 +175,35 @@ class TranslationStorageSafetyTest {
     }
 
     @Test
+    fun completedPageWithoutPreservedOriginalRejectsSaveWithoutChangingItsDisplayOrManifest() = runBlocking {
+        withPage { dir, original, output, translator ->
+            val page = File(dir, "001.png")
+            val pageBytes = page.readBytes()
+            val manifest = File(dir, ".yakuyomi_translated").apply { writeText("001.png") }
+            val manifestBytes = manifest.readBytes()
+            assertFalse(save(dir, original, output, translator))
+            assertArrayEquals(pageBytes, page.readBytes())
+            assertArrayEquals(manifestBytes, manifest.readBytes())
+            assertFalse(File(dir, ".yakuyomi/001.orig.png").exists())
+            assertTrue(translator.isChapterTranslated(requireNotNull(UniFile.fromFile(dir))))
+            assertTrue(dir.listFiles()!!.none { it.name.startsWith(".yakuyomi_translated.checkpoint-") })
+        }
+    }
+
+    @Test
     fun legacyAndVerifiedArchiveManifestsRequireAllPagesAndRecoverFromCheckpoints() = runBlocking {
         withPage { dir, original, output, translator ->
             val chapter = requireNotNull(UniFile.fromFile(dir))
+            // A real previously translated page must have its preserved source before migration.
+            // A completion marker alone cannot authorize treating the visible output as original.
+            val sourceBytes = File(dir, "001.png").readBytes()
+            val source = File(dir, ".yakuyomi/001.orig.png")
+            assertTrue(source.parentFile!!.mkdir())
+            source.writeBytes(sourceBytes)
             File(dir, ".yakuyomi_translated").writeText("001.png")
             assertTrue(translator.isChapterTranslated(chapter)) // Existing plain-text format.
             assertTrue(save(dir, original, output, translator)) // Migrate it.
+            assertArrayEquals(sourceBytes, source.readBytes())
             val checkpoint = dir.listFiles()!!.single { it.name.startsWith(".yakuyomi_translated.checkpoint-") }
             fun archive(extension: String, entries: Map<String, ByteArray>): UniFile {
                 val file = File(dir, "test.$extension")

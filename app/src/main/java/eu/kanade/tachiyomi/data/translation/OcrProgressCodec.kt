@@ -55,8 +55,15 @@ internal object OcrProgressCodec {
         val width: Int,
         val height: Int,
         val regions: List<Region>,
+        val noTextDetected: Boolean = false,
     ) {
-        fun toProgress(): PageProgress = PageProgress(width, height, regions.map { it.toRegion() }, schemaVersion)
+        fun toProgress(): PageProgress = PageProgress(
+            width,
+            height,
+            regions.map { it.toRegion() },
+            schemaVersion,
+            noTextDetected,
+        )
 
         companion object {
             fun from(progress: PageProgress): Payload = Payload(
@@ -64,6 +71,7 @@ internal object OcrProgressCodec {
                 progress.width,
                 progress.height,
                 progress.regions.map { Region.from(it) },
+                progress.noTextDetected,
             )
         }
     }

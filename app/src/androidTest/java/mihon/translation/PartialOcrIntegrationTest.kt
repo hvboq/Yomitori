@@ -43,6 +43,7 @@ import li.joye.yakuyomi.engine.RegionState
 import li.joye.yakuyomi.engine.RenderConfig
 import li.joye.yakuyomi.engine.TextLine
 import li.joye.yakuyomi.engine.TextOrientation
+import li.joye.yakuyomi.engine.TranslationContext
 import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.Translator
 import li.joye.yakuyomi.engine.TranslatorConfig
@@ -258,6 +259,10 @@ class PartialOcrIntegrationTest {
                     val fresh = pipeline.translatePage(original)
                     try {
                         assertTrue("Fresh all-kept pages still use Skipped", fresh is PageResult.Skipped)
+                        val finalAnalysis = requireNotNull((fresh as PageResult.Skipped).analysis)
+                        assertFalse(finalAnalysis.mask.isRecycled)
+                        assertFalse(requireNotNull(finalAnalysis.progress).hasPending)
+                        assertTrue(finalAnalysis.progress!!.regions.all { it.state == RegionState.INTENTIONALLY_KEPT })
                     } finally {
                         release(fresh)
                     }
@@ -278,6 +283,46 @@ class PartialOcrIntegrationTest {
     @Test
     fun singlePagePartialSurvivesTranslatorRecreationAndResumesWithColdServiceRegistration() = runBlocking<Unit> {
         storedLifecycle(singlePage = true)
+    }
+
+    @Test
+    fun nativeNoTextSkipReturnsEmptyFinalProgressAndCallerOwnedRawMask() = runBlocking<Unit> {
+        FixtureTranslationServer().use { server ->
+            nativePipeline(server = server) { pipeline, ocr ->
+                val original = Bitmap.createBitmap(64, 96, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.WHITE) }
+                var skipped: PageResult? = null
+                try {
+                    val before = digest(original)
+                    val result = pipeline.translatePage(original)
+                    skipped = result
+                    assertTrue(result.toString(), result is PageResult.Skipped)
+                    val analysis = requireNotNull((result as PageResult.Skipped).analysis)
+                    val progress = requireNotNull(analysis.progress)
+                    assertTrue(progress.noTextDetected)
+                    assertFalse(progress.hasPending)
+                    assertTrue(progress.regions.isEmpty())
+                    assertFalse(analysis.mask.isRecycled)
+                    assertEquals(original.width, analysis.mask.width)
+                    assertEquals(original.height, analysis.mask.height)
+                    assertEquals(before, digest(original))
+                    assertEquals(0, ocr.calls)
+                    assertTrue(server.requests.isEmpty())
+                } finally {
+                    release(skipped)
+                    original.recycle()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun completedExactPageCanEnterPartialJournalAndResumeFromItsPreservedOriginal() = runBlocking<Unit> {
+        storedLifecycle(singlePage = true, migrated = MigratedSource.EXACT)
+    }
+
+    @Test
+    fun legacyLossyWebpPartialCanRestorePngAndResumeWithoutSourcePromotion() = runBlocking<Unit> {
+        storedLifecycle(singlePage = true, migrated = MigratedSource.LEGACY_WEBP)
     }
 
     @Test
@@ -304,6 +349,7 @@ class PartialOcrIntegrationTest {
                 var initialProgress: PageProgress? = null
                 var resumedProgress: PageProgress? = null
                 val adapter = object : TranslationEngine {
+                    override val translationContext get() = pipeline.translationContext
                     override suspend fun translatePage(page: Bitmap): PageResult = pipeline.translatePage(page).also {
                         initialProgress = (it as? PageResult.Partial)?.analysis?.progress
                     }
@@ -427,6 +473,7 @@ class PartialOcrIntegrationTest {
         val allowResult = CompletableDeferred<Unit>()
         var calls = 0
         val fake = object : TranslationEngine {
+            override val translationContext = TranslationContext.fromTranslator(TranslatorConfig())
             override suspend fun translatePage(page: Bitmap): PageResult {
                 calls++
                 if (calls == 1) {
@@ -509,6 +556,7 @@ class PartialOcrIntegrationTest {
             assertFalse(File(materials, "001.orig.png").exists())
             var calls = 0
             val fake = object : TranslationEngine {
+                override val translationContext = TranslationContext.fromTranslator(TranslatorConfig())
                 override suspend fun translatePage(page: Bitmap): PageResult {
                     calls++
                     assertEquals(
@@ -599,6 +647,7 @@ class PartialOcrIntegrationTest {
             val preserved = listOf(page, original, json, manifest, checkpoint).associateWith { it.readBytes() }
             val calls = AtomicInteger()
             val fake = object : TranslationEngine {
+                override val translationContext = TranslationContext.fromTranslator(TranslatorConfig())
                 override suspend fun translatePage(page: Bitmap): PageResult {
                     calls.incrementAndGet()
                     error("Ambiguous source ownership must be rejected before OCR or API work")
@@ -663,18 +712,60 @@ class PartialOcrIntegrationTest {
         }
     }
 
-    private suspend fun storedLifecycle(singlePage: Boolean) {
+    private enum class MigratedSource { EXACT, LEGACY_WEBP }
+
+    internal suspend fun verifyLiveStoredLifecycle(translator: Translator, requestCount: () -> Int) =
+        storedLifecycle(singlePage = true, externalTranslator = translator, externalRequestCount = requestCount)
+
+    private suspend fun storedLifecycle(
+        singlePage: Boolean,
+        migrated: MigratedSource? = null,
+        externalTranslator: Translator? = null,
+        externalRequestCount: (() -> Int)? = null,
+    ) {
         FixtureTranslationServer().use { server ->
-            nativePipeline(server = server) { pipeline, ocr ->
+            val requestCount = externalRequestCount ?: { server.requests.size }
+            nativePipeline(server = server, translator = externalTranslator) { pipeline, ocr ->
                 val directory = File(context.cacheDir, "partial-ocr-${System.nanoTime()}").apply { check(mkdirs()) }
                 val page = File(directory, "001.png")
                 val source = fixture()
                 try {
-                    page.outputStream().use { check(source.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+                    val format = if (migrated == MigratedSource.LEGACY_WEBP) {
+                        @Suppress("DEPRECATION")
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            Bitmap.CompressFormat.WEBP_LOSSY
+                        } else {
+                            Bitmap.CompressFormat.WEBP
+                        }
+                    } else {
+                        Bitmap.CompressFormat.PNG
+                    }
+                    page.outputStream().use { check(source.compress(format, 90, it)) }
                 } finally {
                     source.recycle()
                 }
                 val originalBytes = page.readBytes()
+                val originalFile = File(
+                    directory,
+                    if (migrated == MigratedSource.LEGACY_WEBP) ".yakuyomi/001.orig.webp" else ".yakuyomi/001.orig.png",
+                )
+                if (migrated != null) {
+                    check(originalFile.parentFile!!.mkdir())
+                    originalFile.writeBytes(originalBytes)
+                    val priorTranslation = Bitmap.createBitmap(1200, 1600, Bitmap.Config.ARGB_8888).apply {
+                        eraseColor(Color.BLUE)
+                    }
+                    try {
+                        page.outputStream().use {
+                            check(priorTranslation.compress(Bitmap.CompressFormat.PNG, 100, it))
+                        }
+                    } finally {
+                        priorTranslation.recycle()
+                    }
+                    File(directory, CompletionManifestCodec.PRIMARY)
+                        .writeBytes(CompletionManifestCodec.encode(setOf("001.png")))
+                }
+                val previousOutput = page.readBytes()
                 val chapter = requireNotNull(UniFile.fromFile(directory))
                 var initialProgress: PageProgress? = null
                 var finalProgress: PageProgress? = null
@@ -682,6 +773,7 @@ class PartialOcrIntegrationTest {
                 var initialCalls = 0
                 var resumeCalls = 0
                 val adapter = object : TranslationEngine {
+                    override val translationContext get() = pipeline.translationContext
                     private fun assertRegistered() {
                         val field = TranslationEngineService::class.java.getDeclaredField("inFlight").apply {
                             isAccessible = true
@@ -713,6 +805,7 @@ class PartialOcrIntegrationTest {
                             .set(it, activeService)
                     }
                     val first = translator()
+                    if (migrated != null) assertTrue(first.isPageTranslated(chapter, "001.png"))
                     if (singlePage) {
                         assertEquals(
                             PageTranslator.SinglePageResult.PARTIAL,
@@ -723,33 +816,70 @@ class PartialOcrIntegrationTest {
                     }
                     assertEquals(1, initialCalls)
                     assertEquals(0, resumeCalls)
-                    assertEquals(1, server.requests.size)
+                    assertEquals(1, requestCount())
                     assertFalse(first.isPageTranslated(chapter, "001.png"))
                     assertFalse(first.isChapterTranslated(chapter))
                     assertTrue(first.hasDisplayableTranslation(chapter, "001.png"))
                     assertEquals(setOf("001.png"), first.displayablePages(chapter))
                     assertTrue(first.hasPartialProgress(chapter))
-                    val originalFile = File(directory, ".yakuyomi/001.orig.png")
                     assertArrayEquals(originalBytes, originalFile.readBytes())
                     assertFalse(originalBytes.contentEquals(page.readBytes()))
                     val materials = requireNotNull(chapter.findFile(".yakuyomi"))
                     val store = PartialPageStore.forUniFile(context, chapter, materials)
                     val pending = requireNotNull(store.load("001.png"))
                     assertFalse(pending.complete)
+                    assertTrue(
+                        "The registered engine's actual context must be saved",
+                        pending.safeContextPayload != null,
+                    )
+                    if (migrated != null) {
+                        assertArrayEquals(previousOutput, store.readInitialBaseline(pending))
+                        assertEquals(
+                            if (migrated == MigratedSource.LEGACY_WEBP) {
+                                PartialPageStore.OriginalProvenance.LEGACY_REENCODED
+                            } else {
+                                PartialPageStore.OriginalProvenance.EXACT_BYTES
+                            },
+                            pending.original.provenance,
+                        )
+                    } else {
+                        assertNull(pending.initialBaseline)
+                    }
                     val pendingProgress = OcrProgressCodec.decode(pending.progressPayload, 1200, 1600)
                     assertEquals(initialProgress, pendingProgress)
                     val rawMask = store.readRawMask(pending)
                     val maskHash = PartialPageStore.sha256(rawMask)
-                    if (!singlePage) {
+                    val restoreBeforeResume = !singlePage || migrated != null
+                    if (restoreBeforeResume) {
                         assertTrue(first.reRenderPage(chapter, "001.png", "original"))
-                        assertEquals(1, server.requests.size)
+                        assertEquals(1, requestCount())
                         assertEquals(1, ocr.calls)
                         val restored = requireNotNull(store.load("001.png"))
                         assertFalse(restored.complete)
                         assertEquals(pending.progressPayload, restored.progressPayload)
+                        assertEquals(pending.safeContextPayload, restored.safeContextPayload)
+                        assertEquals(pending.initialBaseline, restored.initialBaseline)
                         assertEquals(maskHash, PartialPageStore.sha256(store.readRawMask(restored)))
                         assertArrayEquals(originalBytes, originalFile.readBytes())
-                        assertArrayEquals(originalBytes, page.readBytes())
+                        if (migrated == MigratedSource.LEGACY_WEBP) {
+                            assertTrue(
+                                "The visible .png must remain PNG after legacy restoration",
+                                page.readBytes()[0] == 0x89.toByte(),
+                            )
+                            val expectedImage = requireNotNull(
+                                BitmapFactory.decodeByteArray(originalBytes, 0, originalBytes.size),
+                            )
+                            val restoredImage = requireNotNull(BitmapFactory.decodeFile(page.path))
+                            try {
+                                assertEquals(digest(expectedImage), digest(restoredImage))
+                            } finally {
+                                expectedImage.recycle()
+                                restoredImage.recycle()
+                            }
+                            assertFalse(File(directory, ".yakuyomi/001.orig.png").exists())
+                        } else {
+                            assertArrayEquals(originalBytes, page.readBytes())
+                        }
                     }
                     // A valid old checkpoint must never override the explicit pending journal.
                     File(directory, ".yakuyomi_translated").writeText("001.png")
@@ -772,14 +902,17 @@ class PartialOcrIntegrationTest {
                     assertEquals(1, initialCalls)
                     assertEquals(1, resumeCalls)
                     assertEquals(2, ocr.calls)
-                    assertEquals(2, server.requests.size)
+                    assertEquals(2, requestCount())
                     assertTrue(recreated.isPageTranslated(chapter, "001.png"))
                     assertTrue(recreated.isChapterTranslated(chapter))
                     assertFalse(recreated.hasPartialProgress(chapter))
                     val completed = requireNotNull(store.load("001.png"))
                     assertTrue(completed.complete)
-                    assertEquals(pending.generation + (if (singlePage) 1L else 2L), completed.generation)
+                    assertEquals(pending.generation + (if (restoreBeforeResume) 2L else 1L), completed.generation)
                     assertEquals(pending.original, completed.original)
+                    assertEquals(pending.initialBaseline, completed.initialBaseline)
+                    assertEquals(pending.safeContextPayload, completed.safeContextPayload)
+                    if (migrated != null) assertArrayEquals(previousOutput, store.readInitialBaseline(completed))
                     assertEquals(maskHash, PartialPageStore.sha256(store.readRawMask(completed)))
                     assertArrayEquals(originalBytes, originalFile.readBytes())
                     val after = requireNotNull(finalProgress)
@@ -863,6 +996,7 @@ class PartialOcrIntegrationTest {
 
     /** Deliberately controls only OCR availability; all recognized text comes from the real model. */
     private class ForcedFirstOcr(private val native: Ocr, private val force: Force) : OcrRecognizer {
+        override val intentionalFilterContext get() = native.intentionalFilterContext
         var calls = 0
             private set
         var forcedQuad: List<Pt>? = null
@@ -909,6 +1043,10 @@ class PartialOcrIntegrationTest {
     }
 
     private fun release(result: PageResult?) {
+        if (result is PageResult.Skipped) {
+            result.analysis?.mask?.recycle()
+            return
+        }
         val output = when (result) {
             is PageResult.Translated -> result.page to result.analysis?.mask
             is PageResult.Partial -> result.page to result.analysis.mask
