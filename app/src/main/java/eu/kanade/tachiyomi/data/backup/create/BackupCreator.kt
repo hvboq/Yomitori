@@ -51,6 +51,7 @@ class BackupCreator(
     private val preferenceBackupCreator: PreferenceBackupCreator = PreferenceBackupCreator(),
     private val extensionStoresBackupCreator: ExtensionStoresBackupCreator = ExtensionStoresBackupCreator(),
     private val sourcesBackupCreator: SourcesBackupCreator = SourcesBackupCreator(),
+    private val backupFileValidator: BackupFileValidator = BackupFileValidator(context),
 ) {
 
     suspend fun backup(uri: Uri, options: BackupOptions): String {
@@ -105,7 +106,7 @@ class BackupCreator(
             val fileUri = file.uri
 
             // Make sure it's a valid backup file
-            BackupFileValidator(context).validate(fileUri)
+            backupFileValidator.validate(fileUri)
 
             if (isAutoBackup) {
                 backupPreferences.lastAutoBackupTimestamp.set(Clock.System.now().toEpochMilliseconds())

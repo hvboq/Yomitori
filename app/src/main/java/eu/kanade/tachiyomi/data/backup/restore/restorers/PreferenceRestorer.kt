@@ -30,6 +30,13 @@ class PreferenceRestorer(
     private val context: Context,
     private val getCategories: GetCategories = Injekt.get(),
     private val preferenceStore: PreferenceStore = Injekt.get(),
+    private val sourcePreferenceStoreResolver: (String) -> PreferenceStore = {
+        AndroidPreferenceStore(context, sourcePreferences(it))
+    },
+    private val onAppPreferencesRestored: () -> Unit = {
+        LibraryUpdateJob.setupTask(context)
+        BackupCreateJob.setupTask(context)
+    },
 ) {
     suspend fun restoreApp(
         preferences: List<BackupPreference>,
@@ -41,15 +48,14 @@ class PreferenceRestorer(
             backupCategories,
         )
 
-        LibraryUpdateJob.setupTask(context)
-        BackupCreateJob.setupTask(context)
+        onAppPreferencesRestored()
     }
 
     suspend fun restoreSource(preferences: List<BackupSourcePreferences>) {
         preferences.forEach {
             // A backup must not select arbitrary preference files, including app credentials.
             if (!SourcePreferenceBackupPolicy.isValidSourceKey(it.sourceKey)) return@forEach
-            val sourcePrefs = AndroidPreferenceStore(context, sourcePreferences(it.sourceKey))
+            val sourcePrefs = sourcePreferenceStoreResolver(it.sourceKey)
             restorePreferences(it.prefs, sourcePrefs)
         }
     }

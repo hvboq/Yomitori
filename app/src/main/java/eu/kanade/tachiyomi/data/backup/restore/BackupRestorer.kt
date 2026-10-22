@@ -38,7 +38,7 @@ import kotlin.concurrent.atomics.incrementAndFetch
 @OptIn(ExperimentalAtomicApi::class)
 class BackupRestorer(
     private val context: Context,
-    private val notifier: BackupNotifier,
+    private val callbacks: BackupRestoreCallbacks,
     private val isSync: Boolean,
 
     private val database: Database = Injekt.get(),
@@ -46,7 +46,43 @@ class BackupRestorer(
     private val preferenceRestorer: PreferenceRestorer = PreferenceRestorer(context),
     private val extensionStoreRestorer: ExtensionStoreRestorer = ExtensionStoreRestorer(),
     private val mangaRestorer: MangaRestorer = MangaRestorer(),
+    private val invalidateDownloadCache: () -> Unit = { Injekt.get<DownloadCache>().invalidateCache() },
+    private val decoder: BackupDecoder = BackupDecoder(context),
 ) {
+
+    constructor(
+        context: Context,
+        notifier: BackupNotifier,
+        isSync: Boolean,
+        database: Database = Injekt.get(),
+        categoriesRestorer: CategoriesRestorer = CategoriesRestorer(),
+        preferenceRestorer: PreferenceRestorer = PreferenceRestorer(context),
+        extensionStoreRestorer: ExtensionStoreRestorer = ExtensionStoreRestorer(),
+        mangaRestorer: MangaRestorer = MangaRestorer(),
+    ) : this(
+        context = context,
+        callbacks = object : BackupRestoreCallbacks {
+            override fun showRestoreProgress(content: String, progress: Int, maxAmount: Int, sync: Boolean) {
+                notifier.showRestoreProgress(content, progress, maxAmount, sync)
+            }
+
+            override fun showRestoreComplete(
+                time: Long,
+                errorCount: Int,
+                path: String?,
+                file: String?,
+                sync: Boolean,
+            ) {
+                notifier.showRestoreComplete(time, errorCount, path, file, sync)
+            }
+        },
+        isSync = isSync,
+        database = database,
+        categoriesRestorer = categoriesRestorer,
+        preferenceRestorer = preferenceRestorer,
+        extensionStoreRestorer = extensionStoreRestorer,
+        mangaRestorer = mangaRestorer,
+    )
 
     private var restoreAmount = 0
     private val restoreProgress = AtomicInt(0)
@@ -65,7 +101,7 @@ class BackupRestorer(
         // Invalidate download cache to ensure UI reflects any restored downloads
         if (options.libraryEntries) {
             try {
-                Injekt.get<DownloadCache>().invalidateCache()
+                invalidateDownloadCache()
             } catch (e: Exception) {
                 logcat(LogPriority.ERROR, e) { "Failed to invalidate download cache after restore" }
             }
@@ -75,7 +111,7 @@ class BackupRestorer(
 
         val logFile = writeErrorLog()
 
-        notifier.showRestoreComplete(
+        callbacks.showRestoreComplete(
             time,
             errors.size,
             logFile.parent,
@@ -85,7 +121,7 @@ class BackupRestorer(
     }
 
     private suspend fun restoreFromFile(uri: Uri, options: RestoreOptions) {
-        val backup = BackupDecoder(context).decode(uri)
+        val backup = decoder.decode(uri)
 
         // Store source mapping for error messages
         val backupMaps = backup.backupSources
@@ -108,20 +144,26 @@ class BackupRestorer(
         }
 
         coroutineScope {
-            if (options.categories) {
+            val categoriesJob = if (options.categories) {
                 restoreCategories(backup.backupCategories)
-            }
-            if (options.appSettings) {
-                restoreAppPreferences(backup.backupPreferences, backup.backupCategories.takeIf { options.categories })
+            } else {
+                null
             }
             if (options.sourceSettings) {
                 restoreSourcePreferences(backup.backupSourcePreferences)
             }
-            if (options.libraryEntries) {
-                restoreManga(backup.backupManga, if (options.categories) backup.backupCategories else emptyList())
-            }
             if (options.extensionStores) {
                 restoreExtensionStores(backup.backupExtensionStores)
+            }
+
+            // Preference and manga category remapping requires the restored category IDs.
+            // Independent sections can restore while category creation completes.
+            categoriesJob?.join()
+            if (options.appSettings) {
+                restoreAppPreferences(backup.backupPreferences, backup.backupCategories.takeIf { options.categories })
+            }
+            if (options.libraryEntries) {
+                restoreManga(backup.backupManga, if (options.categories) backup.backupCategories else emptyList())
             }
 
             // TODO: optionally trigger online library + tracker update
@@ -133,7 +175,7 @@ class BackupRestorer(
         categoriesRestorer(backupCategories)
 
         val progress = restoreProgress.incrementAndFetch()
-        notifier.showRestoreProgress(
+        callbacks.showRestoreProgress(
             context.stringResource(MR.strings.categories),
             progress,
             restoreAmount,
@@ -180,7 +222,7 @@ class BackupRestorer(
                     }
                 }
 
-                notifier.showRestoreProgress(chunk.last().title, restoreProgress.load(), restoreAmount, isSync)
+                callbacks.showRestoreProgress(chunk.last().title, restoreProgress.load(), restoreAmount, isSync)
             }
     }
 
@@ -195,7 +237,7 @@ class BackupRestorer(
         )
 
         val progress = restoreProgress.incrementAndFetch()
-        notifier.showRestoreProgress(
+        callbacks.showRestoreProgress(
             context.stringResource(MR.strings.app_settings),
             progress,
             restoreAmount,
@@ -208,7 +250,7 @@ class BackupRestorer(
         preferenceRestorer.restoreSource(preferences)
 
         val progress = restoreProgress.incrementAndFetch()
-        notifier.showRestoreProgress(
+        callbacks.showRestoreProgress(
             context.stringResource(MR.strings.source_settings),
             progress,
             restoreAmount,
@@ -235,7 +277,7 @@ class BackupRestorer(
                         restoreProgress.incrementAndFetch()
                     }
                 }
-                notifier.showRestoreProgress(
+                callbacks.showRestoreProgress(
                     context.stringResource(MR.strings.extensionStores),
                     restoreProgress.load(),
                     restoreAmount,

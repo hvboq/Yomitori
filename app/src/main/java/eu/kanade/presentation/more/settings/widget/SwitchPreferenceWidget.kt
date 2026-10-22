@@ -9,6 +9,11 @@ import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import eu.kanade.presentation.theme.TachiyomiPreviewTheme
 
@@ -23,7 +28,11 @@ fun SwitchPreferenceWidget(
     onCheckedChanged: (Boolean) -> Unit,
 ) {
     TextPreferenceWidget(
-        modifier = modifier,
+        modifier = modifier.semantics {
+            // The entire row handles clicks; the trailing Switch is only its visual indicator.
+            role = Role.Switch
+            toggleableState = ToggleableState(checked)
+        },
         title = title,
         titleBadge = titleBadge,
         subtitle = subtitle,

@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.data.backup.create.creators
 
+import android.content.SharedPreferences
 import eu.kanade.tachiyomi.data.backup.TranslationCredentialBackupPolicy
 import eu.kanade.tachiyomi.data.backup.models.BackupPreference
 import eu.kanade.tachiyomi.data.backup.models.BackupSourcePreferences
@@ -21,6 +22,7 @@ import uy.kohesive.injekt.api.get
 class PreferenceBackupCreator(
     private val sourceManager: SourceManager = Injekt.get(),
     private val preferenceStore: PreferenceStore = Injekt.get(),
+    private val sourcePreferenceResolver: (String) -> SharedPreferences = ::sourcePreferences,
 ) {
 
     fun createApp(includePrivatePreferences: Boolean): List<BackupPreference> {
@@ -33,9 +35,10 @@ class PreferenceBackupCreator(
         return sourceManager.getAll()
             .filterIsInstance<ConfigurableSource>()
             .map {
+                val sourceKey = it.preferenceKey()
                 BackupSourcePreferences(
-                    it.preferenceKey(),
-                    it.sourcePreferences().all.toBackupPreferences()
+                    sourceKey,
+                    sourcePreferenceResolver(sourceKey).all.toBackupPreferences()
                         .withPrivatePreferences(includePrivatePreferences),
                 )
             }
