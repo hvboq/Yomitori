@@ -10,6 +10,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.hippo.unifile.UniFile
+import dev.icerock.moko.resources.StringResource
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationBusy
@@ -32,6 +33,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.domain.chapter.model.Chapter
 import tachiyomi.domain.chapter.repository.ChapterRepository
 import tachiyomi.domain.manga.interactor.GetFavorites
@@ -42,11 +44,14 @@ import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.domain.storage.service.StorageManager
 import tachiyomi.domain.storage.service.StoragePreferences
 import tachiyomi.domain.translation.service.TranslationPreferences
+import tachiyomi.i18n.MR
 import tachiyomi.source.local.LocalSource
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -68,9 +73,8 @@ class LocalReaderTranslationTest {
                 assertEquals(Uri.fromFile(File(fixture.file, "002.png")), pages[1].uri)
                 scenario.onActivity {
                     it.viewModel.state.value.viewer!!.moveToPage(pages[1])
-                    it.viewModel.openPageDialog(pages[1])
-                    it.viewModel.translateThisPage()
                 }
+                pageAction(scenario, pages[1], MR.strings.reader_translate_this_page)
                 waitFor(180000) {
                     server.failure?.let { throw AssertionError("Fixture HTTP failure", it) }
                     fixture.translator.isPageTranslated(fixture.uniFile, "002.png") &&
@@ -82,13 +86,13 @@ class LocalReaderTranslationTest {
                 compareOriginal(scenario, pages[1], fixture.original)
                 val calls = server.requests.size
                 val revision = pages[1].reloadFlow.value
-                scenario.onActivity { it.viewModel.openReRenderDialog(pages[1]) }
+                pageAction(scenario, pages[1], MR.strings.reader_change_removal)
                 waitFor(10000) { activity.viewModel.state.value.dialog is ReaderViewModel.Dialog.ReRenderMethod }
                 scenario.onActivity { it.viewModel.reRenderPage("boxfill") }
                 waitFor(180000) { pages[1].reloadFlow.value > revision && TranslationBusy.active.value == 0 }
                 assertEquals("Re-render must reuse persisted OCR/translation", calls, server.requests.size)
                 val firstRevision = pages[0].reloadFlow.value
-                scenario.onActivity { it.viewModel.startChapterTranslate() }
+                pageAction(scenario, pages[0], MR.strings.reader_translate_this_chapter)
                 waitFor(180000) {
                     server.failure?.let { throw AssertionError("Fixture HTTP failure", it) }
                     fixture.translator.isChapterTranslated(fixture.uniFile) && pages[0].reloadFlow.value > firstRevision
@@ -121,8 +125,13 @@ class LocalReaderTranslationTest {
                 val page = activity.viewModel.state.value.viewerChapters!!.currChapter.pages!![1]
                 scenario.onActivity {
                     it.viewModel.state.value.viewer!!.moveToPage(page)
-                    it.viewModel.startChapterTranslate()
                 }
+                pageAction(
+                    scenario,
+                    page,
+                    MR.strings.reader_translate_this_chapter,
+                    forbidden = MR.strings.reader_translate_this_page,
+                )
                 waitFor(240000) {
                     server.failure?.let { throw AssertionError("Fixture HTTP failure", it) }
                     val current = activity.viewModel.state.value.viewerChapters?.currChapter
@@ -159,6 +168,96 @@ class LocalReaderTranslationTest {
     }
 
     @Test
+    fun localDirectoryAutomaticTranslationUsesActualStopAndRestartActions() = localAutomaticTranslation(archive = false)
+
+    @Test
+    fun localArchiveAutomaticTranslationUsesActualStopAndRestartActions() = localAutomaticTranslation(archive = true)
+
+    private fun localAutomaticTranslation(archive: Boolean) = runBlocking<Unit> {
+        // One page isolates the held request from the chapter's multi-page pipeline. The other
+        // tests cover two-page resume and archive replacement without concurrent fixture sockets.
+        withFixture(archive = archive, live = true, pageCount = 1) { fixture, server ->
+            val requested = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            server.expectClientDisconnect = setOf(1)
+            server.beforeResponse = { number ->
+                if (number == 1) {
+                    requested.countDown()
+                    check(release.await(30, TimeUnit.SECONDS)) { "Local automatic translation gate timed out" }
+                }
+            }
+            // Migrate the impossible local pending state left by the previously released bug.
+            fixture.manager.markForTranslate(fixture.chapter.id)
+            val originalArchive = if (archive) fixture.file.readBytes() else null
+            try {
+                ActivityScenario.launch<ReaderActivity>(fixture.intent()).use { scenario ->
+                    val activity = ready(scenario, expectedPages = 1)
+                    assertTrue("Local auto mode never reached native OCR/LLM", requested.await(180, TimeUnit.SECONDS))
+                    fixture.assertNoDownload()
+                    assertFalse(activity.viewModel.state.value.translationDownloadPending)
+                    waitFor(10000) { activity.viewModel.state.value.liveTranslateProgress != null }
+                    pageAction(
+                        scenario,
+                        activity.viewModel.state.value.viewerChapters!!.currChapter.pages!!.first(),
+                        MR.strings.reader_stop_chapter_translate,
+                        forbidden = MR.strings.reader_translate_this_chapter,
+                    )
+                    release.countDown()
+                    waitFor(30000) {
+                        server.failure?.let { throw AssertionError("Fixture cancellation failure", it) }
+                        TranslationBusy.active.value == 0 && fixture.manager.queueState.value.isEmpty() &&
+                            1 in server.disconnectedRequests
+                    }
+                    fixture.assertNoDownload()
+                    if (archive) {
+                        assertArrayEquals(originalArchive, fixture.file.readBytes())
+                    } else {
+                        assertArrayEquals(fixture.original, File(fixture.file, "001.png").readBytes())
+                    }
+                    // Queue removal/reload in this session must not auto-enqueue the stopped chapter.
+                    SystemClock.sleep(500)
+                    assertEquals(1, server.requests.size)
+                    assertTrue(fixture.manager.queueState.value.isEmpty())
+                    pageAction(
+                        scenario,
+                        activity.viewModel.state.value.viewerChapters!!.currChapter.pages!!.first(),
+                        MR.strings.reader_translate_this_chapter,
+                    )
+                    waitFor(240000) {
+                        server.failure?.let { throw AssertionError("Fixture HTTP failure", it) }
+                        val done = if (archive) {
+                            fixture.translator.isArchiveTranslated(fixture.uniFile)
+                        } else {
+                            fixture.translator.isChapterTranslated(fixture.uniFile)
+                        }
+                        done && TranslationBusy.active.value == 0 && fixture.manager.queueState.value.isEmpty()
+                    }
+                    fixture.assertNoDownload()
+                    assertEquals(2, server.requests.size) // One cancelled request and one completed translation.
+                    waitFor(10000) { activity.viewModel.state.value.liveTranslateProgress == null }
+                    if (!archive) {
+                        val page = activity.viewModel.state.value.viewerChapters!!.currChapter.pages!!.first()
+                        compareOriginal(scenario, page, fixture.original)
+                        pageAction(scenario, page, MR.strings.reader_change_removal)
+                        waitFor(10000) {
+                            activity.viewModel.state.value.dialog is ReaderViewModel.Dialog.ReRenderMethod
+                        }
+                        scenario.onActivity { it.viewModel.closeDialog() }
+                    }
+                }
+                ActivityScenario.launch<ReaderActivity>(fixture.intent()).use { scenario ->
+                    val activity = ready(scenario, expectedPages = 1)
+                    assertEquals(1, activity.viewModel.state.value.viewerChapters!!.currChapter.pages!!.size)
+                    fixture.assertNoDownload()
+                    assertEquals("Reopening completed local content must not translate again", 2, server.requests.size)
+                }
+            } finally {
+                release.countDown()
+            }
+        }
+    }
+
+    @Test
     fun archiveReaderExcludesReservedMaterialsButKeepsNormalNestedImages() = runBlocking<Unit> {
         val file = File.createTempFile("local-reader-paths-", ".cbz", context.cacheDir)
         try {
@@ -182,7 +281,12 @@ class LocalReaderTranslationTest {
         }
     }
 
-    private suspend fun withFixture(archive: Boolean, block: suspend (Fixture, FixtureTranslationServer) -> Unit) {
+    private suspend fun withFixture(
+        archive: Boolean,
+        live: Boolean = false,
+        pageCount: Int = 2,
+        block: suspend (Fixture, FixtureTranslationServer) -> Unit,
+    ) {
         val manager = Injekt.get<TranslationManager>()
         val downloads = Injekt.get<DownloadManager>()
         assertTrue(
@@ -211,7 +315,10 @@ class LocalReaderTranslationTest {
                     settings.set(prefs.orientation, "horizontal")
                     settings.set(prefs.translationMasterEnabled, true)
                     settings.set(prefs.translationEnabled, false)
-                    settings.set(prefs.liveTranslate, false)
+                    settings.set(prefs.liveTranslate, live)
+                    settings.set(prefs.translationSourcesExclude, emptySet())
+                    settings.set(prefs.liveTranslateCategories, emptySet())
+                    settings.set(prefs.liveTranslateCategoriesExclude, emptySet())
                     settings.set(prefs.liveInpaintMethod, "boxfill")
                     settings.set(prefs.inpaintMethod, "boxfill")
                     settings.set(prefs.keepMaterials, true)
@@ -229,7 +336,7 @@ class LocalReaderTranslationTest {
                     val file = File(mangaDir, chapterName)
                     if (archive) {
                         ZipOutputStream(file.outputStream()).use { zip ->
-                            for (name in listOf("001.png", "002.png")) {
+                            for (name in (1..pageCount).map { "%03d.png".format(it) }) {
                                 zip.putNextEntry(ZipEntry(name))
                                 zip.write(image)
                                 zip.closeEntry()
@@ -237,8 +344,7 @@ class LocalReaderTranslationTest {
                         }
                     } else {
                         check(file.mkdir())
-                        File(file, "001.png").writeBytes(image)
-                        File(file, "002.png").writeBytes(image)
+                        (1..pageCount).forEach { File(file, "%03d.png".format(it)).writeBytes(image) }
                     }
                     val repository = Injekt.get<MangaRepository>()
                     val manga = repository.insertNetworkManga(
@@ -283,25 +389,42 @@ class LocalReaderTranslationTest {
         }
     }
 
-    private fun ready(scenario: ActivityScenario<ReaderActivity>): ReaderActivity {
+    private fun ready(scenario: ActivityScenario<ReaderActivity>, expectedPages: Int = 2): ReaderActivity {
         lateinit var activity: ReaderActivity
         scenario.onActivity { activity = it }
-        waitFor(15000) { activity.viewModel.state.value.viewerChapters?.currChapter?.pages?.size == 2 }
+        waitFor(15000) { activity.viewModel.state.value.viewerChapters?.currChapter?.pages?.size == expectedPages }
         return activity
     }
 
     private fun compareOriginal(scenario: ActivityScenario<ReaderActivity>, page: ReaderPage, original: ByteArray) {
-        scenario.onActivity {
-            it.viewModel.openPageDialog(page)
-            it.viewModel.toggleOriginalPreview()
-        }
+        pageAction(scenario, page, MR.strings.reader_show_original, forbidden = MR.strings.reader_show_translation)
         waitFor(10000) { page.isOriginalPreview }
         assertArrayEquals(original, page.displayStream!!().use { it.readBytes() })
-        scenario.onActivity {
-            it.viewModel.openPageDialog(page)
-            it.viewModel.toggleOriginalPreview()
-        }
+        pageAction(scenario, page, MR.strings.reader_show_translation, forbidden = MR.strings.reader_show_original)
         waitFor(10000) { !page.isOriginalPreview }
+    }
+
+    /** Open the real page menu, then activate its accessibility button, never the operation's VM method. */
+    private fun pageAction(
+        scenario: ActivityScenario<ReaderActivity>,
+        page: ReaderPage,
+        action: StringResource,
+        forbidden: StringResource = MR.strings.reader_stop_chapter_translate,
+    ) {
+        lateinit var expectedLabel: String
+        lateinit var forbiddenLabel: String
+        scenario.onActivity {
+            expectedLabel = it.stringResource(action)
+            forbiddenLabel = it.stringResource(forbidden)
+            it.viewModel.openPageDialog(page)
+        }
+        checkOnlineReaderAction(
+            packageName = context.packageName,
+            expectedLabel = expectedLabel,
+            forbiddenLabel = forbiddenLabel,
+            click = true,
+            beforeClick = {},
+        )
     }
 
     private fun sample(): ByteArray {

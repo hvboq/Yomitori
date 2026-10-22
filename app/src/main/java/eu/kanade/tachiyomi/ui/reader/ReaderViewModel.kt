@@ -667,7 +667,7 @@ class ReaderViewModel @JvmOverloads constructor(
             prefetchNextChapters(chapter)
             return
         }
-        // 原生 loader：只有「線上（未下載）且符合即時翻 gate」才觸發下載 + 重載。
+        // Native loaders: local files enqueue directly; only HttpSource chapters may download.
         maybeTriggerOnlineLiveTranslate(chapter)
     }
 
@@ -714,14 +714,31 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     /**
-     * 線上（未下載）章的即時翻入口：判斷「是否該對這條線上章即時翻」（gate 與 [ChapterLoader.shouldTranslateLive]
-     * 對齊：開關 + 引擎就緒 + 分類 + 尚未翻好 + 確為線上未下載），符合則觸發 [triggerOnlineLiveTranslate]。
-     * 每章只觸發一次（[onlineTriggeredChapterIds]）。
+     * Automatic translation for native loaders. Local Directory/Archive chapters enqueue directly;
+     * HTTP chapters download first. Both share master/live/engine/source/category gates and the
+     * per-session activation latch; explicit Stop invalidates an activation waiting on those gates.
      */
     private suspend fun maybeTriggerOnlineLiveTranslate(chapter: ReaderChapter) {
         val manga = manga ?: return
         val loader = loader ?: return
         val chapterId = chapter.chapter.id ?: return
+        val source = sourceManager.getOrStub(manga.source)
+        if (source is LocalSource) {
+            // Older versions incorrectly persisted local chapters as pending HTTP downloads.
+            // Clear that impossible state even if automatic translation is now disabled.
+            synchronized(onlineTranslationLock) {
+                if (translationManager.isPendingTranslate(chapterId)) {
+                    translationManager.clearPending(chapterId)
+                    pendingTranslationIntentRevision.update { it + 1 }
+                }
+            }
+        } else if (source !is HttpSource) {
+            return
+        }
+        val stopVersion = synchronized(onlineTranslationLock) {
+            if (chapterId in stoppedTranslationChapters) return
+            translationStopVersions[chapterId] ?: 0L
+        }
         if (chapterId in onlineTriggeredChapterIds) return
 
         // gate：即時翻開關 + 引擎就緒（key+模型，**不含**「下載時翻譯」開關）+ 分類（與已下載路徑 shouldTranslateLive 同一份語義）。
@@ -731,6 +748,31 @@ class ReaderViewModel @JvmOverloads constructor(
         if (!translationPreferences.liveTranslate.get()) return
         if (!loader.engineReady()) return
         if (!loader.autoTranslateAllowed()) return
+
+        val domainChapter = chapter.chapter.toDomainChapter() ?: return
+        if (translationManager.isTranslated(manga, domainChapter)) return
+        if (source is LocalSource) {
+            val format = runCatching { source.getFormat(chapter.chapter) }.getOrNull()
+            if (format !is Format.Directory && format !is Format.Archive) return
+            synchronized(onlineTranslationLock) {
+                if (chapterId in stoppedTranslationChapters ||
+                    (translationStopVersions[chapterId] ?: 0L) != stopVersion ||
+                    getCurrentChapter()?.chapter?.id != chapterId ||
+                    !translationPreferences.translationMasterEnabled.get() ||
+                    !translationPreferences.liveTranslate.get() ||
+                    !onlineTriggeredChapterIds.add(chapterId)
+                ) {
+                    return
+                }
+                translationManager.translate(
+                    manga,
+                    listOf(domainChapter),
+                    atFront = true,
+                    method = translationManager.liveInpaintMethod(),
+                )
+            }
+            return
+        }
 
         // 必須是「線上、尚未下載」才走此路徑（已下載章由 TranslatingPageLoader 路徑處理）。
         val isDownloaded = downloadManager.isChapterDownloaded(
@@ -743,12 +785,14 @@ class ReaderViewModel @JvmOverloads constructor(
         )
         if (isDownloaded) return
 
-        val domainChapter = chapter.chapter.toDomainChapter() ?: return
-        // 已整章翻好（理論上線上章必未翻；保險檢查）→ 不重翻。
-        if (translationManager.isTranslated(manga, domainChapter)) return
-
-        onlineTriggeredChapterIds.add(chapterId)
-        triggerOnlineLiveTranslate(chapter)
+        synchronized(onlineTranslationLock) {
+            if ((translationStopVersions[chapterId] ?: 0L) != stopVersion ||
+                !onlineTriggeredChapterIds.add(chapterId)
+            ) {
+                return
+            }
+            triggerOnlineLiveTranslate(chapter)
+        }
     }
 
     /**
@@ -767,6 +811,7 @@ class ReaderViewModel @JvmOverloads constructor(
      */
     private fun triggerOnlineLiveTranslate(chapter: ReaderChapter, explicitRetry: Boolean = false) {
         val manga = manga ?: return
+        if (sourceManager.getOrStub(manga.source) !is HttpSource) return
         val domainChapter = chapter.chapter.toDomainChapter() ?: return
         synchronized(onlineTranslationLock) {
             if (explicitRetry) stoppedTranslationChapters.remove(domainChapter.id)

@@ -491,9 +491,14 @@ class ReaderActivity : BaseActivity() {
             }
             is ReaderViewModel.Dialog.PageActions -> {
                 val page = dialog.page
-                // 已下載章＝頁圖在磁碟（可重繪/可單頁翻）；DownloadPageLoader＝已下載、TranslatingPageLoader＝即時翻（同樣落盤）。
-                val pageOnDisk = page.chapter.pageLoader is DownloadPageLoader ||
-                    page.chapter.pageLoader is TranslatingPageLoader
+                // Single-page operations require the exact loose-file URI, including local sources.
+                // Archive entries have no such URI and must use safe whole-chapter translation.
+                val pageOnDisk = page.uri != null &&
+                    (
+                        page.chapter.pageLoader is DownloadPageLoader ||
+                            page.chapter.pageLoader is TranslatingPageLoader ||
+                            page.chapter.pageLoader is DirectoryPageLoader
+                        )
                 // 夜讀項（日常／夜讀切換已移到常駐懸浮鈕，這裡不再重複）：先過夜讀表層總開關；再要求頁圖在鬆散資料夾
                 // （已下載／即時翻／本機來源目錄章；壓縮檔章、線上章＝UNSUPPORTED）。
                 val nightCapable = nightReadEnabled &&
