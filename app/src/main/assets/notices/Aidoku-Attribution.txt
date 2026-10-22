@@ -1,0 +1,37 @@
+Aidoku source attribution
+
+Reference repository: https://github.com/qwopqwop200/Aidoku
+Reference commit: 821a612f3648e9312cf1efafe175d4aa77d96b5f
+
+Aidoku application code
+-----------------------
+The referenced repository's LICENSE contains the GNU General Public License,
+version 3. Its README.md identifies the application repository, excluding
+translations, as GPLv3. Aidoku application logic referenced or ported for DPI
+and layout handling is covered by this application-code license, not by the
+separate community source notice below.
+
+Aidoku-GPL-3.0.txt is an unmodified copy of LICENSE at the reference commit.
+
+Native Hitomi source adapter provenance
+---------------------------------------
+The Kotlin Hitomi adapter follows these files in the reference repository:
+Aidoku/Core/Sources/BuiltIn/Hitomi/HitomiSource.swift
+Aidoku/Core/Sources/BuiltIn/Hitomi/HitomiSearch.swift
+Aidoku/Core/Sources/BuiltIn/Hitomi/HitomiModels.swift
+Aidoku/Core/Sources/BuiltIn/Hitomi/HitomiGalleryRouting.swift
+
+Docs/native-source-auth.md, section "Source provenance and license", identifies
+community-derived native source ports as using the MIT license option from:
+https://github.com/Aidoku-Community/sources
+Community reference commit: 897b8f2102b48c722f438c10373d1cb5e10876cb
+
+That document preserves the notice in Docs/NativeSource-MIT.txt. Hitomi-MIT.txt
+is an unmodified copy of that notice and remains bundled for this provenance.
+This separate native source notice does not describe the license of Aidoku's
+application code as a whole or of application DPI/layout logic.
+
+Other project notices
+----------------------
+The existing Yakuyomi GPL-3.0 and Mihon Apache-2.0 notices remain bundled
+separately.

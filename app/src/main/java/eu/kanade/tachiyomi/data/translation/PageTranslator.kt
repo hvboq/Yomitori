@@ -45,6 +45,7 @@ import li.joye.yakuyomi.engine.TextLine
 import li.joye.yakuyomi.engine.TextRegion
 import li.joye.yakuyomi.nightread.NightReadParams
 import logcat.LogPriority
+import mihon.core.archive.archiveReader
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.translation.service.TranslationPreferences
@@ -91,7 +92,7 @@ class PageTranslator(private val context: Context) {
     fun isReady(): Boolean {
         if (!translationPreferences.translationMasterEnabled.get()) return false
         if (!translationPreferences.translationEnabled.get()) return false
-        if (apiKey().isBlank()) return false
+        if (!translationPreferences.hasCredentials()) return false
         if (TranslationEngineConfig.isProviderBaseMissing(translationPreferences)) return false
         return TranslationEngineConfig.modelsResolvable(context)
     }
@@ -228,8 +229,7 @@ class PageTranslator(private val context: Context) {
                                     logcat(LogPriority.WARN) { "翻譯略過 $name：$reason" }
                                     stateMutex.withLock {
                                         errors.appendLine("$name\t$reason")
-                                        done.add(name)
-                                        done.addAll(commitManifest(chapterDir, done))
+                                        done.addAll(commitManifest(chapterDir, done + name))
                                         processed++
                                         onProgress(processed, total)
                                     }
@@ -249,10 +249,21 @@ class PageTranslator(private val context: Context) {
                                 }
                             }
                             TraceLog.log("page", "$name decoded ${bmp.width}x${bmp.height} -> engine")
+                            var translatedResult: PageResult.Translated? = null
                             try {
                                 // 併發進引擎（EngineService 已放鬆成可並發；同章去字法相同、不重建）。§11 三態處理與循序版完全一致。
-                                when (val r = engineService.translatePage(bmp, inpaintMethodRaw)) {
+                                val result = runTranslationUntilStopped(
+                                    shouldStop = shouldStop,
+                                    discard = { r ->
+                                        if (r is PageResult.Translated) {
+                                            r.page.recycle()
+                                            r.analysis?.mask?.recycle()
+                                        }
+                                    },
+                                ) { engineService.translatePage(bmp, inpaintMethodRaw) } ?: return@launch
+                                when (val r = result) {
                                     is PageResult.Translated -> {
+                                        translatedResult = r
                                         val keepThisPage = keepMaterials && r.analysis != null
                                         // 落地整段在頁鎖內（只擋同一頁；別頁照樣並發）：存原檔 → 覆蓋頁檔 → 存素材 → 記清單 → 刪記號。
                                         val landed = lock.withLock {
@@ -260,8 +271,8 @@ class PageTranslator(private val context: Context) {
                                             // → 不再蓋一次：再存原檔會存到譯圖。
                                             if (name in readDonePages(chapterDir)) return@withLock false
                                             // 保留素材：原檔位元組要在頁檔被譯圖覆蓋**之前**原樣複製出去（覆蓋後就沒有了）。
-                                            // 複製失敗不擋翻譯，[saveMaterials] 會退回舊做法（把解碼後的原圖存成有損 WebP）。
-                                            val saved = if (keepThisPage) saveOriginalBytes(chapterDir, img) else null
+                                            // Originals are mandatory even when optional re-render materials are disabled.
+                                            val saved = saveOriginalBytes(chapterDir, img)
                                             writeBackOrRestore(img, r.page, saved) // 各頁寫各自檔、並發
                                             r.page.recycle() // 譯圖已落檔、後面用不到 → 立即回收（跨頁併發下少堆一張 bitmap，降記憶體峰值）
                                             // 成品頁換了 → 舊夜讀版（若有，如先手動產生再翻譯）作廢；翻完由開關開著的夜讀佇列補做。
@@ -298,12 +309,13 @@ class PageTranslator(private val context: Context) {
                                                     materialsFailed = true
                                                     errors.appendLine("(materials)\t$matErr")
                                                 }
+                                                done.addAll(commitManifest(chapterDir, done + name))
                                                 translated++
-                                                done.add(name)
-                                                done.addAll(commitManifest(chapterDir, done))
                                             }
                                             // 這頁進了清單 → 進行中記號用不到了（記號只對還沒進清單的頁有意義）。
-                                            saved?.marker?.let { m -> runCatching { m.delete() } }
+                                            saved?.marker?.let { m ->
+                                                deleteFileOnly(m, OriginalMaterial.inflightName(name))
+                                            }
                                             true
                                         }
                                         if (landed) {
@@ -325,8 +337,7 @@ class PageTranslator(private val context: Context) {
                                         completionTokens += r.stats.completionTokens
                                         TraceLog.log("page", "$name skipped")
                                         logcat { "翻譯略過 $name：${r.reason}" }
-                                        done.add(name)
-                                        done.addAll(commitManifest(chapterDir, done)) // 略過＝沒字可翻、算處理過、不重試
+                                        done.addAll(commitManifest(chapterDir, done + name)) // 略過＝沒字可翻、算處理過、不重試
                                     }
                                     is PageResult.Failed -> stateMutex.withLock {
                                         // 該頁失敗 → 跳過、留原圖、續翻下一頁；記原因供查（不標記、下次重試）。
@@ -345,6 +356,10 @@ class PageTranslator(private val context: Context) {
                                     errors.appendLine("$name\t例外 ${t.javaClass.simpleName}: ${t.message}")
                                 }
                             } finally {
+                                translatedResult?.let {
+                                    if (!it.page.isRecycled) it.page.recycle()
+                                    it.analysis?.mask?.let { mask -> if (!mask.isRecycled) mask.recycle() }
+                                }
                                 if (!bmp.isRecycled) bmp.recycle() // 任何出口（成功/略過/失敗/例外）都回收，避免併發下 bitmap 堆積 → OOM
                             }
                             // 跑到 when 的頁（含例外頁）在這裡計進度；太大／讀不出來的頁上面自己計過。shouldStop／無檔名提早 return
@@ -376,7 +391,7 @@ class PageTranslator(private val context: Context) {
         if (allErrors.isNotEmpty()) {
             overwriteBytes(chapterDir, ERRORS_FILE, allErrors.joinToString("\n", postfix = "\n").toByteArray())
         } else {
-            runCatching { chapterDir.findFile(ERRORS_FILE)?.delete() }
+            deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
         }
         // 統計：記當日新翻頁數 + token（resume 已跳過 done 頁 ⇒ translated 為本輪新翻、不重複計）。
         // chapters 只在本輪把整章補成「全翻完」時 +1（避免部分翻/重試各算一次）。
@@ -430,11 +445,20 @@ class PageTranslator(private val context: Context) {
         val name = pageFile.name ?: return false
         return runCatching {
             pageLock(pageFile).withLock {
-                if (wasPending && name in readDonePages(chapterDir)) return@withLock true
-                // 0. 原檔位元組要在頁檔被覆蓋**之前**原樣複製出去（此時 pageFile 還是下載下來的原檔）。best-effort。
+                val alreadyDone = name in readDonePages(chapterDir)
+                if (wasPending && alreadyDone) return@withLock true
+                if (!alreadyDone && !recoverInterrupted(chapterDir, pageFile, name)) return@withLock false
+                // 0. 原檔位元組必須在頁檔被覆蓋之前原樣複製出去。
                 //    頁檔是我們自己的成品時不複製：素材裡留著的才是原圖。
-                val copyOriginal = analysis != null && !keepExistingOriginal
-                val saved = if (copyOriginal) saveOriginalBytes(chapterDir, pageFile) else null
+                val existingOriginal = if (keepExistingOriginal || alreadyDone) {
+                    chapterDir.findFile(MATERIALS_DIR)
+                        ?.let { findOriginalMaterial(it, name) }
+                        ?.let { (file, exact) -> if (exact) SavedOriginal(file, null) else null }
+                } else {
+                    null
+                }
+                val saved =
+                    existingOriginal ?: if (keepExistingOriginal) null else saveOriginalBytes(chapterDir, pageFile)
                 // 1. 譯圖覆蓋下載檔（§11：呼叫端保證只有成功頁才進來）。成品頁換了 → 舊夜讀版作廢（見 [invalidateNightPage]）。
                 writeBackOrRestore(pageFile, translated, saved)
                 invalidateNightPage(chapterDir.findFile(MATERIALS_DIR), name)
@@ -445,10 +469,11 @@ class PageTranslator(private val context: Context) {
                 }
                 // 3. 加進 manifest（page-level resume 標記）。讀-改-寫經 [manifestMutex]（行程內共用）序列化。
                 commitManifest(chapterDir, setOf(name))
-                saved?.marker?.let { m -> runCatching { m.delete() } }
+                saved?.marker?.let { m -> deleteFileOnly(m, OriginalMaterial.inflightName(name)) }
                 true
             }
         }.getOrElse { e ->
+            if (e is CancellationException) throw e
             logcat(LogPriority.WARN, e) { "即時翻譯落地頁失敗 $name" }
             false
         }
@@ -548,18 +573,22 @@ class PageTranslator(private val context: Context) {
             when (val r = engineService.translatePage(original, method)) {
                 is PageResult.Translated -> {
                     // 與佇列逐頁一致：覆蓋下載檔 + 強制存素材（重繪用）+ 記 manifest（manifestMutex 序列化）。
-                    persistLivePage(
-                        chapterDir,
-                        pageFile,
-                        original,
-                        r.page,
-                        r.analysis,
-                        method,
-                        keepExistingOriginal = keptBitmapUsed,
-                        wasPending = wasPending,
-                    )
-                    r.page.recycle()
-                    SinglePageResult.TRANSLATED
+                    try {
+                        val saved = persistLivePage(
+                            chapterDir,
+                            pageFile,
+                            original,
+                            r.page,
+                            r.analysis,
+                            method,
+                            keepExistingOriginal = keptBitmapUsed,
+                            wasPending = wasPending,
+                        )
+                        if (saved) SinglePageResult.TRANSLATED else SinglePageResult.NOT_TRANSLATED
+                    } finally {
+                        r.page.recycle()
+                        r.analysis?.mask?.recycle()
+                    }
                 }
                 is PageResult.Skipped -> {
                     logcat { "翻譯這頁略過 $pageFileName：${r.reason}" } // 無字可翻：不覆蓋、不算成功
@@ -861,12 +890,12 @@ class PageTranslator(private val context: Context) {
         val pageNames = listed.mapNotNullTo(HashSet()) { it.name }.takeIf { total > 0 || MATERIALS_DIR in it }
         val doomed = NightPages.cleanupPlan(matFiles.keys, pageNames)
         for (n in doomed) {
-            runCatching { matFiles.getValue(n).delete() }
+            runCatching { deleteFileOnly(matFiles.getValue(n), n) }
                 .onFailure { logcat(LogPriority.WARN, it) { "清夜讀殘留檔失敗 $n" } }
         }
         // 已經不在這章的頁留下的夜讀文字框檔（[NightTextBoxes.orphans]；列目錄不可信時不清，同上）。只給夜讀用的檔，在這裡一起清。
         for (n in NightTextBoxes.orphans(matFiles.keys, pageNames)) {
-            runCatching { matFiles.getValue(n).delete() }
+            runCatching { deleteFileOnly(matFiles.getValue(n), n) }
                 .onFailure { logcat(LogPriority.WARN, it) { "清孤兒夜讀文字框檔失敗 $n" } }
         }
         val existing = HashMap<String, UniFile>()
@@ -1361,12 +1390,7 @@ class PageTranslator(private val context: Context) {
      */
     private fun createEmptyNamed(dir: UniFile, name: String): Boolean = runCatching {
         val f = dir.findFile(name) ?: dir.createFile(name) ?: return@runCatching false
-        if (f.name == name) {
-            true
-        } else {
-            runCatching { f.delete() }
-            false
-        }
+        f.isFile && f.name == name
     }.onFailure { logcat(LogPriority.WARN, it) { "建空檔失敗 $name" } }.getOrDefault(false)
 
     /**
@@ -1375,7 +1399,7 @@ class PageTranslator(private val context: Context) {
      */
     private fun probeStampWritable(matDir: UniFile): Boolean {
         val ok = createEmptyNamed(matDir, NightPages.STAMP_PROBE)
-        runCatching { matDir.findFile(NightPages.STAMP_PROBE)?.delete() }
+        deleteFileOnly(matDir.findFile(NightPages.STAMP_PROBE), NightPages.STAMP_PROBE)
         return ok
     }
 
@@ -1475,10 +1499,13 @@ class PageTranslator(private val context: Context) {
         /** 刪掉這一輪的暫存與換檔途中已改名的 more（best-effort）。可重複呼叫。 */
         fun discard() {
             tmps.forEach { level ->
-                runCatching { matDir.findFile(NightPages.tmpName(NightPages.levelName(page, level)))?.delete() }
+                deleteFileOnly(
+                    matDir.findFile(NightPages.tmpName(NightPages.levelName(page, level))),
+                    NightPages.tmpName(NightPages.levelName(page, level)),
+                )
             }
             tmps.clear()
-            finals.forEach { n -> runCatching { matDir.findFile(n)?.delete() } }
+            finals.forEach { n -> deleteFileOnly(matDir.findFile(n), n) }
             finals.clear()
         }
 
@@ -1659,13 +1686,13 @@ class PageTranslator(private val context: Context) {
     ) {
         val tmpName = NightPages.tmpName(finalName)
         if (!compressToFile(matDir, tmpName, bmp, format, nightQuality(format))) {
-            runCatching { matDir.findFile(tmpName)?.delete() }
+            deleteFileOnly(matDir.findFile(tmpName), tmpName)
             throw IllegalStateException("夜讀版寫檔失敗")
         }
         val tmp = matDir.findFile(tmpName) ?: throw IllegalStateException("夜讀版暫存檔寫完卻找不到")
         if (tmp.length() <= 0L) {
             // compress 回 true 但檔是空的（SAF 串流異常）：別把空檔升成最終名、reader 會端出解不開的夜讀版
-            runCatching { tmp.delete() }
+            deleteFileOnly(tmp, tmpName)
             throw IllegalStateException("夜讀版暫存為空")
         }
         if (commit) commitNightTmp(matDir, finalName)
@@ -1686,10 +1713,12 @@ class PageTranslator(private val context: Context) {
     private fun commitNightTmp(matDir: UniFile, finalName: String) {
         val tmpName = NightPages.tmpName(finalName)
         val tmp = matDir.findFile(tmpName) ?: throw IllegalStateException("夜讀版暫存檔不見了")
-        runCatching { matDir.findFile(finalName)?.delete() }
+        check(tmp.isFile && tmp.name == tmpName) { "Invalid night image temporary file" }
+        val previous = matDir.findFile(finalName)
+        check(previous == null || deleteFileOnly(previous, finalName)) { "Cannot replace night image file" }
         val renamed = runCatching { tmp.renameTo(finalName) }.getOrDefault(false)
         if (!renamed) {
-            runCatching { tmp.delete() }
+            deleteFileOnly(tmp, tmpName)
             throw IllegalStateException("夜讀版暫存改名失敗（暫存已刪）")
         }
     }
@@ -1706,7 +1735,7 @@ class PageTranslator(private val context: Context) {
         var ok = true
         for (n in names) {
             val f = runCatching { matDir.findFile(n) }.getOrNull() ?: continue
-            if (!runCatching { f.delete() }.getOrDefault(false)) {
+            if (!deleteFileOnly(f, n)) {
                 logcat(LogPriority.WARN) { "刪夜讀檔失敗 $n" }
                 ok = false
                 if (stopOnFailure) break
@@ -1728,7 +1757,7 @@ class PageTranslator(private val context: Context) {
             val kept = existing.filterNot { it.isBlank() || it.startsWith(NIGHT_ERROR_PREFIX) }
             val merged = kept + nightErrors.map { "$NIGHT_ERROR_PREFIX\t$it" }
             if (merged.isEmpty()) {
-                chapterDir.findFile(ERRORS_FILE)?.delete()
+                deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
             } else {
                 overwriteBytes(chapterDir, ERRORS_FILE, merged.joinToString("\n").toByteArray())
             }
@@ -1785,6 +1814,7 @@ class PageTranslator(private val context: Context) {
         renderCfg: RenderConfig?,
     ): Boolean {
         val base = name.substringBeforeLast('.')
+        val ownedBitmaps = mutableListOf<Bitmap>()
         return try {
             val materials = decodeMaterials(matDir, base) ?: return false
             val (originalFile, byteCopy) = findOriginalMaterial(matDir, name) ?: return false
@@ -1801,6 +1831,7 @@ class PageTranslator(private val context: Context) {
             val original = context.contentResolver.openInputStream(originalFile.uri)
                 ?.use { BitmapFactory.decodeStream(it) }
                 ?: return false
+            ownedBitmaps.add(original)
 
             if (newMethod == ORIGINAL_METHOD) {
                 writeBack(img, original)
@@ -1815,10 +1846,13 @@ class PageTranslator(private val context: Context) {
                 original.recycle()
                 return false
             }
+            ownedBitmaps.add(mask)
 
             val regions = regionsFromMaterials(materials)
             val cleaned = inpainter!!.inpaint(original, regions, mask) // 引擎內部 copy 輸入，不會 mutate original/mask
+            ownedBitmaps.add(cleaned)
             val finalPage = Renderer.render(cleaned, regions, renderCfg!!, null) // 引擎內部 copy cleaned
+            ownedBitmaps.add(finalPage)
 
             try {
                 writeBack(img, finalPage)
@@ -1840,9 +1874,13 @@ class PageTranslator(private val context: Context) {
             cleaned.recycle()
             finalPage.recycle()
             true
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
             logcat(LogPriority.WARN, e) { "重繪頁失敗 $name（跳過、保留原圖）" }
             false
+        } finally {
+            ownedBitmaps.forEach { if (!it.isRecycled) it.recycle() }
         }
     }
 
@@ -1945,6 +1983,7 @@ class PageTranslator(private val context: Context) {
             ).apply {
                 translatedText = rm.target
                 onArt = rm.onArt
+                preserveOriginal = rm.preserveOriginal
             }
         }
 
@@ -1966,19 +2005,55 @@ class PageTranslator(private val context: Context) {
         return images.all { it in done }
     }
 
-    /** 讀 manifest（已處理頁名集合）。 */
-    private fun readDonePages(chapterDir: UniFile): Set<String> {
-        val f = chapterDir.findFile(MARKER) ?: return emptySet()
-        return runCatching {
-            context.contentResolver.openInputStream(f.uri)?.use { input ->
-                input.bufferedReader().readLines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    /** ZIP/CBZ uses the same verified manifest and complete page coverage as loose chapters. */
+    fun isArchiveTranslated(archive: UniFile): Boolean = runCatching {
+        archive.archiveReader(context).use { reader ->
+            val entries = reader.useEntries { sequence ->
+                sequence.take(SafeArchiveRewrite.MAX_ENTRIES + 1).map { it.name to it.isFile }.toList()
             }
-        }.getOrNull() ?: emptySet()
+            SafeArchiveRewrite.validateEntries(entries)
+            val names = entries.filter { it.second }.map { it.first }
+            val images = names.filter { name ->
+                '/' !in name && name.substringAfterLast('.').lowercase() in IMAGE_EXT
+            }
+            if (images.isEmpty()) return@use false
+            val metadata = names.filter { name ->
+                name == MARKER || name == CompletionManifestCodec.PREVIOUS || CompletionManifestCodec.isCheckpoint(name)
+            }.mapNotNull { name ->
+                reader.getInputStream(name)?.use(CompletionManifestCodec::read)?.let { name to it }
+            }.toMap()
+            val done = CompletionManifestCodec.resolve(metadata)
+            images.all { it in done }
+        }
+    }.getOrDefault(false)
+
+    /** 讀 manifest（已處理頁名集合）。 */
+    private fun readDonePages(chapterDir: UniFile): Set<String> =
+        CompletionManifestCodec.resolve(readManifestFiles(chapterDir))
+
+    private fun readManifestFiles(chapterDir: UniFile): Map<String, ByteArray> {
+        val files = chapterDir.listFiles().orEmpty().filter {
+            it.isFile && it.name?.let { name ->
+                name == MARKER || name == CompletionManifestCodec.PREVIOUS || CompletionManifestCodec.isCheckpoint(name)
+            } == true
+        }
+        return files.mapNotNull { file ->
+            readManifestBytes(file)?.let { file.name!! to it }
+        }.toMap()
     }
+
+    private fun readManifestBytes(file: UniFile): ByteArray? = runCatching {
+        if (!file.isFile) return@runCatching null
+        context.contentResolver.openInputStream(file.uri)?.use(CompletionManifestCodec::read)
+    }.getOrNull()
 
     /** 覆寫 manifest（每頁成功後叫一次；小檔、相對翻譯耗時可忽略，給中斷後 resume）。只給 [commitManifest] 用。 */
     private fun writeManifest(chapterDir: UniFile, done: Set<String>) {
-        overwriteBytes(chapterDir, MARKER, done.joinToString("\n").toByteArray())
+        CompletionManifestStore(
+            readFiles = { readManifestFiles(chapterDir) },
+            write = { name, bytes -> writeExactNamed(chapterDir, name, bytes) },
+            delete = { name -> deleteFileOnly(chapterDir.findFile(name), name) },
+        ).commit(done)
     }
 
     /**
@@ -1998,7 +2073,7 @@ class PageTranslator(private val context: Context) {
      * 把 [bmp]（譯圖／重繪圖／重新編碼的原圖）寫回頁檔 [file]。格式跟著副檔名走（[WriteBackFormat]：`.png` → PNG、`.webp` →
      * 有損 WebP、其他 → JPEG；JPEG 與 WebP 品質都是 [WriteBackFormat.QUALITY]）。
      * 寫入走 [openTruncating]（SAF 用 "wt"）：UniFile 的 openOutputStream 是 "w"，SAF 上不截斷，新檔比舊檔短時（`.webp` 頁改寫
-     * WebP 後常見）會留一截舊尾、檔案大小也不會變小。"wt" 開不了（極少數儲存位置不支援）才退回 "w"，跟以前一樣。
+     * WebP 後常見）會留一截舊尾、檔案大小也不會變小。Truncating writes are required; unsupported providers fail without a non-truncating fallback.
      *
      * **先在記憶體裡編碼完、才開頁檔**：截斷寫一開串流就把頁檔清空了，編碼器一開始就失敗（記憶體不足、編碼器初始化失敗）的話
      * 頁檔會變成空檔。編碼失敗拋一般 IOException（頁檔一個位元組都沒碰）；開了頁檔之後才失敗拋 [PageWriteInterrupted]
@@ -2029,12 +2104,11 @@ class PageTranslator(private val context: Context) {
         if (!bmp.compress(fmt, WriteBackFormat.QUALITY, encoded)) {
             throw java.io.IOException("頁檔編碼失敗 ${file.name}")
         }
-        val os = runCatching { openTruncating(file) }
-            .onFailure { logcat(LogPriority.WARN, it) { "頁檔截斷寫開不了，退回一般寫入 ${file.name}" } }
-            .getOrNull()
-            ?: file.openOutputStream()
         try {
+            // Never fall back to a non-truncating SAF stream; opening can itself truncate then fail.
+            val os = openTruncating(file) ?: throw java.io.IOException("Cannot open page for replacement")
             os.use { encoded.writeTo(it) }
+            check(file.length() == encoded.size().toLong()) { "Page replacement length mismatch" }
         } catch (t: Throwable) {
             throw PageWriteInterrupted("頁檔寫到一半失敗 ${file.name}", t)
         }
@@ -2056,15 +2130,18 @@ class PageTranslator(private val context: Context) {
     /**
      * 用譯圖覆蓋頁檔；失敗（例外或編碼不成）而手上有剛存好的原檔 [saved] 時，立刻把原檔寫回頁檔（§11：不留半截檔在
      * 那裡等下一輪），寫得回去就順手刪掉進行中記號。然後照樣把例外往外拋（呼叫端記錯、這頁不進清單）。
-     * 沒有 [saved]（沒開保留素材，或原檔複製失敗）就只能原樣拋出，跟以前一樣。
+     * 沒有 [saved] 時先拋出，下載的原頁檔不會被寫入。
      */
     private fun writeBackOrRestore(page: UniFile, bmp: Bitmap, saved: SavedOriginal?) {
+        checkNotNull(saved) {
+            "Cannot preserve the original page. Translation was not saved; check storage access and free space."
+        }
         try {
             writeBack(page, bmp)
         } catch (t: Throwable) {
-            if (saved != null && restoreOriginalBytes(saved.file, page)) {
+            if (restoreOriginalBytes(saved.file, page)) {
                 TraceLog.log("page", "${page.name} writeBack failed, original restored")
-                runCatching { saved.marker?.delete() }
+                deleteFileOnly(saved.marker, OriginalMaterial.inflightName(page.name.orEmpty()))
             }
             throw t
         }
@@ -2152,10 +2229,16 @@ class PageTranslator(private val context: Context) {
     private fun recoverInterrupted(chapterDir: UniFile, pageFile: UniFile, name: String): Boolean {
         val matDir = chapterDir.findFile(MATERIALS_DIR) ?: return true
         val marker = matDir.findFile(OriginalMaterial.inflightName(name)) ?: return true
+        // UniFile.delete may recursively delete directories. A directory at this reserved name
+        // is not our recovery marker and must neither be removed nor treated as a usable journal.
+        if (!marker.isFile) {
+            logcat(LogPriority.WARN) { "Invalid recovery marker for $name; page will not be replaced" }
+            return false
+        }
         val original = matDir.findFile(OriginalMaterial.exactName(name))?.takeIf { it.isFile }
         val hasOriginal = original != null
         if (!OriginalMaterial.shouldRecover(inManifest = false, hasMarker = true, hasExactOriginal = hasOriginal)) {
-            runCatching { marker.delete() } // 記號在、原檔不在：沒東西可寫回
+            deleteFileOnly(marker, OriginalMaterial.inflightName(name)) // 記號在、原檔不在：沒東西可寫回
             return true
         }
         if (!restoreOriginalBytes(original!!, pageFile)) {
@@ -2164,7 +2247,7 @@ class PageTranslator(private val context: Context) {
             return false
         }
         TraceLog.log("page", "$name interrupted overwrite: original restored")
-        runCatching { marker.delete() }
+        deleteFileOnly(marker, OriginalMaterial.inflightName(name))
         return true
     }
 
@@ -2174,8 +2257,10 @@ class PageTranslator(private val context: Context) {
      */
     private fun ownOutputOriginal(chapterDir: UniFile, pageFile: UniFile, name: String): UniFile? {
         val matDir = chapterDir.findFile(MATERIALS_DIR) ?: return null
-        val json = matDir.findFile(NightTextBoxes.materialsJsonName(name))?.takeIf { it.isFile } ?: return null
         val (original, _) = findOriginalMaterial(matDir, name) ?: return null
+        // Exact originals are mandatory; optional OCR materials may be disabled or fail to save.
+        // Missing optional JSON must never cause a translated page to replace its own original.
+        val json = matDir.findFile(NightTextBoxes.materialsJsonName(name))?.takeIf { it.isFile } ?: return original
         val own = OriginalMaterial.pageIsOwnOutput(
             inManifest = true,
             hasOriginal = true,
@@ -2195,11 +2280,25 @@ class PageTranslator(private val context: Context) {
      *    重壓的 zip 沒 marker → isChapterTranslated=false → 整章誤判失敗（翻好卻變紅）。
      * best-effort：開不了回 null。
      */
-    private fun openTruncating(f: UniFile): java.io.OutputStream? =
-        if (f.uri.scheme == "file") f.openOutputStream() else context.contentResolver.openOutputStream(f.uri, "wt")
+    private fun openTruncating(f: UniFile): java.io.OutputStream? {
+        if (!f.isFile) return null
+        return if (f.uri.scheme ==
+            "file"
+        ) {
+            f.openOutputStream()
+        } else {
+            context.contentResolver.openOutputStream(f.uri, "wt")
+        }
+    }
+
+    /** UniFile.delete is recursive for directories; all callers here own individual files only. */
+    private fun deleteFileOnly(file: UniFile?, expectedName: String?): Boolean = runCatching {
+        file != null && expectedName != null && file.isFile && file.name == expectedName && file.delete()
+    }.getOrDefault(false)
 
     private fun overwriteBytes(dir: UniFile, name: String, bytes: ByteArray): Boolean = runCatching {
         val f = dir.findFile(name) ?: dir.createFile(name) ?: return@runCatching false
+        if (!f.isFile || f.name != name) return@runCatching false
         val os = openTruncating(f) ?: return@runCatching false
         os.use { it.write(bytes) }
         true
@@ -2214,6 +2313,7 @@ class PageTranslator(private val context: Context) {
         quality: Int,
     ): Boolean = runCatching {
         val f = dir.findFile(name) ?: dir.createFile(name) ?: return@runCatching false
+        if (!f.isFile || f.name != name) return@runCatching false
         val os = openTruncating(f) ?: return@runCatching false
         // 回傳 compress 本身的結果：編碼失敗（記憶體不足、串流中途錯）會留半截檔，呼叫端要知道（夜讀原子寫入靠這判）
         os.use { bmp.compress(format, quality, it) }
@@ -2224,7 +2324,8 @@ class PageTranslator(private val context: Context) {
      * 建出重複子夾或回 null。建不出來回 null。
      */
     private fun materialsDir(chapterDir: UniFile): UniFile? = synchronized(materialsDirLock) {
-        chapterDir.findFile(MATERIALS_DIR) ?: chapterDir.createDirectory(MATERIALS_DIR)
+        (chapterDir.findFile(MATERIALS_DIR) ?: chapterDir.createDirectory(MATERIALS_DIR))
+            ?.takeIf { it.isDirectory && it.name == MATERIALS_DIR }
     }
 
     /**
@@ -2234,7 +2335,7 @@ class PageTranslator(private val context: Context) {
     fun ensureMaterialsDir(chapterDir: UniFile): Boolean =
         runCatching { materialsDir(chapterDir) != null }.getOrDefault(false)
 
-    /** [saveOriginalBytes] 存好的原檔 [file] 與它的進行中記號 [marker]（記號建不出來是 null，只是少了中斷保護）。 */
+    /** [saveOriginalBytes] 存好的原檔 [file] 與它的進行中記號 [marker]（新原檔必須有記號；既有已完成頁可省略）。 */
     private class SavedOriginal(val file: UniFile, val marker: UniFile?)
 
     /**
@@ -2249,7 +2350,7 @@ class PageTranslator(private val context: Context) {
      * 步驟：先寫暫存 `<最終名>.tmp`、長度與來源相同才改名成最終名，改名後再確認檔名與長度（SAF 上舊檔沒刪掉時，
      * 改名可能變成另一個檔名）；然後刪掉同頁舊版的有損 WebP、建立進行中記號 `<最終名>.wip`。被殺在半路只會留下暫存
      * （讀取端不認），不會留下半截的「原圖」讓之後的還原把壞檔寫回頁檔（§11）。
-     * best-effort：任何一步失敗 → 刪暫存、回 null（呼叫端退回舊做法，不擋翻譯）。
+     * Any failed step returns null; callers must not replace the page without a verified original and recovery marker.
      */
     private fun saveOriginalBytes(chapterDir: UniFile, pageFile: UniFile): SavedOriginal? {
         val pageName = pageFile.name ?: return null
@@ -2259,6 +2360,7 @@ class PageTranslator(private val context: Context) {
         return runCatching {
             val d = materialsDir(chapterDir) ?: return@runCatching null
             val tmp = d.findFile(tmpName) ?: d.createFile(tmpName) ?: return@runCatching null
+            if (!tmp.isFile || tmp.name != tmpName) return@runCatching null
             pendingTmp = tmp
             val copied = context.contentResolver.openInputStream(pageFile.uri)?.use { input ->
                 openTruncating(tmp)?.use { output -> input.copyTo(output) }
@@ -2269,36 +2371,49 @@ class PageTranslator(private val context: Context) {
             if (copied <= 0L || (srcLen > 0L && srcLen != copied) || tmpLen != copied) {
                 TraceLog.log("page", "$pageName orig copy length mismatch src=$srcLen copied=$copied landed=$tmpLen")
                 logcat(LogPriority.WARN) {
-                    "複製原檔長度不符 $pageName：來源 $srcLen、寫入 $copied、落地 $tmpLen（退回有損 WebP）"
+                    "複製原檔長度不符 $pageName：來源 $srcLen、寫入 $copied、落地 $tmpLen（原圖不覆寫）"
                 }
                 return@runCatching null
             }
-            runCatching { d.findFile(finalName)?.delete() }
+            val existing = d.findFile(finalName)
+            if (existing != null && !deleteFileOnly(existing, finalName)) return@runCatching null
             // 改名後再看一次：檔名要真的是最終名、長度要是這次複製的長度（舊檔沒刪掉時 SAF 可能改成別的檔名還回成功）。
             if (!tmp.renameTo(finalName) || tmp.name != finalName || tmp.length() != copied) {
                 TraceLog.log("page", "$pageName orig rename failed -> ${tmp.name} len=${tmp.length()} want=$copied")
-                logcat(LogPriority.WARN) { "原檔暫存改名失敗 $pageName → ${tmp.name}（退回有損 WebP）" }
+                logcat(LogPriority.WARN) { "原檔暫存改名失敗 $pageName → ${tmp.name}（原圖不覆寫）" }
                 return@runCatching null
             }
             pendingTmp = null // 已是最終檔
             // 原檔存好了 → 同頁舊版的有損 WebP 用不到了（查找本來就先看原檔），刪掉省空間。
             OriginalMaterial.supersededLegacyName(pageName)?.let { legacy ->
-                runCatching { d.findFile(legacy)?.delete() }
+                deleteFileOnly(d.findFile(legacy), legacy)
             }
             // 進行中記號：從這裡到這頁進清單之間被打斷，下次靠它把原檔寫回頁檔（[recoverInterrupted]）。
             val markerName = OriginalMaterial.inflightName(pageName)
             val marker = runCatching { d.findFile(markerName) ?: d.createFile(markerName) }.getOrNull()
-            if (marker == null) logcat(LogPriority.WARN) { "進行中記號建不出來 $pageName（少了中斷保護，不擋翻譯）" }
+            if (marker == null || !marker.isFile || marker.name != markerName) {
+                logcat(LogPriority.WARN) { "Cannot create recovery marker for $pageName; page will not be replaced" }
+                return@runCatching null
+            }
             SavedOriginal(tmp, marker)
-        }.onFailure { logcat(LogPriority.WARN, it) { "複製原檔到素材失敗 $pageName（退回有損 WebP）" } }
+        }.onFailure { logcat(LogPriority.WARN, it) { "複製原檔到素材失敗 $pageName（原圖不覆寫）" } }
             .getOrNull()
-            .also { r -> if (r == null) runCatching { pendingTmp?.delete() } }
+            .also { r -> if (r == null) deleteFileOnly(pendingTmp, tmpName) }
     }
 
-    /**
-     * 找這頁的原圖素材（[OriginalMaterial.resolve]：先原檔、後舊版）。回傳（檔, 可否位元組原樣寫回）；沒有 → null。
-     * 查到的檔順手留著，不再 findFile 第二次（SAF 上每次 findFile 都是一次列目錄）：新素材查一次、舊版素材查兩次。
-     */
+    /** Read-only original lookup for reader comparison, independent of optional OCR materials. */
+    fun originalForPreview(chapterDir: UniFile, pageName: String): UniFile? {
+        if (pageName.isBlank() || pageName.any { it == '/' || it == '\\' || it == '\u0000' }) return null
+        val matDir = chapterDir.findFile(MATERIALS_DIR)?.takeIf { it.isDirectory } ?: return null
+        val original = findOriginalMaterial(matDir, pageName)?.first ?: return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(original.uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        return original.takeIf { bounds.outWidth > 0 && bounds.outHeight > 0 }
+    }
+
+    /** Resolve exact originals before legacy WebP copies, retaining the already-resolved file. */
     private fun findOriginalMaterial(matDir: UniFile, pageName: String): Pair<UniFile, Boolean>? {
         val hits = HashMap<String, UniFile>(2)
         val found = OriginalMaterial.resolve(pageName) { n ->
@@ -2363,13 +2478,18 @@ class PageTranslator(private val context: Context) {
                 val legacy = OriginalMaterial.legacyName(pageName)
                 val exact = OriginalMaterial.exactName(pageName)
                 // 上一次翻譯留下的原檔若還在，查找會先拿到它（那是上一次的圖）→ 先刪。頁檔是 .webp 時兩個檔名相同、直接蓋。
-                if (exact != legacy) runCatching { dir.findFile(exact)?.delete() }
+                if (exact != legacy) deleteFileOnly(dir.findFile(exact), exact)
                 compressToFile(dir, legacy, original, webpFmt, 90)
             }
             // 遮罩 → 獨立無損 PNG 檔（不再 base64 內嵌 json）：換去字法重繪只重寫小 json、遮罩檔不動；省 ~33% 膨脹、讀取走 native stream 不灌 heap。
             val bin = binarizeMask(analysis.mask)
-            compressToFile(dir, "$base$MASK_SUFFIX", bin, Bitmap.CompressFormat.PNG, 100)
-            bin.recycle()
+            try {
+                check(compressToFile(dir, "$base$MASK_SUFFIX", bin, Bitmap.CompressFormat.PNG, 100)) {
+                    "Cannot save translation mask"
+                }
+            } finally {
+                bin.recycle()
+            }
             // 文字區 → RegionMaterial（四邊形逐行、角度、onArt、原文、譯文、bbox）。
             val regions = analysis.regions.map { region ->
                 RegionMaterial(
@@ -2384,15 +2504,19 @@ class PageTranslator(private val context: Context) {
                     cy = region.cy,
                     boxW = region.boxW,
                     boxH = region.boxH,
+                    preserveOriginal = region.preserveOriginal,
                 )
             }
             // mask 改存獨立檔 → materials 不帶 mask（預設空字串、不序列化進 json）。
             val materials = PageMaterials(method = method, regions = regions)
             val jsonOk = overwriteBytes(dir, "$base.json", MATERIALS_JSON.encodeToString(materials).toByteArray())
+            check(jsonOk) { "Cannot save translation regions" }
             // 完整素材接手：之前只存夜讀素材時留下的文字框檔用不到了（夜讀先看完整 json），刪掉免得留著過期的一份。
             // json 沒寫成就留著（夜讀還能退回它）。
             if (jsonOk) {
-                runCatching { dir.findFile(NightTextBoxes.fileName(pageName))?.delete() }
+                runCatching {
+                    deleteFileOnly(dir.findFile(NightTextBoxes.fileName(pageName)), NightTextBoxes.fileName(pageName))
+                }
                     .onFailure { logcat(LogPriority.WARN, it) { "刪舊夜讀文字框檔失敗 $pageName（夜讀先看完整素材，無害）" } }
             }
         }.fold(
@@ -2450,7 +2574,7 @@ class PageTranslator(private val context: Context) {
             val boxesName = NightTextBoxes.fileName(pageName)
             val pageBytes = pageLength(pageFile)
             if (pageBytes <= 0L) {
-                runCatching { dir.findFile(boxesName)?.delete() }
+                deleteFileOnly(dir.findFile(boxesName), boxesName)
                 logcat(LogPriority.WARN) { "夜讀文字框沒寫 $pageName：讀不到頁檔大小" }
                 return if (maskOk) "夜讀文字框沒寫：讀不到頁檔大小（不影響翻譯）" else "夜讀遮罩與文字框都沒寫成（不影響翻譯）"
             }
@@ -2490,11 +2614,7 @@ class PageTranslator(private val context: Context) {
      */
     private fun writeExactNamed(dir: UniFile, name: String, bytes: ByteArray): Boolean = runCatching {
         val f = dir.findFile(name) ?: dir.createFile(name) ?: return@runCatching false
-        if (f.name != name) {
-            logcat(LogPriority.WARN) { "建檔名字不對：要 $name、建成 ${f.name}，刪掉" }
-            runCatching { f.delete() }
-            return@runCatching false
-        }
+        if (!f.isFile || f.name != name) return@runCatching false
         val os = openTruncating(f) ?: return@runCatching false
         os.use { it.write(bytes) }
         true
@@ -2600,4 +2720,6 @@ data class RegionMaterial(
     val cy: Float,
     val boxW: Float,
     val boxH: Float,
+    /** Excluded OCR regions must retain their original pixels during later re-rendering. */
+    val preserveOriginal: Boolean = false,
 )

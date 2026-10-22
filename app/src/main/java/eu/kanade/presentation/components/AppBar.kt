@@ -30,6 +30,7 @@ import androidx.compose.material3.TopAppBarScrollBehavior
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.surfaceColorAtElevation
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -45,8 +46,10 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -284,6 +287,19 @@ fun SearchToolbar(
 
             val keyboardController = LocalSoftwareKeyboardController.current
             val focusManager = LocalFocusManager.current
+            var editingValue by remember {
+                mutableStateOf(TextFieldValue(searchQuery, TextRange(searchQuery.length)))
+            }
+            // An explicit replacement (for example a suggestion) ends at the new text's trailing space.
+            // Locally edited text keeps its selection and IME composition unchanged.
+            val displayedValue = if (editingValue.text == searchQuery) {
+                editingValue
+            } else {
+                TextFieldValue(searchQuery, TextRange(searchQuery.length))
+            }
+            SideEffect {
+                if (editingValue != displayedValue) editingValue = displayedValue
+            }
 
             val searchAndClearFocus: () -> Unit = f@{
                 if (searchQuery.isBlank()) return@f
@@ -294,8 +310,12 @@ fun SearchToolbar(
             }
 
             BasicTextField(
-                value = searchQuery,
-                onValueChange = onChangeSearchQuery,
+                value = displayedValue,
+                onValueChange = { value ->
+                    val textChanged = value.text != editingValue.text
+                    editingValue = value
+                    if (textChanged) onChangeSearchQuery(value.text)
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .focusRequester(focusRequester)

@@ -6,6 +6,7 @@ import com.hippo.unifile.UniFile
 import li.joye.yakuyomi.engine.EngineConfig
 import li.joye.yakuyomi.engine.LlmProviders
 import li.joye.yakuyomi.engine.ModelSet
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.domain.storage.service.StoragePreferences
 import tachiyomi.domain.translation.service.TranslationPreferences
@@ -204,7 +205,9 @@ object TranslationEngineConfig {
      */
     fun isProviderBaseMissing(prefs: TranslationPreferences): Boolean {
         val preset = LlmProviders.byId(prefs.provider.get())
-        return preset.baseEditable && prefs.apiBase.get().isBlank()
+        if (!preset.baseEditable) return false
+        return prefs.apiBase.get().toHttpUrlOrNull() == null ||
+            prefs.model.get().ifBlank { preset.defaultModel }.isBlank()
     }
 
     /**

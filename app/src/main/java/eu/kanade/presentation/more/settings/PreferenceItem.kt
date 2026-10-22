@@ -163,6 +163,8 @@ internal fun PreferenceItem(
             is Preference.PreferenceItem.EditTextPreference -> {
                 val values by item.preference.collectAsState()
                 EditTextPreferenceWidget(
+                    allowEmpty = item.allowEmpty,
+                    isSecret = item.isSecret,
                     title = item.title,
                     titleBadge = item.titleBadge,
                     subtitle = item.subtitle,

@@ -85,7 +85,9 @@ class ModelDownloadManager(private val context: Context) {
         update(State.Running(group, context.stringResource(MR.strings.model_dl_preparing), 0))
         scope.launch {
             try {
-                val manifest = ModelDownloader.fetchManifest()
+                val manifest = ModelDownloader.fetchManifest(
+                    "https://raw.githubusercontent.com/joyeli/yakuyomi-engine/883737078aecb92ed796efac571bf066e217b1ab/models.json",
+                )
                 // 只下這組的檔（偵測器兩組都含；ensure 對已存在且 sha256 相符的檔直接跳過 → 另一組已帶進來就不重抓）。
                 val models = manifest.filter { group in TranslationEngineConfig.groupsOfRole(it.role) }
                 val dir = TranslationEngineConfig.downloadedDir(context)

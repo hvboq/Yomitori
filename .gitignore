@@ -20,3 +20,16 @@ api-keys.properties
 keystore.properties
 *.jks
 *.keystore
+.signing/
+
+# Local verified translation models (downloaded by scripts/prepare_translation_models.py)
+.translation-models/
+
+# Local credentials and signing containers
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+__pycache__/
+*.pyc

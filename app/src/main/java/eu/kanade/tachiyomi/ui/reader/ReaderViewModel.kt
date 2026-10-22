@@ -54,7 +54,9 @@ import eu.kanade.tachiyomi.util.lang.byteSize
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import eu.kanade.tachiyomi.util.storage.cacheImageDir
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -67,6 +69,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
@@ -313,7 +317,12 @@ class ReaderViewModel @JvmOverloads constructor(
      * 已觸發過「線上即時翻（下載 + 重載）」的章 id：每章只觸發一次，避免重複進同一章（換頁回到同章 / 重載後）
      * 重複下載。在 [onCurrentChapterActivated]（單一 viewModelScope coroutine、序列化）下存取，免額外鎖。
      */
-    private val onlineTriggeredChapterIds = mutableSetOf<Long>()
+    private val onlineTriggeredChapterIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+    private val onlineTranslationLock = Any()
+    private val onlineTranslationPolls = mutableMapOf<Long, Job>()
+    private val stoppedTranslationChapters = mutableSetOf<Long>()
+    private val translationStopVersions = mutableMapOf<Long, Long>()
+    private val pendingTranslationIntentRevision = MutableStateFlow(0L)
 
     /**
      * 線上章的夜讀（[OnlineNightPrompt]）：[nightDownloadAskedIds]＝這次閱讀已經問過「要先下載嗎？」的章（打開夜讀模式時
@@ -349,6 +358,28 @@ class ReaderViewModel @JvmOverloads constructor(
             .distinctUntilChanged()
             .filterNotNull()
             .onEach { currentChapter -> onCurrentChapterActivated(currentChapter) }
+            .launchIn(viewModelScope)
+
+        // Downloading for a requested translation is cancellable, but is not translation progress.
+        // Observe each item's status as well as queue membership so ERROR immediately restores Retry.
+        combine(
+            state.map { it.currentChapter?.chapter?.id }.distinctUntilChanged(),
+            downloadManager.queueState.flatMapLatest { queue ->
+                if (queue.isEmpty()) {
+                    flowOf(emptyMap<Long, Download.State>())
+                } else {
+                    combine(queue.map { download -> download.statusFlow.map { download.chapter.id to it } }) {
+                        it.toMap()
+                    }
+                }
+            },
+            pendingTranslationIntentRevision,
+        ) { chapterId, downloads, _ ->
+            chapterId != null && translationManager.isPendingTranslate(chapterId) &&
+                downloads[chapterId] != Download.State.ERROR && downloads[chapterId] != Download.State.DOWNLOADED
+        }
+            .distinctUntilChanged()
+            .onEach { pending -> mutableState.update { it.copy(translationDownloadPending = pending) } }
             .launchIn(viewModelScope)
 
         // 即時翻譯進度：把「正在讀的章 id」與翻譯佇列 [TranslationManager.queueState] 併流，
@@ -592,7 +623,9 @@ class ReaderViewModel @JvmOverloads constructor(
         val pageLoader = chapter.pageLoader
         if (pageLoader is TranslatingPageLoader) {
             // 已下載 + 已包裝：整章插隊排入翻譯佇列（冪等；loader 內 enqueued 旗標去重）。
-            pageLoader.onActivated()
+            synchronized(onlineTranslationLock) {
+                if (chapter.chapter.id !in stoppedTranslationChapters) pageLoader.onActivated()
+            }
             // 跨章預取：背景先翻下一章（已下載 + 合格 + 未翻），等使用者翻過去時已（部分）翻好＝體感即時。
             prefetchNextChapters(chapter)
             return
@@ -695,15 +728,35 @@ class ReaderViewModel @JvmOverloads constructor(
      *
      * CBZ（isFile）即時翻本里程碑不支援 → 停止輪詢、維持線上原圖（下載仍會完成、退出重進可讀已翻 CBZ）。
      */
-    private fun triggerOnlineLiveTranslate(chapter: ReaderChapter) {
+    private fun triggerOnlineLiveTranslate(chapter: ReaderChapter, explicitRetry: Boolean = false) {
         val manga = manga ?: return
         val domainChapter = chapter.chapter.toDomainChapter() ?: return
-
-        logcat { "線上即時翻：觸發下載 + 等完成後重載 ${chapter.chapter.url}" }
-        translationManager.markForTranslate(domainChapter.id)
-        downloadManager.downloadChapters(manga, listOf(domainChapter))
-
-        viewModelScope.launchIO { awaitDownloadThenReload(chapter, "線上即時翻") }
+        synchronized(onlineTranslationLock) {
+            if (explicitRetry) stoppedTranslationChapters.remove(domainChapter.id)
+            if (domainChapter.id in stoppedTranslationChapters) return
+            translationManager.markForTranslate(domainChapter.id)
+            pendingTranslationIntentRevision.update { it + 1 }
+            if (explicitRetry) {
+                downloadManager.downloadChapterForReader(manga, domainChapter)
+            } else {
+                downloadManager.downloadChapters(manga, listOf(domainChapter))
+            }
+            if (onlineTranslationPolls[domainChapter.id]?.isActive == true) return
+            val job = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                awaitDownloadThenReload(chapter, "Online translation")
+            }
+            onlineTranslationPolls[domainChapter.id] = job
+            job.invokeOnCompletion {
+                synchronized(onlineTranslationLock) {
+                    if (onlineTranslationPolls[domainChapter.id] ===
+                        job
+                    ) {
+                        onlineTranslationPolls.remove(domainChapter.id)
+                    }
+                }
+            }
+            job.start()
+        }
     }
 
     /**
@@ -804,7 +857,11 @@ class ReaderViewModel @JvmOverloads constructor(
             // 重載後當前章已下載 → 已重新包成 TranslatingPageLoader。**必須在此直接啟動**：
             // currChapter 仍是同一個 ReaderChapter 物件，init 的 currChapter flow 經 distinctUntilChanged 會視為「未變」
             // 而不重發 → 不會自動再呼 onCurrentChapterActivated。故在這裡顯式 onActivated() 把整章排入翻譯佇列。
-            (currChapter.pageLoader as? TranslatingPageLoader)?.onActivated()
+            synchronized(onlineTranslationLock) {
+                if (currChapter.chapter.id !in stoppedTranslationChapters) {
+                    (currChapter.pageLoader as? TranslatingPageLoader)?.onActivated()
+                }
+            }
             // 夜讀狀態同理要自己重算（線上章是「不支援」，重載後是鬆散資料夾章：懸浮鈕與長按選單才會給夜讀的選項）
             refreshNightAvailability(currChapter)
             logcat { "線上即時翻：已重載當前章進已下載路徑（保留第 $targetPage 頁）" }
@@ -1329,6 +1386,35 @@ class ReaderViewModel @JvmOverloads constructor(
         refreshNightAvailability(page.chapter)
     }
 
+    /** Compare the saved original without rewriting the translated page or its completion state. */
+    fun toggleOriginalPreview() {
+        val selected = (state.value.dialog as? Dialog.PageActions)?.page ?: return
+        val page = (selected as? InsertPage)?.parent ?: selected
+        closeDialog()
+        if (page.isOriginalPreview) {
+            page.clearOriginalPreview()
+            return
+        }
+        if (page.status != Page.State.Ready) return
+        viewModelScope.launchIO {
+            try {
+                val target = resolveDownloadedPageFile(page)
+                val original = target?.let { pageTranslator.originalForPreview(it.first, it.second) }
+                if (original == null) {
+                    eventChannel.send(Event.OriginalPreviewUnavailable)
+                    return@launchIO
+                }
+                val context = Injekt.get<Application>()
+                withUIContext {
+                    page.showOriginalPreview { requireNotNull(context.contentResolver.openInputStream(original.uri)) }
+                }
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                eventChannel.send(Event.OriginalPreviewUnavailable)
+            }
+        }
+    }
+
     /**
      * 切換日常／夜讀（懸浮鈕）：只改偏好；重畫由 init 觀察 [nightEffective] 那條統一處理（設定面板 checkbox 也是同一條路）。
      */
@@ -1624,8 +1710,8 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     /**
-     * 已下載章 [page] 的章節夾與頁檔名（與 [reRenderPage] 同源：下載夾裡的頂層圖檔依檔名排序，取第 index 個）。
-     * 找不到章節夾或對不上 → null。IO。
+     * Finds a downloaded page by the URI assigned by its loader, including split-page parents.
+     * Returns null when the chapter directory or exact child file no longer exists. Performs IO.
      */
     private fun resolveDownloadedPageFile(page: ReaderPage): Pair<UniFile, String>? {
         val manga = manga ?: return null
@@ -1637,11 +1723,9 @@ class ReaderViewModel @JvmOverloads constructor(
             manga.title,
             sourceManager.getOrStub(manga.source),
         ) ?: return null
-        val imageExt = setOf("jpg", "jpeg", "png", "webp")
+        val fileUri = ((page as? InsertPage)?.parent ?: page).uri ?: return null
         val name = chapterDir.listFiles()
-            ?.filter { f -> f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in imageExt }
-            ?.sortedBy { it.name.orEmpty() }
-            ?.getOrNull(page.index)
+            ?.firstOrNull { it.isFile && it.uri == fileUri }
             ?.name
             ?: return null
         return chapterDir to name
@@ -1672,6 +1756,7 @@ class ReaderViewModel @JvmOverloads constructor(
         val page = (state.value.dialog as? Dialog.PageActions)?.page
         if (page?.status != Page.State.Ready) return
         val manga = manga ?: return
+        val stream = page.displayStream ?: return
 
         val context = Injekt.get<Application>()
         val notifier = SaveImageNotifier(context)
@@ -1693,7 +1778,7 @@ class ReaderViewModel @JvmOverloads constructor(
             try {
                 val uri = imageSaver.save(
                     image = Image.Page(
-                        inputStream = page.stream!!,
+                        inputStream = stream,
                         name = filename,
                         location = Location.Pictures.create(relativePath),
                     ),
@@ -1720,26 +1805,28 @@ class ReaderViewModel @JvmOverloads constructor(
         val page = (state.value.dialog as? Dialog.PageActions)?.page
         if (page?.status != Page.State.Ready) return
         val manga = manga ?: return
+        val stream = page.displayStream ?: return
 
         val context = Injekt.get<Application>()
         val destDir = context.cacheImageDir
 
         val filename = generateFilename(manga, page)
 
-        try {
-            viewModelScope.launchNonCancellable {
+        viewModelScope.launchNonCancellable {
+            try {
                 destDir.deleteRecursively()
                 val uri = imageSaver.save(
                     image = Image.Page(
-                        inputStream = page.stream!!,
+                        inputStream = stream,
                         name = filename,
                         location = Location.Cache,
                     ),
                 )
                 eventChannel.send(if (copyToClipboard) Event.CopyImage(uri) else Event.ShareImage(uri, page))
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                eventChannel.send(Event.SavedImage(SaveImageResult.Error(e)))
             }
-        } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e)
         }
     }
 
@@ -1750,7 +1837,7 @@ class ReaderViewModel @JvmOverloads constructor(
         val page = (state.value.dialog as? Dialog.PageActions)?.page
         if (page?.status != Page.State.Ready) return
         val manga = manga ?: return
-        val stream = page.stream ?: return
+        val stream = page.displayStream ?: return
 
         viewModelScope.launchNonCancellable {
             val result = try {
@@ -1784,7 +1871,8 @@ class ReaderViewModel @JvmOverloads constructor(
      * 線上/封存頁無素材 → reRenderPage 回 false → 走「重新顯示原圖 + 提示失敗」路徑。
      */
     fun reRenderPage(method: String) {
-        val page = (state.value.dialog as? Dialog.ReRenderMethod)?.page ?: return
+        val selected = (state.value.dialog as? Dialog.ReRenderMethod)?.page ?: return
+        val page = (selected as? InsertPage)?.parent ?: selected
         closeDialog()
         if (!translationPreferences.translationMasterEnabled.get()) return // 硬總開關：關時不重繪、不載引擎
         val manga = manga ?: return
@@ -1802,38 +1890,21 @@ class ReaderViewModel @JvmOverloads constructor(
             eventChannel.send(Event.ReRenderStarted)
 
             try {
-                val source = sourceManager.getOrStub(manga.source)
-                val chapterDir = downloadProvider.findChapterDir(
-                    chapter.chapter.name,
-                    chapter.chapter.scanlator,
-                    chapter.chapter.url,
-                    manga.title,
-                    source,
-                )
-                if (chapterDir == null) {
+                val target = resolveDownloadedPageFile(page)
+                if (target == null) {
                     finish(false)
                     return@launchIO
                 }
-                // page.index → 檔名：以與下載頁列表相同的排序（DownloadManager.buildPageList 的 sortedBy{name}）
-                // 取第 index 個圖檔；對不上（資料夾被外部改動）→ 放棄、重新顯示原圖。
-                val imageExt = setOf("jpg", "jpeg", "png", "webp")
-                val sortedImages = chapterDir.listFiles()
-                    ?.filter { f ->
-                        f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in imageExt
-                    }
-                    ?.sortedBy { it.name.orEmpty() }
-                    .orEmpty()
-                val pageFileName = sortedImages.getOrNull(page.index)?.name
-                if (pageFileName == null) {
-                    finish(false)
-                    return@launchIO
-                }
+                val (chapterDir, pageFileName) = target
 
                 // 覆寫前先問這章有沒有夜讀版（覆寫會刪掉這頁的夜讀檔，事後問會漏掉「只有這頁有」的章）
                 val hadNight = translationManager.chapterHasNightBeforePage(chapterDir)
                 val ok = pageTranslator.reRenderPage(chapterDir, pageFileName, method)
                 // 補排夜讀放在 finish 前：finish 會等 UI 收事件，使用者這時退出 reader 的話後面的程式碼不會跑
-                if (ok) requeueNightAfterPage(manga, chapter, hadNight)
+                if (ok) {
+                    withUIContext { page.clearOriginalPreview() }
+                    requeueNightAfterPage(manga, chapter, hadNight)
+                }
                 finish(ok)
             } catch (e: Throwable) {
                 if (e is CancellationException) throw e
@@ -1864,7 +1935,8 @@ class ReaderViewModel @JvmOverloads constructor(
      * [PageLoader.retryPage] 刷新（成功＝譯圖、失敗＝原圖），再 toast 成敗。線上章不提供此鈕（呼叫端 gate）。
      */
     fun translateThisPage() {
-        val page = (state.value.dialog as? Dialog.PageActions)?.page ?: return
+        val selected = (state.value.dialog as? Dialog.PageActions)?.page ?: return
+        val page = (selected as? InsertPage)?.parent ?: selected
         closeDialog()
         if (!translationPreferences.translationMasterEnabled.get()) return // 硬總開關：關時不翻、不載引擎
         val manga = manga ?: return
@@ -1878,45 +1950,25 @@ class ReaderViewModel @JvmOverloads constructor(
                 eventChannel.send(Event.TranslateModelsUnavailable(TranslationEngineConfig.modelsOutdated(ctx)))
                 return@launchIO
             }
-            // 收尾：回 UI thread 刷新該頁（retryPage → Ready → holder 重 decode，把 spinner 換回圖）並回報成敗。
+            // Report the actual operation result. Display restoration lives in finally, including cancellation.
             suspend fun finish(ok: Boolean, event: Event = Event.TranslatePageResult(ok)) {
-                withUIContext { page.chapter.pageLoader?.retryPage(page) }
                 eventChannel.send(event)
             }
 
-            withUIContext { page.status = Page.State.Queue }
-            eventChannel.send(Event.TranslatePageStarted)
-
             try {
-                val source = sourceManager.getOrStub(manga.source)
-                val chapterDir = downloadProvider.findChapterDir(
-                    chapter.chapter.name,
-                    chapter.chapter.scanlator,
-                    chapter.chapter.url,
-                    manga.title,
-                    source,
-                )
-                if (chapterDir == null) {
+                withUIContext { page.status = Page.State.Queue }
+                eventChannel.send(Event.TranslatePageStarted)
+                val target = resolveDownloadedPageFile(page)
+                if (target == null) {
                     finish(false)
                     return@launchIO
                 }
-                // page.index → 檔名：與下載頁列表相同排序（DownloadManager.buildPageList 的 sortedBy{name}）取第 index 個。
-                val imageExt = setOf("jpg", "jpeg", "png", "webp")
-                val pageFileName = chapterDir.listFiles()
-                    ?.filter { f ->
-                        f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in imageExt
-                    }
-                    ?.sortedBy { it.name.orEmpty() }
-                    ?.getOrNull(page.index)
-                    ?.name
-                if (pageFileName == null) {
-                    finish(false)
-                    return@launchIO
-                }
+                val (chapterDir, pageFileName) = target
                 // 覆寫前先問這章有沒有夜讀版（同 reRenderPage）
                 val hadNight = translationManager.chapterHasNightBeforePage(chapterDir)
                 when (pageTranslator.translateSinglePage(chapterDir, pageFileName, method)) {
                     PageTranslator.SinglePageResult.TRANSLATED -> {
+                        withUIContext { page.clearOriginalPreview() }
                         requeueNightAfterPage(manga, chapter, hadNight) // finish 前：見 reRenderPage
                         finish(true)
                     }
@@ -1930,6 +1982,8 @@ class ReaderViewModel @JvmOverloads constructor(
                 if (e is CancellationException) throw e
                 logcat(LogPriority.ERROR, e) { "翻譯這頁失敗" }
                 finish(false)
+            } finally {
+                eu.kanade.tachiyomi.ui.reader.loader.refreshAfterPageOperation(page)
             }
         }
     }
@@ -1937,7 +1991,7 @@ class ReaderViewModel @JvmOverloads constructor(
     /**
      * 「開始翻譯這話」（reader 頁動作對話框，當前章**未**在翻譯佇列時顯示）——手動觸發，與自動（讀到當前章）
      * 共用同一條可靠路徑：
-     *  - **已下載**：直接把當前章插隊排入翻譯佇列（已包 [TranslatingPageLoader] → [TranslatingPageLoader.onActivated]；
+     *  - **已下載**：直接把當前章插隊排入翻譯佇列（已包 [TranslatingPageLoader] → [TranslatingPageLoader.restartTranslation]；
      *    否則 [TranslationManager.translate] `atFront=true`）。
      *  - **線上（未下載）**：走與自動相同的 [triggerOnlineLiveTranslate]——下載該章、完成後重載進已下載路徑、再排入翻譯。
      *    （取代舊版只 markForTranslate + 下載、同 session 不顯示的做法 → 手動線上翻也會在本 session 顯示。）
@@ -1953,6 +2007,10 @@ class ReaderViewModel @JvmOverloads constructor(
         val readerChapter = getCurrentChapter() ?: return
         val domainChapter = readerChapter.chapter.toDomainChapter() ?: return
 
+        val stopVersion = synchronized(onlineTranslationLock) {
+            stoppedTranslationChapters.remove(domainChapter.id)
+            translationStopVersions[domainChapter.id] ?: 0L
+        }
         viewModelScope.launchIO {
             // 模型不可用（缺 / 舊版 v1）→ 明確提示去設定更新，別送假「已開始」再默默變紅（修 0.16.0 舊模型靜默）。
             val ctx = Injekt.get<Application>()
@@ -1970,24 +2028,35 @@ class ReaderViewModel @JvmOverloads constructor(
                     skipCache = true,
                 )
                 if (isDownloaded) {
-                    // 已下載：插隊排入翻譯佇列。已包裝 → 走 loader 的 onActivated（與自動同入口、冪等）；否則直接 translate。
-                    val pageLoader = readerChapter.pageLoader
-                    if (pageLoader is TranslatingPageLoader) {
-                        pageLoader.onActivated()
-                    } else {
-                        // reader 控制鈕「翻這話」＝即時情境 → 即時去字法（預設 AI 去字，與自動即時翻一致）。
-                        translationManager.translate(
-                            manga,
-                            listOf(domainChapter),
-                            atFront = true,
-                            method = translationManager.liveInpaintMethod(),
-                        )
+                    synchronized(onlineTranslationLock) {
+                        if ((translationStopVersions[domainChapter.id] ?: 0L) != stopVersion) return@launchIO
+                    }
+                    // A timed-out download poll may have left this reader using its HTTP loader.
+                    if (readerChapter.pageLoader is HttpPageLoader) reloadCurrentChapterPreservingPage()
+                    synchronized(onlineTranslationLock) {
+                        if ((translationStopVersions[domainChapter.id] ?: 0L) != stopVersion) return@launchIO
+                        // Explicit retries must bypass the loader's one-time automatic activation latch.
+                        val pageLoader = readerChapter.pageLoader
+                        if (pageLoader is TranslatingPageLoader) {
+                            pageLoader.restartTranslation()
+                        } else {
+                            // reader 控制鈕「翻這話」＝即時情境 → 即時去字法（預設 AI 去字，與自動即時翻一致）。
+                            translationManager.translate(
+                                manga,
+                                listOf(domainChapter),
+                                atFront = true,
+                                method = translationManager.liveInpaintMethod(),
+                            )
+                        }
                     }
                 } else {
                     // 線上：走與自動相同的「下載 + 完成後重載進已下載路徑」流程（本 session 也會顯示）。
                     // 登記去重集合，避免隨後 currChapter flow 的自動路徑重觸發同一章。
                     readerChapter.chapter.id?.let { onlineTriggeredChapterIds.add(it) }
-                    triggerOnlineLiveTranslate(readerChapter)
+                    synchronized(onlineTranslationLock) {
+                        if ((translationStopVersions[domainChapter.id] ?: 0L) != stopVersion) return@launchIO
+                        triggerOnlineLiveTranslate(readerChapter, explicitRetry = true)
+                    }
                 }
                 eventChannel.send(Event.ChapterTranslateStarted)
             } catch (e: Throwable) {
@@ -2006,7 +2075,13 @@ class ReaderViewModel @JvmOverloads constructor(
     fun stopChapterTranslate() {
         closeDialog()
         val chapterId = getCurrentChapter()?.chapter?.id ?: return
-        translationManager.cancelTranslation(listOf(chapterId)) // 只中止翻譯／重繪項；同章夜讀項不動
+        synchronized(onlineTranslationLock) {
+            stoppedTranslationChapters.add(chapterId)
+            translationStopVersions[chapterId] = (translationStopVersions[chapterId] ?: 0L) + 1L
+            onlineTranslationPolls.remove(chapterId)?.cancel()
+            translationManager.cancelPendingTranslation(chapterId)
+            pendingTranslationIntentRevision.update { it + 1 }
+        }
         viewModelScope.launchIO { eventChannel.send(Event.ChapterTranslateStopped) }
     }
 
@@ -2083,6 +2158,8 @@ class ReaderViewModel @JvmOverloads constructor(
          * 由 [translationManager] 的佇列與當前章 id 併流算得（見 init 區塊）。
          */
         val liveTranslateProgress: LiveTranslateProgress? = null,
+        /** Pending online translation download; used for Stop, never as translated-page progress. */
+        val translationDownloadPending: Boolean = false,
         /** 引擎是否正在載入（~100MB）：reader 角落指示器顯示「引擎載入中…」（[eu.kanade.presentation.reader.ReaderLiveTranslateIndicator]）。 */
         val engineLoading: Boolean = false,
 
@@ -2182,6 +2259,8 @@ class ReaderViewModel @JvmOverloads constructor(
 
         /** 這頁沒有重繪素材（翻譯時沒開保留素材、只存了夜讀素材）：不開重繪對話框，提示重繪與還原原圖都做不到。 */
         data object ReRenderNoMaterials : Event
+
+        data object OriginalPreviewUnavailable : Event
 
         /** 「翻譯這頁」拒絕：這頁已翻過、沒有原圖素材（頁檔就是譯圖），再翻沒有意義。什麼都沒動。 */
         data object TranslatePageNoOriginal : Event

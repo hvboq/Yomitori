@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name" translatable="false">Yakuyomi</string>
+    <string name="app_name" translatable="false">Yomitori</string>
 
     <!-- Generic strings -->
     <string name="on">On</string>
@@ -496,7 +496,7 @@
     <string name="enhancements_guide_ls_desc_title">Collapsible description</string>
     <string name="enhancements_guide_ls_desc_desc">Choose whether a manga\'s description opens expanded or collapsed.</string>
     <string name="pref_translation_orientation">Text direction</string>
-    <string name="pref_translation_orientation_auto">Auto (follow source)</string>
+    <string name="pref_translation_orientation_auto">Auto (horizontal for Korean)</string>
     <string name="pref_translation_orientation_vertical">Vertical (vertical-first)</string>
     <string name="pref_translation_orientation_horizontal">Horizontal (horizontal-first)</string>
     <string name="pref_translation_inpaint_method">Text removal method</string>
@@ -1488,7 +1488,7 @@
     <string name="pref_translation_thread_auto">Auto (%d cores)</string>
     <string name="pref_translation_thread_count">%d threads</string>
     <string name="pref_translation_keep_materials">Keep re-render materials</string>
-    <string name="pref_translation_keep_materials_summary">Saves the original + mask + text regions per page so you can re-render with another removal method later (no re-OCR/translate); roughly doubles storage</string>
+    <string name="pref_translation_keep_materials_summary">Keeps masks and text regions for re-rendering without OCR or translation. Original page files are always preserved separately.</string>
     <string name="pref_translation_color_mode">Text color</string>
     <string name="pref_translation_color_auto">Auto (black/white by background)</string>
     <string name="pref_translation_color_mono">Always black with a white outline</string>
@@ -1568,7 +1568,7 @@
     <string name="model_dl_error_checksum">File check failed; the download may be corrupted</string>
     <string name="model_dl_error_http">Server error (HTTP %1$d)</string>
     <!-- Yakuyomi: engine status + preload -->
-    <string name="engine_unavailable">Engine unavailable (missing models/key or build failed)</string>
+    <string name="engine_unavailable">Check downloaded models, server URL, model name and API key. Custom local servers may leave the key empty.</string>
     <string name="translate_exception">Translation exception</string>
     <string name="engine_preload_desc">Translation engine</string>
     <string name="engine_status_loading">Translation engine: loading…</string>
@@ -1584,6 +1584,10 @@
     <string name="reader_translating">Translating</string>
     <string name="reader_translating_queued">Translation queued</string>
     <string name="reader_translate_this_page">Translate this page</string>
+    <string name="reader_show_original">Show original</string>
+    <string name="reader_show_translation">Show translation</string>
+    <string name="reader_original_preview_summary">Compare with the original while keeping the saved translation.</string>
+    <string name="reader_original_preview_unavailable">No readable original is saved for this page.</string>
     <string name="reader_chapter_list">Chapters</string>
     <string name="reader_translate_this_chapter">Translate this chapter</string>
     <string name="reader_stop_chapter_translate">Stop translating this chapter</string>
@@ -1733,4 +1737,6 @@
     <string name="pref_nightread_clear_read">Clear night versions of read chapters</string>
     <string name="pref_nightread_clear_all">Clear all night versions</string>
     <string name="pref_nightread_clear_nothing">Nothing to clear</string>
+    <string name="hitomi_dpi_bypass">DPI bypass</string>
+    <string name="hitomi_dpi_bypass_summary">Use an alternative connection for Hitomi when your network blocks it. Changes apply to new requests. Encrypted DNS remains enabled when this is off.</string>
 </resources>

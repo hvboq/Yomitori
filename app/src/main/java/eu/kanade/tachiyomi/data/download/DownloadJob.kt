@@ -11,6 +11,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.util.system.NetworkState
@@ -58,7 +59,7 @@ class DownloadJob(context: Context, workerParams: WorkerParameters) : CoroutineW
             applicationContext.activeNetworkState(),
             downloadPreferences.downloadOnlyOverWifi.get(),
         )
-        var active = networkCheck && downloadManager.downloaderStart()
+        var active = networkCheck && downloadManager.downloaderStart(inputData.getBoolean(RETRY_ERRORS, true))
 
         if (!active) {
             return Result.failure()
@@ -101,10 +102,12 @@ class DownloadJob(context: Context, workerParams: WorkerParameters) : CoroutineW
 
     companion object {
         private const val TAG = "Downloader"
+        private const val RETRY_ERRORS = "retry_errors"
 
-        fun start(context: Context) {
+        fun start(context: Context, retryErrors: Boolean = true) {
             val request = OneTimeWorkRequestBuilder<DownloadJob>()
                 .addTag(TAG)
+                .setInputData(workDataOf(RETRY_ERRORS to retryErrors))
                 .build()
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(TAG, ExistingWorkPolicy.REPLACE, request)

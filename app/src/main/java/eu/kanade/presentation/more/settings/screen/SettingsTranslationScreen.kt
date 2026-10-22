@@ -324,7 +324,7 @@ object SettingsTranslationScreen : SearchableSettings {
         }.toImmutableMap()
 
         val targetLangs = persistentMapOf(
-            TranslationPreferences.DEFAULT_TARGET_LANG to stringResource(MR.strings.pref_translation_lang_trad_chinese),
+            TranslationPreferences.TRAD_CHINESE_LANG to stringResource(MR.strings.pref_translation_lang_trad_chinese),
             "Japanese" to stringResource(MR.strings.pref_translation_lang_japanese),
             "Simplified Chinese" to stringResource(MR.strings.pref_translation_lang_simp_chinese),
             "English" to stringResource(MR.strings.pref_translation_lang_english),
@@ -338,7 +338,7 @@ object SettingsTranslationScreen : SearchableSettings {
         val sourceLangs = persistentMapOf(
             "" to stringResource(MR.strings.pref_translation_lang_auto_detect),
             TranslationPreferences.DEFAULT_SOURCE_LANG to stringResource(MR.strings.pref_translation_lang_japanese),
-            TranslationPreferences.DEFAULT_TARGET_LANG to stringResource(MR.strings.pref_translation_lang_trad_chinese),
+            TranslationPreferences.TRAD_CHINESE_LANG to stringResource(MR.strings.pref_translation_lang_trad_chinese),
             "Simplified Chinese" to stringResource(MR.strings.pref_translation_lang_simp_chinese),
             "English" to stringResource(MR.strings.pref_translation_lang_english),
             "Korean" to stringResource(MR.strings.pref_translation_lang_korean),
@@ -538,9 +538,18 @@ object SettingsTranslationScreen : SearchableSettings {
                         preference = prefs.apiBase,
                         title = stringResource(MR.strings.pref_translation_api_base),
                         subtitle = stringResource(MR.strings.pref_translation_api_base_summary),
+                        onValueChanged = { endpoint ->
+                            if (endpoint.trim() != prefs.apiBase.get().trim()) {
+                                prefs.apiKeyFor("custom").set("")
+                                prefs.apiKeyFor("sakura").set("")
+                            }
+                            true
+                        },
                     ).takeIf { providerPreset.baseEditable },
                     Preference.PreferenceItem.EditTextPreference(
                         preference = prefs.apiKeyFor(providerId),
+                        allowEmpty = true,
+                        isSecret = true,
                         title = stringResource(MR.strings.pref_translation_api_key),
                         subtitle = stringResource(
                             MR.strings.pref_translation_api_key_summary,

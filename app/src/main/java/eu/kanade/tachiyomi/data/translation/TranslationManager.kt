@@ -36,7 +36,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import logcat.LogPriority
-import mihon.core.archive.ZipWriter
 import mihon.core.archive.archiveReader
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.category.interactor.GetCategories
@@ -75,7 +74,7 @@ import java.io.File
  *
  * **跟隨磁碟實際格式**（CBZ 還是鬆散資料夾由 mihon `saveChaptersAsCBZ` 決定）：
  *  - 鬆散資料夾 → 原地翻（[PageTranslator.translateChapter]，無重壓、無掉檔風險）。
- *  - CBZ → 解壓→翻→重壓回 CBZ，**§11-安全順序**：新 zip 寫好前原檔完好，最後才 delete+rename。
+ *  - CBZ → 解壓→翻→重壓回 CBZ，**§11-安全順序**：新 zip 寫好前原檔完好，最後保留經驗證的原始備份再寫回，失敗則嘗試還原。
  *
  * 失敗矩陣（§11）：單章失敗 → 標 ERROR 留佇列可重試、原檔不動；翻成功 → 離開佇列。
  *
@@ -171,7 +170,7 @@ class TranslationManager(private val context: Context) {
      * 記下時間；>0＝那一輪的開跑時間，完成標記早於它的頁一律重做）。時間在**開跑時**才定：要求當下若有舊的一輪正在跑，它停下前
      * 落地的頁（用舊參數）也早於這個時間、會被重做；之後被暫停再續跑，這輪已做好的頁晚於它、不會白做。持久化。
      */
-    private class Entry(
+    internal class Entry(
         val manga: Manga,
         val chapter: Chapter,
         var status: TranslationItem.Status = TranslationItem.Status.QUEUE,
@@ -228,9 +227,10 @@ class TranslationManager(private val context: Context) {
      * 超過 [PENDING_MARK_TTL_MS] 的（下載早就被取消的章，別讓多年後的一次下載還被當成「要翻」）。
      */
     private val pendingTranslate = HashMap<Long, Long>()
+    private val pendingTranslationDispatch = PendingTranslationDispatch()
 
     /** 標記某章「下載完成後要翻」（線上即時翻 / reader 控制鈕用）。 */
-    fun markForTranslate(chapterId: Long) {
+    fun markForTranslate(chapterId: Long) = pendingTranslationDispatch.mark(chapterId) {
         synchronized(lock) { pendingTranslate[chapterId] = System.currentTimeMillis() }
         persist()
     }
@@ -243,6 +243,32 @@ class TranslationManager(private val context: Context) {
         val removed = synchronized(lock) { pendingTranslate.remove(chapterId) != null }
         if (removed) persist()
     }
+
+    /** Reader stop and completion enqueue share a boundary; stale pending reads cannot enqueue afterward. */
+    fun cancelPendingTranslation(chapterId: Long) = pendingTranslationDispatch.cancel(
+        chapterId,
+        hasPending = { isPendingTranslate(chapterId) },
+    ) {
+        clearPending(chapterId)
+        cancelTranslation(listOf(chapterId))
+    }
+
+    fun onDownloadedForTranslation(manga: Manga, chapter: Chapter): Boolean =
+        pendingTranslationDispatch.onDownloaded(chapter.id) {
+            val pending = isPendingTranslate(chapter.id)
+            if (pending || (isReady() && !isSourceExcluded(manga))) {
+                translate(
+                    manga,
+                    listOf(chapter),
+                    atFront = pending,
+                    method = if (pending) liveInpaintMethod() else null,
+                )
+                if (pending) clearPending(chapter.id)
+                true
+            } else {
+                false
+            }
+        }
 
     /**
      * 「下載完要產生夜讀版」標記（章 id → 標記時間）：閱讀器裡對**線上章**按了「這話要先下載才能產生夜讀版，要下載嗎？」的
@@ -662,7 +688,7 @@ class TranslationManager(private val context: Context) {
     fun liveInpaintMethod(): String = translationPreferences.liveInpaintMethod.get()
 
     /**
-     * 排入翻譯（已下載章）。已在佇列裡的章 id 不重排。
+     * 排入翻譯（已下載章）。既有失敗項重試，排隊／執行中的章不重複新增。
      *
      * 每個新項擷取**當下**的去字方法（[TranslationPreferences.inpaintMethod]）存進 [Entry.method]——
      * 之後改全域偏好不影響已排隊的章；QUEUE 項可再經 [setItemMethod] 改。
@@ -703,15 +729,7 @@ class TranslationManager(private val context: Context) {
                 }
                 entries.addAll(0, batch)
             } else {
-                val ids = chapters.mapTo(HashSet()) { it.id }
-                val present = HashSet<Long>()
-                entries.forEach {
-                    if (!it.nightRender && it.chapter.id in ids) { // 夜讀項不擋翻譯
-                        present.add(it.chapter.id)
-                        it.paused = false // 明確再排＝解除單章暫停（否則章節列點「翻譯」對被 ⏸ 的章是無聲 no-op）
-                    }
-                }
-                chapters.forEach { if (it.id !in present) entries.add(Entry(manga, it, method = m)) }
+                enqueueTranslationsAtEnd(entries, manga, chapters, m)
             }
         }
         publish()
@@ -1693,7 +1711,7 @@ class TranslationManager(private val context: Context) {
             //   換檔＝翻有進度 or manifest 已覆蓋（持久化部分成果、避免續傳重做）；
             //   成功＝manifest 全覆蓋（部分成功仍回 false → drain 標 ERROR 留佇列、下次補剩頁）。
             processArchiveInPlace(dir, onProgress, shouldStop) { tmpU ->
-                // 夜讀素材不存：打包跳過 .yakuyomi/、壓縮檔章也不能夜讀，存了白做
+                // Night-only materials are not needed; original and re-render materials are retained in the ZIP.
                 val n = pageTranslator.translateChapter(
                     tmpU,
                     entry.method,
@@ -2013,7 +2031,7 @@ class TranslationManager(private val context: Context) {
     }
 
     /**
-     * CBZ：解壓暫存→[process]（翻譯或重繪）→重壓暫存 zip→驗證後才換掉原檔（§11：原檔到 rename 前都完好）。
+     * Stage and verify the rewritten ZIP, then retain a verified original archive backup before replacement.
      *
      * [process]＝對解壓後的暫存夾做實際處理、回傳 [ProcessResult]（swap＝是否重壓換檔、success＝是否算成功）。
      * 翻譯與重繪共用同一套解壓/重壓/§11-安全換檔邏輯，差別只在這個 callback。回傳 [ProcessResult.success]。
@@ -2024,69 +2042,108 @@ class TranslationManager(private val context: Context) {
         shouldStop: () -> Boolean,
         process: suspend (UniFile) -> ProcessResult,
     ): Boolean {
-        val parent = cbz.parentFile ?: return false
-        val cbzName = cbz.name ?: return false
-        val tmp = File(context.cacheDir, "yakutr_${System.nanoTime()}").apply { mkdirs() }
-        try {
-            // 1. 解壓檔案 entry 到暫存夾
-            cbz.archiveReader(context).use { reader ->
-                val names = reader.useEntries { seq -> seq.filter { it.isFile }.map { it.name }.toList() }
-                names.forEach { entryName ->
-                    reader.getInputStream(entryName)?.use { input ->
-                        File(tmp, File(entryName).name).outputStream().use { input.copyTo(it) }
-                    }
+        // fromFile creates a root UniFile with no parent link. Resolve only local file URIs;
+        // a content URI needs its provider-granted parent and must never be guessed from its path.
+        val parent = checkNotNull(
+            cbz.parentFile ?: if (cbz.uri.scheme == "file") {
+                cbz.uri.path?.let { path ->
+                    File(path).absoluteFile.parentFile?.takeIf(File::isDirectory)?.let(UniFile::fromFile)
                 }
+            } else {
+                null
+            },
+        ) { "Archive parent is unavailable" }
+        val cbzName = checkNotNull(cbz.name) { "Archive name is unavailable" }
+        val work = java.nio.file.Files.createTempDirectory(context.cacheDir.toPath(), "yakutr_").toFile()
+        try {
+            val original = File(work, "original.archive")
+            context.contentResolver.openInputStream(cbz.uri).use { input ->
+                checkNotNull(input) { "Cannot read original archive" }
+                original.outputStream().use { SafeArchiveRewrite.copy(input, it, shouldStop) }
             }
-            val tmpU = UniFile.fromFile(tmp) ?: return false
-            // 2. 處理（就地覆蓋暫存頁；翻譯另寫 manifest、重繪另更新素材 method）
-            val result = process(tmpU)
-            if (shouldStop()) return false // 被暫停/取消中止 → 丟棄暫存、原檔不動（不壓回半成品）
-            if (!result.swap) return false // 全失敗（沒翻成/沒重繪到）→ 不動原檔、可重試
-            // 3. 重壓到暫存 zip（原檔此時完好）。先清掉上次打包失敗殘留的孤兒暫存。
-            parent.findFile("$cbzName$TMP_SUFFIX")?.delete()
-            val newZip = parent.createFile("$cbzName$TMP_SUFFIX") ?: return false
-            // 只壓「檔案」、跳過目錄：ZipWriter.write() 把目錄當檔案讀會丟 EISDIR（素材子夾 .yakuyomi 觸發、
-            // = local 壓縮檔翻完打包失敗的真因）。壓縮檔不支援素材重繪 → 素材子夾不必進壓縮檔；
-            // marker(.yakuyomi_translated) 與譯圖都是檔案、照壓。
-            ZipWriter(context, newZip).use { w -> tmpU.listFiles()?.forEach { if (it.isFile) w.write(it) } }
-            // 4. 換檔。優先 §11-safe 的 delete+rename（一般裝置儲存可行、原子）；某些 SAF provider delete/rename
-            //    不可靠 → 退回「就地把暫存 zip 位元組覆寫回原檔」(overwriteFrom、"wt" 截斷、不靠 rename)。
-            if (cbz.delete() && newZip.renameTo(cbzName)) {
-                return result.success
+            val pages = File(work, "pages").apply { check(mkdir()) { "Cannot create archive staging directory" } }
+            val snapshot = checkNotNull(UniFile.fromFile(original))
+            snapshot.archiveReader(context).use { reader ->
+                val entries = reader.useEntries { seq ->
+                    seq.take(SafeArchiveRewrite.MAX_ENTRIES + 1).map { it.name to it.isFile }.toList()
+                }
+                SafeArchiveRewrite.extract(
+                    entries,
+                    pages,
+                    { name -> checkNotNull(reader.getInputStream(name)) { "Archive entry is unreadable" } },
+                    shouldStop,
+                )
             }
-            val target = parent.findFile(cbzName) ?: parent.createFile(cbzName) ?: return false
-            val overwritten = overwriteFrom(target, newZip)
-            if (overwritten) newZip.delete()
-            // 覆寫失敗 → 保留 .yakutmp（翻譯結果不丟、可重試）、回 false → drain 標 ERROR 留佇列可重試。
-            return overwritten && result.success
-        } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e) { "processArchiveInPlace 失敗（原檔保留）" }
-            return false
+            val result = process(checkNotNull(UniFile.fromFile(pages)))
+            if (shouldStop() || !result.swap) return false
+            val replacement = File(work, "replacement.zip")
+            SafeArchiveRewrite.packAndVerify(pages, replacement, shouldStop)
+            if (shouldStop()) return false
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+
+            // Never delete a preexisting .yakutmp or the chapter. Keep an independently verified
+            // original next to it even when the SAF provider cannot roll back a failed write.
+            val backupName = "$cbzName.yomitori-original-${java.util.UUID.randomUUID()}.bak"
+            check(parent.findFile(backupName) == null) { "Archive backup path already exists" }
+            val backup = checkNotNull(parent.createFile(backupName)) { "Cannot create original archive backup" }
+            check(backup.uri != cbz.uri && backup.name == backupName && backup.isFile) {
+                "Archive provider did not create a distinct backup file"
+            }
+            SafeArchiveRewrite.commit(
+                original,
+                replacement,
+                archiveStorage(cbz),
+                archiveStorage(backup),
+                shouldStop,
+            )
+            return result.success
         } finally {
-            tmp.deleteRecursively()
+            work.deleteRecursively()
         }
     }
 
-    /** 把 [src] 的位元組就地覆寫進 [dst]（ContentResolver "wt" 截斷；繞過不可靠的 SAF delete/rename）。best-effort。 */
-    private fun overwriteFrom(dst: UniFile, src: UniFile): Boolean = runCatching {
-        val input = context.contentResolver.openInputStream(src.uri) ?: return false
-        input.use { i ->
-            val out = context.contentResolver.openOutputStream(dst.uri, "wt") ?: return false
-            out.use { i.copyTo(it) }
-        }
-        true
-    }.getOrDefault(false)
+    private fun archiveStorage(file: UniFile): SafeArchiveRewrite.Storage = object : SafeArchiveRewrite.Storage {
+        override fun read(): java.io.InputStream =
+            context.contentResolver.openInputStream(file.uri) ?: throw java.io.IOException("Cannot read archive file")
 
-    /** CBZ 內是否有 marker entry（已翻指標；逐頁 coverage 細查留後續）。 */
-    private fun archiveHasMarker(cbz: UniFile): Boolean = runCatching {
-        cbz.archiveReader(context).use { reader ->
-            reader.useEntries { seq -> seq.any { File(it.name).name == MARKER_NAME } }
-        }
-    }.getOrDefault(false)
+        override fun write(): java.io.OutputStream =
+            if (file.uri.scheme == "file") {
+                java.io.FileOutputStream(checkNotNull(file.uri.path), false)
+            } else {
+                context.contentResolver.openOutputStream(file.uri, "wt")
+                    ?: throw java.io.IOException("Cannot write archive file")
+            }
+    }
+
+    /** Archive completion requires verified metadata covering every page, including checkpoint recovery. */
+    private fun archiveHasMarker(cbz: UniFile): Boolean = pageTranslator.isArchiveTranslated(cbz)
 
     companion object {
-        private const val MARKER_NAME = ".yakuyomi_translated"
-        private const val TMP_SUFFIX = ".yakutmp"
+        /** Caller holds the queue lock. Explicit enqueue retries failures without replacing active entries. */
+        internal fun enqueueTranslationsAtEnd(
+            entries: MutableList<Entry>,
+            manga: Manga,
+            chapters: List<Chapter>,
+            method: String,
+        ) {
+            val ids = chapters.mapTo(HashSet()) { it.id }
+            val present = HashSet<Long>()
+            entries.forEach { entry ->
+                if (!entry.nightRender && entry.chapter.id in ids) {
+                    present.add(entry.chapter.id)
+                    entry.paused = false // Keep the existing explicit-enqueue resume behavior.
+                    if (entry.status == TranslationItem.Status.ERROR) {
+                        entry.status = TranslationItem.Status.QUEUE
+                        entry.method = method
+                        entry.done = 0
+                        entry.total = 0
+                    }
+                }
+            }
+            chapters.forEach { chapter ->
+                if (present.add(chapter.id)) entries.add(Entry(manga, chapter, method = method))
+            }
+        }
 
         /** drain 期間持有的 partial WakeLock 標籤（翻譯那條／夜讀那條各一把）+ 逾時上限（洩漏保險；正常由 finally 釋放）。見 [runDrain]。 */
         private const val WAKELOCK_TAG = "yakuyomi:translation"

@@ -85,6 +85,7 @@ internal class DownloadPageLoader(
                     dirFallback = { UniFile.fromUri(context, uri)?.parentFile },
                 ) { context.contentResolver.openInputStream(uri)!! }
             }.apply {
+                this.uri = uri // Preserve file identity; an index can shift when other image formats are present.
                 status = Page.State.Ready
             }
         }

@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.data.backup.create.creators
 
+import eu.kanade.tachiyomi.data.backup.TranslationCredentialBackupPolicy
 import eu.kanade.tachiyomi.data.backup.models.BackupPreference
 import eu.kanade.tachiyomi.data.backup.models.BackupSourcePreferences
 import eu.kanade.tachiyomi.data.backup.models.BooleanPreferenceValue
@@ -23,7 +24,8 @@ class PreferenceBackupCreator(
 ) {
 
     fun createApp(includePrivatePreferences: Boolean): List<BackupPreference> {
-        return preferenceStore.getAll().toBackupPreferences()
+        return preferenceStore.getAll().filterKeys { !TranslationCredentialBackupPolicy.isCredential(it) }
+            .toBackupPreferences()
             .withPrivatePreferences(includePrivatePreferences)
     }
 

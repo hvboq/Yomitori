@@ -39,10 +39,10 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = "li.joye.yakuyomi"
+        applicationId = "app.yomitori.yakuyomi"
 
-        versionCode = 67
-        versionName = "0.23.0"
+        versionCode = 70
+        versionName = "0.23.0-yomitori.4"
 
         buildConfigField("String", "COMMIT_COUNT", "\"${getLatestCommitCount()}\"")
         buildConfigField("String", "COMMIT_SHA", "\"${getLatestCommitSha()}\"")
@@ -325,6 +325,9 @@ dependencies {
     implementation(libs.stringSimilarity)
 
     // Tests
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation("androidx.test:runner:1.7.0")
+    androidTestImplementation("androidx.test:core:1.7.0")
     testImplementation(libs.bundles.test)
     testRuntimeOnly(libs.junit.platform.launcher)
 

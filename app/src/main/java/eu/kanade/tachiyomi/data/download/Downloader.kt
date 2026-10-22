@@ -20,8 +20,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asFlow
@@ -39,6 +41,7 @@ import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.withContext
 import logcat.LogPriority
 import mihon.core.archive.ZipWriter
 import nl.adaptivity.xmlutil.serialization.XML
@@ -91,6 +94,8 @@ class Downloader(
      */
     private val _queueState = MutableStateFlow<List<Download>>(emptyList())
     val queueState = _queueState.asStateFlow()
+    private val retryRevision = MutableStateFlow(0L)
+    private val explicitlyRetriedIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
 
     /**
      * Notifier for the downloader state and progress.
@@ -128,12 +133,13 @@ class Downloader(
      *
      * @return true if the downloader is started, false otherwise.
      */
-    fun start(): Boolean {
+    fun start(retryErrors: Boolean = true): Boolean {
         if (isRunning || queueState.value.isEmpty()) {
             return false
         }
 
-        val pending = queueState.value.filter { it.status != Download.State.DOWNLOADED }
+        val pending = queueState.value.filter { shouldResumeDownload(it.status, retryErrors) }
+        if (pending.isEmpty()) return false
         pending.forEach { if (it.status != Download.State.QUEUE) it.status = Download.State.QUEUE }
 
         isPaused = false
@@ -141,6 +147,18 @@ class Downloader(
         launchDownloaderJob()
 
         return pending.isNotEmpty()
+    }
+
+    /** Wake only the explicitly selected failed chapter, preserving all other error states. */
+    fun retryFailedChapter(chapterId: Long): Boolean {
+        val target = queueState.value.firstOrNull { it.chapter.id == chapterId } ?: return false
+        if (target.status != Download.State.ERROR) return false
+        explicitlyRetriedIds.add(chapterId)
+        target.status = Download.State.QUEUE
+        // Status belongs to each Download, not queueState. A new signal is needed even when the
+        // queue list remains equal, otherwise an already running collector can miss this retry.
+        retryRevision.update { it + 1 }
+        return true
     }
 
     /**
@@ -199,7 +217,8 @@ class Downloader(
             val activeDownloadsFlow = combine(
                 queueState,
                 downloadPreferences.parallelSourceLimit.changes(),
-            ) { a, b -> a to b }.transformLatest { (queue, parallelCount) ->
+                retryRevision,
+            ) { a, b, _ -> a to b }.transformLatest { (queue, parallelCount) ->
                 while (true) {
                     val activeDownloads = queue.asSequence()
                         // Ignore completed downloads, leave them in the queue
@@ -208,7 +227,7 @@ class Downloader(
                         .toList()
                         .take(parallelCount)
                         .map { (_, downloads) -> downloads.first() }
-                    emit(activeDownloads)
+                    emit(activeDownloads to retryRevision.value)
 
                     if (activeDownloads.isEmpty()) break
                     // Suspend until a download enters the ERROR state
@@ -225,7 +244,16 @@ class Downloader(
             supervisorScope {
                 val downloadJobs = mutableMapOf<Download, Job>()
 
-                activeDownloadsFlow.collectLatest { activeDownloads ->
+                activeDownloadsFlow.collectLatest { (activeDownloads, _) ->
+                    // A retry can arrive before the failed coroutine has finished unwinding.
+                    // Join it before launching the replacement so both cannot write the same files.
+                    activeDownloads.filter { it.chapter.id in explicitlyRetriedIds }.forEach { download ->
+                        withContext(NonCancellable) {
+                            downloadJobs[download]?.cancelAndJoin()
+                            downloadJobs.remove(download)
+                            explicitlyRetriedIds.remove(download.chapter.id)
+                        }
+                    }
                     val downloadJobsToStop = downloadJobs.filter { it.key !in activeDownloads }
                     downloadJobsToStop.forEach { (download, job) ->
                         job.cancel()
@@ -433,17 +461,8 @@ class Downloader(
             //  - isPendingTranslate()＝這章被 reader 即時翻 / 控制鈕標記過（markForTranslate）→
             //    即使總開關關著（或來源被排除）也要翻（使用者讀到/手動觸發＝明確意圖）。排入後清掉標記、用 atFront 插隊
             //    （正在讀的章優先翻），與 TranslatingPageLoader 的插隊語義一致。
-            val pending = translationManager.isPendingTranslate(download.chapter.id)
-            if ((translationManager.isReady() && !translationManager.isSourceExcluded(download.manga)) || pending) {
-                translationManager.translate(
-                    download.manga,
-                    listOf(download.chapter),
-                    atFront = pending,
-                    // pending＝reader 即時翻/控制鈕觸發的線上章 → 用即時翻去字法（獨立 pref，預設同為 AI 去字）；自動下載時翻（!pending）用設定去字法。
-                    method = if (pending) translationManager.liveInpaintMethod() else null,
-                )
-                if (pending) translationManager.clearPending(download.chapter.id)
-            } else if (translationManager.autoNightEligible() &&
+            if (!translationManager.onDownloadedForTranslation(download.manga, download.chapter) &&
+                translationManager.autoNightEligible() &&
                 !translationManager.willLiveTranslate(download.manga)
             ) {
                 // 這章不會進翻譯（翻譯關／來源排除／沒 key，且讀到時也不會被即時翻接手）→ 非翻譯本也要夜讀：直接排夜讀項

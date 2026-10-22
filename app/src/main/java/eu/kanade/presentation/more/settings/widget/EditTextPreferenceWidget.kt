@@ -19,7 +19,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
 import tachiyomi.i18n.MR
@@ -33,13 +35,15 @@ fun EditTextPreferenceWidget(
     value: String,
     onConfirm: suspend (String) -> Boolean,
     titleBadge: String? = null,
+    allowEmpty: Boolean = false,
+    isSecret: Boolean = false,
 ) {
     var isDialogShown by remember { mutableStateOf(false) }
 
     TextPreferenceWidget(
         title = title,
         titleBadge = titleBadge,
-        subtitle = subtitle?.format(value),
+        subtitle = subtitle?.format(if (isSecret && value.isNotBlank()) "••••••••" else value),
         icon = icon,
         onPreferenceClick = { isDialogShown = true },
     )
@@ -58,7 +62,7 @@ fun EditTextPreferenceWidget(
                     value = textFieldValue,
                     onValueChange = { textFieldValue = it },
                     trailingIcon = {
-                        if (textFieldValue.text.isBlank()) {
+                        if (textFieldValue.text.isBlank() && !allowEmpty) {
                             Icon(imageVector = Icons.Filled.Error, contentDescription = null)
                         } else {
                             IconButton(onClick = { textFieldValue = TextFieldValue("") }) {
@@ -66,7 +70,8 @@ fun EditTextPreferenceWidget(
                             }
                         }
                     },
-                    isError = textFieldValue.text.isBlank(),
+                    isError = textFieldValue.text.isBlank() && !allowEmpty,
+                    visualTransformation = if (isSecret) PasswordVisualTransformation() else VisualTransformation.None,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -76,7 +81,7 @@ fun EditTextPreferenceWidget(
             ),
             confirmButton = {
                 TextButton(
-                    enabled = textFieldValue.text != value && textFieldValue.text.isNotBlank(),
+                    enabled = textFieldValue.text != value && (allowEmpty || textFieldValue.text.isNotBlank()),
                     onClick = {
                         scope.launch {
                             if (onConfirm(textFieldValue.text)) {

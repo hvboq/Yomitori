@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.data.backup.restore.restorers
 
 import android.content.Context
 import android.util.Log
+import eu.kanade.tachiyomi.data.backup.SourcePreferenceBackupPolicy
+import eu.kanade.tachiyomi.data.backup.TranslationCredentialBackupPolicy
 import eu.kanade.tachiyomi.data.backup.create.BackupCreateJob
 import eu.kanade.tachiyomi.data.backup.models.BackupCategory
 import eu.kanade.tachiyomi.data.backup.models.BackupPreference
@@ -34,7 +36,7 @@ class PreferenceRestorer(
         backupCategories: List<BackupCategory>?,
     ) {
         restorePreferences(
-            preferences,
+            TranslationCredentialBackupPolicy.prepareRestore(preferences, preferenceStore),
             preferenceStore,
             backupCategories,
         )
@@ -45,6 +47,8 @@ class PreferenceRestorer(
 
     suspend fun restoreSource(preferences: List<BackupSourcePreferences>) {
         preferences.forEach {
+            // A backup must not select arbitrary preference files, including app credentials.
+            if (!SourcePreferenceBackupPolicy.isValidSourceKey(it.sourceKey)) return@forEach
             val sourcePrefs = AndroidPreferenceStore(context, sourcePreferences(it.sourceKey))
             restorePreferences(it.prefs, sourcePrefs)
         }

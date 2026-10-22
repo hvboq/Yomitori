@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.data.translation
 import android.content.Context
 import android.graphics.Bitmap
 import eu.kanade.tachiyomi.crash.TraceLog
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -84,9 +85,6 @@ class TranslationEngineService(private val context: Context) {
     private val _warm = MutableStateFlow(false)
     val warm: StateFlow<Boolean> = _warm.asStateFlow()
 
-    /** key：設定頁（BYOK，Keystore 加密），與 [PageTranslator] 同規則；沒有 build 時寫進 APK 的後備 key。 */
-    private fun apiKey(): String = translationPreferences.activeApiKey()
-
     /**
      * 引擎是否就緒：key 有設 + 3 顆模型齊。給 [ChapterLoader] 決定要不要包 [TranslatingPageLoader]。
      *
@@ -95,7 +93,7 @@ class TranslationEngineService(private val context: Context) {
      * 故此處只看 key + 模型，否則即時翻會被 translationEnabled 靜默擋掉。
      */
     fun isReady(): Boolean {
-        if (apiKey().isBlank()) return false
+        if (!translationPreferences.hasCredentials()) return false
         if (TranslationEngineConfig.isProviderBaseMissing(translationPreferences)) return false
         return TranslationEngineConfig.modelsResolvable(context)
     }
@@ -133,6 +131,8 @@ class TranslationEngineService(private val context: Context) {
                 // 代價＝只有冷啟動後第一本的第一頁不被跨頁重疊（含一次網路往返）；換得不再撞冷 session。
                 try {
                     e.translatePage(src).also { warmedUp = true }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (ex: Throwable) {
                     logcat(LogPriority.ERROR, ex) { "warm 引擎翻譯單頁失敗（冷引擎首次）" }
                     PageResult.Failed(ex.message ?: context.stringResource(MR.strings.translate_exception))
@@ -150,6 +150,8 @@ class TranslationEngineService(private val context: Context) {
         TraceLog.log("svc", "translatePage.concurrent.call inFlight=${inFlight.get()}")
         return try {
             engine.translatePage(src)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Throwable) {
             logcat(LogPriority.ERROR, e) { "warm 引擎翻譯單頁失敗" }
             PageResult.Failed(e.message ?: context.stringResource(MR.strings.translate_exception))
@@ -176,24 +178,29 @@ class TranslationEngineService(private val context: Context) {
      * **僅在 [mutex] 下呼叫**（[translatePage]/[warmUp] 內）。
      *
      * **併發安全（關鍵）**：重建要 [closeEngine]（釋放 native session）——但**絕不可**在有頁在飛（[inFlight]>0）時關，
-     * 否則正在跑推論的頁 use-after-close 會 native crash。兩個獨立消費者（佇列 drain + reader「翻譯這頁」）去字法不同時
-     * 會撞到這裡：**有現成 warm 引擎且有頁在飛 → 先用現有引擎服務本頁**（去字法可能與請求略不同、但不崩潰），
-     * 延後重建到 idle；只有 inFlight==0 才安全關舊重建。本呼叫者此刻尚未 inFlight++（在鎖下、緊接 ensureEngine 之後才 ++），
-     * 故此處讀到的 inFlight 反映的是**其他**在飛頁；持鎖期間沒有新頁能註冊，故 inFlight==0 判定後關閉是安全的。
+     * Wait for existing calls to finish while holding the registration mutex. Their completion uses
+     * only the atomic counter, so they can drain without acquiring this mutex. New calls must never
+     * reuse an engine with stale endpoint/key settings. Cancellation releases the lock without closing
+     * sessions that are still in use.
      */
-    private fun ensureEngine(methodRaw: String): TranslationEngine? {
-        val signature = configSignature(methodRaw)
+    private suspend fun ensureEngine(methodRaw: String): TranslationEngine? {
+        var preferences = translationPreferences.snapshot()
+        var signature = configSignature(methodRaw, preferences)
         val current = engine
         if (current != null && signature == builtSignature) return current
 
-        // 需重建（簽章變）或首建。有現成引擎但別的頁在飛 → 不能關（use-after-close）→ 先用現有引擎服務本頁、延後重建。
-        if (current != null && inFlight.get() > 0) {
-            logcat(LogPriority.DEBUG) { "延後重建引擎：有 ${inFlight.get()} 頁在飛，本頁先用現有 warm 引擎" }
-            return current
+        // Configuration changed: drain old calls before replacing their native sessions.
+        if (current != null) {
+            // Existing calls decrement without this mutex. Keep registration locked while waiting,
+            // so a new request can never be sent using the previous endpoint, key or language.
+            while (inFlight.get() > 0) delay(20)
+            preferences = translationPreferences.snapshot()
+            signature = configSignature(methodRaw, preferences)
+            if (signature == builtSignature) return current
         }
         // inFlight==0（或還沒建過）→ 安全關舊重建（釋放舊 native session 才不疊加 ~100MB）。
         // ★ 診斷紀錄是給使用者分享的：簽章含 API key，只能記遮蔽版（0.16.8–0.22.0 曾整串明文寫進紀錄）
-        TraceLog.log("svc", "ensureEngine.rebuild sig=${signatureForLog(methodRaw)} hadEngine=${current != null}")
+        TraceLog.log("svc", "ensureEngine.rebuild method=${signatureMethod(methodRaw)} hadEngine=${current != null}")
         closeEngine()
 
         // 真正建構（載入 ~100MB）期間 → loading=true，給 reader 指示器顯示「引擎載入中…」。finally 確保任何出口都歸位。
@@ -203,9 +210,9 @@ class TranslationEngineService(private val context: Context) {
             TraceLog.log("svc", "ensureEngine.resolveModels")
             val bundle = TranslationEngineConfig.resolveModelSet(context) ?: return null
             // 去字法照呼叫端傳入（佇列逐章帶來的去字法），其餘參數（語言/緒數/排版…）照使用者設定。
-            val cfg = TranslationEngineConfig.buildEngineConfig(translationPreferences, methodRaw)
+            val cfg = TranslationEngineConfig.buildEngineConfig(preferences, methodRaw)
             TraceLog.log("svc", "ensureEngine.create.start")
-            val built = Yakuyomi.create(bundle.models, bundle.alphabet, apiKey(), cfg)
+            val built = Yakuyomi.create(bundle.models, bundle.alphabet, preferences.activeApiKey(), cfg)
             TraceLog.log("svc", "ensureEngine.create.done")
             engine = built
             builtSignature = signature
@@ -231,25 +238,21 @@ class TranslationEngineService(private val context: Context) {
      * 改了也重建。
      *
      * **維護鐵則：本清單必須涵蓋 [TranslationEngineConfig.buildEngineConfig] 讀到的每一個 pref**
-     * （＋ [apiKey]，它不在 buildEngineConfig 裡、是另外傳給 `Yakuyomi.create`）；
+     * （＋ [TranslationPreferences.activeApiKey]，它不在 buildEngineConfig 裡、是另外傳給 `Yakuyomi.create`）；
      * pref 那部分在 [EngineConfigMapping.signatureFields]。
      * 漏一個＝改了那個設定卻沿用 warm 引擎、舊值繼續生效（曾漏 provider/model/apiBase/temperature →
      * 使用者在設定換 model 後請求仍打舊 model、持續 HTTP 400；改 API key 反而生效，只因 key 有在簽章裡）。
      * 日後在 buildEngineConfig 加讀任何 pref，**同時**在 [EngineConfigMapping.signatureFields] 加一行
      * （EngineConfigMappingTest 會擋）。
      */
-    private fun configSignature(methodRaw: String): String =
+    private fun configSignature(methodRaw: String, preferences: TranslationPreferences): String =
         // NUL 分隔避免相鄰欄位串接後碰撞
-        (listOf(signatureMethod(methodRaw), apiKey()) + settingsFields()).joinToString("\u0000")
-
-    /**
-     * 給診斷紀錄看的簽章：欄位同 [configSignature]，但 API key 只記「有／無」——紀錄會被使用者分享出去，
-     * 金鑰絕不能落進去。
-     */
-    private fun signatureForLog(methodRaw: String): String {
-        val key = if (apiKey().isBlank()) "<no-key>" else "<key-redacted>"
-        return (listOf(signatureMethod(methodRaw), key) + settingsFields()).joinToString(" ")
-    }
+        (
+            listOf(
+                signatureMethod(methodRaw),
+                preferences.activeApiKey(),
+            ) + settingsFields(preferences)
+            ).joinToString("\u0000")
 
     /**
      * 簽章裡的去字法用映射後的引擎 method（boxfill／aot），不用原始字串：引擎只看映射後的值，auto_whole 與舊版的
@@ -263,7 +266,9 @@ class TranslationEngineService(private val context: Context) {
      * 清單本身在 [EngineConfigMapping.signatureFields]，與 buildEngineConfig 同檔，
      * 有反射測試守著「buildEngineConfig 讀到的 pref 都在簽章裡」。
      */
-    private fun settingsFields(): List<String> = EngineConfigMapping.signatureFields(translationPreferences)
+    private fun settingsFields(
+        preferences: TranslationPreferences,
+    ): List<String> = EngineConfigMapping.signatureFields(preferences)
 
     /** 釋放引擎的原生資源（3 顆 ONNX session）。僅在 [mutex] 下呼叫。 */
     private fun closeEngine() {

@@ -292,6 +292,9 @@ class ReaderActivity : BaseActivity() {
                     ReaderViewModel.Event.TranslatePageNoOriginal -> {
                         toast(stringResource(MR.strings.reader_translate_page_no_original))
                     }
+                    ReaderViewModel.Event.OriginalPreviewUnavailable -> {
+                        toast(stringResource(MR.strings.reader_original_preview_unavailable))
+                    }
                     ReaderViewModel.Event.TranslatePageTooLarge -> {
                         toast(stringResource(MR.strings.reader_translate_page_too_large))
                     }
@@ -521,10 +524,12 @@ class ReaderActivity : BaseActivity() {
                     onReRender = { viewModel.openReRenderDialog(page) }.takeIf { pageOnDisk },
                     // 「翻譯這頁」：只在已下載章提供（單頁進引擎翻、就地覆蓋）；線上章本里程碑先不給。
                     onTranslatePage = viewModel::translateThisPage.takeIf { pageOnDisk },
-                    // 「開始/中止這話翻譯」：依當前章是否在翻譯佇列（liveTranslateProgress != null）二選一顯示。
+                    onToggleOriginal = viewModel::toggleOriginalPreview.takeIf { pageOnDisk },
+                    isOriginalPreview = page.isOriginalPreview,
+                    // Stop also applies while downloading for translation; download state is not page progress.
                     onStartChapterTranslate = viewModel::startChapterTranslate,
                     onStopChapterTranslate = viewModel::stopChapterTranslate,
-                    isChapterTranslating = state.liveTranslateProgress != null,
+                    isChapterTranslating = state.liveTranslateProgress != null || state.translationDownloadPending,
                     onStartChapterNightRender = { viewModel.startChapterNightRender() }.takeIf { nightGenerate }
                         ?: viewModel::requestOnlineChapterNight.takeIf { nightOnline },
                     nightLegacy = state.nightAvailability == NightAvailability.LEGACY,
@@ -1040,6 +1045,7 @@ class ReaderActivity : BaseActivity() {
             }
             is ReaderViewModel.SaveImageResult.Error -> {
                 logcat(LogPriority.ERROR, result.error)
+                toast(MR.strings.error_saving_picture)
             }
         }
     }

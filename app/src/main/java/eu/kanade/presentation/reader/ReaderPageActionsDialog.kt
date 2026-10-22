@@ -46,11 +46,13 @@ fun ReaderPageActionsDialog(
     onReRender: (() -> Unit)? = null,
     // 翻譯當頁；只在已下載章可用（線上章先不提供），呼叫端傳 null 時不顯示此鈕。
     onTranslatePage: (() -> Unit)? = null,
+    onToggleOriginal: (() -> Unit)? = null,
+    isOriginalPreview: Boolean = false,
     // 開始翻譯這話（已下載＝排佇列／線上＝觸發下載+標記待翻）。當前章「未在翻譯」時顯示（與停止互斥）。
     onStartChapterTranslate: (() -> Unit)? = null,
     // 中止這話翻譯（取消佇列 + 中止進行中）。當前章「正在翻譯」時顯示（與開始互斥）。
     onStopChapterTranslate: (() -> Unit)? = null,
-    // 當前章是否正在翻譯佇列（QUEUE/TRANSLATING）：true → 顯示「中止」、false → 顯示「開始」（XOR）。
+    // Translation queued/running, or its online download pending: show Stop; errors retain Start.
     isChapterTranslating: Boolean = false,
     // 日常／夜讀切換與檔位已移到閱讀器的常駐懸浮鈕（ReaderNightFloatingControl），這裡只剩「產生」類動作。
     /** 「為這一話產生夜讀版」（非翻譯本的夜讀入口）；null＝不顯示（已有夜讀版／已在佇列／夜讀關／不支援）。 */
@@ -103,6 +105,20 @@ fun ReaderPageActionsDialog(
                         onSave()
                         onDismissRequest()
                     },
+                )
+            }
+            if (onToggleOriginal != null) {
+                ListItem(
+                    headlineContent = {
+                        val title = if (isOriginalPreview) {
+                            MR.strings.reader_show_translation
+                        } else {
+                            MR.strings.reader_show_original
+                        }
+                        Text(stringResource(title))
+                    },
+                    supportingContent = { Text(stringResource(MR.strings.reader_original_preview_summary)) },
+                    modifier = Modifier.clickable(onClick = onToggleOriginal),
                 )
             }
             // 第二列：翻譯控制。每顆鈕的回呼自己關對話框（VM 內 closeDialog），故這裡不再呼叫 onDismissRequest。

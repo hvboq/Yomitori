@@ -61,7 +61,7 @@ class DownloadManager(
         get() = downloader.queueState
 
     // For use by DownloadService only
-    fun downloaderStart() = downloader.start()
+    fun downloaderStart(retryErrors: Boolean = true) = downloader.start(retryErrors)
     fun downloaderStop(reason: String? = null) = downloader.stop(reason)
 
     val isDownloaderRunning
@@ -136,6 +136,21 @@ class DownloadManager(
      */
     fun downloadChapters(manga: Manga, chapters: List<Chapter>, autoStart: Boolean = true) {
         downloader.queueChapters(manga, chapters, autoStart)
+    }
+
+    /** Explicit reader action: enqueue a new chapter or retry its error without retrying others. */
+    @Synchronized
+    fun downloadChapterForReader(manga: Manga, chapter: Chapter) {
+        val existing = getQueuedDownloadOrNull(chapter.id)
+        val changed = if (existing == null) {
+            downloader.queueChapters(manga, listOf(chapter), autoStart = false)
+            getQueuedDownloadOrNull(chapter.id) != null
+        } else {
+            downloader.retryFailedChapter(chapter.id)
+        }
+        if (changed && !downloader.isRunning) {
+            DownloadJob.start(context, retryErrors = false)
+        }
     }
 
     /**

@@ -62,7 +62,7 @@ object EngineConfigMapping {
             // 思考模式（預設關）：欄位形狀 per-provider，由引擎 LlmProviders.requestParams 映射。
             thinking = prefs.thinking.get(),
         )
-        if (target != TranslationPreferences.DEFAULT_TARGET_LANG) {
+        if (target != TranslationPreferences.TRAD_CHINESE_LANG) {
             translatorCfg = translatorCfg.copy(sampleSource = "", sampleTarget = "")
         }
 

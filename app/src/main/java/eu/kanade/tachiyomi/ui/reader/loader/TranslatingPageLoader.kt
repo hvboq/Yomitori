@@ -6,8 +6,10 @@ import eu.kanade.tachiyomi.data.database.models.toDomainChapter
 import eu.kanade.tachiyomi.data.download.DownloadProvider
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationManager
+import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import kotlinx.coroutines.CoroutineScope
@@ -86,14 +88,6 @@ internal class TranslatingPageLoader(
     @Volatile
     private var chapterDir: UniFile? = null
 
-    /**
-     * `page.index → 下載檔` 對映：以**與 [DownloadPageLoader] 相同的排序**建立
-     * （`DownloadManager.buildPageList`＝圖檔 `sortedBy { name }` 後 `mapIndexed` 給 index）。
-     * 故第 `index` 個 = 名稱排序後第 index 個圖檔，與 holder 顯示的頁一一對應、查 manifest 用正確的檔名。
-     */
-    @Volatile
-    private var pageFiles: List<UniFile> = emptyList()
-
     /** 章目錄是否已嘗試解析過（避免每頁重掃；解析不到也只試一次）。 */
     @Volatile
     private var resolved = false
@@ -122,8 +116,7 @@ internal class TranslatingPageLoader(
         delegate.getPages().onEach { it.chapter = chapter }
 
     /**
-     * 解析章目錄 + `page.index → 檔` 對映（lazy、只試一次）。
-     * 與 [DownloadPageLoader] 同源：[DownloadProvider.findChapterDir] 找章目錄、圖檔副檔名過濾 + `sortedBy { name }`。
+     * Resolve the chapter directory once. Page identity comes from the delegate's URI, not its index.
      */
     private fun ensureResolved() {
         if (resolved) return
@@ -144,11 +137,13 @@ internal class TranslatingPageLoader(
                 return
             }
             chapterDir = dir
-            pageFiles = dir.listFiles()
-                ?.filter { f -> f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in IMAGE_EXT }
-                ?.sortedBy { it.name.orEmpty() }
-                .orEmpty()
         }
+    }
+
+    /** Resolve the exact page supplied by the download loader, never a separately filtered index. */
+    private fun pageFile(page: ReaderPage): UniFile? {
+        val uri = page.uri ?: return null
+        return chapterDir?.listFiles()?.firstOrNull { it.isFile && it.uri == uri }
     }
 
     /**
@@ -166,15 +161,34 @@ internal class TranslatingPageLoader(
      *
      * toDomainChapter null（無 id）時排不了——理論上有 id，保險起見只記 log、跳過排入（仍顯示原圖）。
      */
-    fun onActivated() {
-        if (enqueued) return
+    fun onActivated() = enqueueTranslation(explicitRetry = false)
+
+    /** A user retry may resume a cancelled/failed chapter without recreating its reader loader. */
+    fun restartTranslation() = enqueueTranslation(explicitRetry = true)
+
+    private fun enqueueTranslation(explicitRetry: Boolean) {
+        if (isRecycled || (enqueued && !explicitRetry)) return
         synchronized(this) {
-            if (enqueued) return
-            enqueued = true
+            if (isRecycled || (enqueued && !explicitRetry)) return
             val domainChapter = chapter.chapter.toDomainChapter()
             if (domainChapter == null) {
                 logcat(LogPriority.WARN) { "即時翻：章無 id、無法排入佇列（維持顯示原圖）" }
                 return
+            }
+            if (explicitRetry) {
+                // Repeated taps must not reorder or duplicate active work. ERROR and removed
+                // (cancelled) entries can resume; completed chapters require no new work.
+                if (translationManager.queueState.value.any {
+                        it.chapter.id == domainChapter.id && it.kind != TranslationItem.Kind.NIGHT &&
+                            it.status != TranslationItem.Status.ERROR
+                    } || translationManager.isTranslated(manga, domainChapter)
+                ) {
+                    return
+                }
+            }
+            if (!enqueued) {
+                enqueued = true
+                startQueueObserver()
             }
             // 整章排入受管理佇列（背景翻、可暫停/取消/重試、清單顯示翻譯中）。atFront＝true：正在讀的章插隊到最前。
             // 即時翻用即時去字法（預設 AI 去字），與下載/手動翻的去字法分開＝弱機可單獨改回 boxfill 求低延遲。
@@ -184,7 +198,6 @@ internal class TranslatingPageLoader(
                 atFront = true,
                 method = translationManager.liveInpaintMethod(),
             )
-            startQueueObserver()
         }
     }
 
@@ -205,7 +218,7 @@ internal class TranslatingPageLoader(
                 if (chapterId != chapter.chapter.id) return@collect
                 if (chapterDir == null) return@collect
                 val page = synchronized(tracked) {
-                    val hit = tracked.entries.firstOrNull { (_, p) -> pageFiles.getOrNull(p.index)?.name == name }
+                    val hit = tracked.entries.firstOrNull { (_, p) -> pageFile(p)?.name == name }
                     if (hit != null) tracked.remove(hit.key)
                     hit?.value
                 }
@@ -244,7 +257,7 @@ internal class TranslatingPageLoader(
     private suspend fun handleDownloadedPage(page: ReaderPage) {
         ensureResolved()
         val dir = chapterDir
-        val pageFile = pageFiles.getOrNull(page.index)
+        val pageFile = pageFile(page)
         if (dir == null || pageFile == null) {
             // 解析不到章目錄/該頁檔（CBZ 即時翻 / 外部改動）→ 原圖已在畫面、不插手（不換頁）。
             return
@@ -271,7 +284,7 @@ internal class TranslatingPageLoader(
      */
     private fun swapToFile(page: ReaderPage) {
         if (isRecycled) return
-        page.reload()
+        ((page as? InsertPage)?.parent ?: page).reload()
     }
 
     /**
@@ -279,18 +292,22 @@ internal class TranslatingPageLoader(
      *  - 已翻（manifest 命中）→ 只重 decode（[swapToFile] 呼叫 [ReaderPage.reload] 叫 holder 重畫當前檔）。
      *    重繪後刷新靠這條：[eu.kanade.tachiyomi.ui.reader.ReaderViewModel.reRenderPage] 重繪覆蓋檔後 → `retryPage` → 重 decode 顯示新圖。
      *  - 未翻 → 重新登記進 [tracked]；佇列翻到時觀察者換頁。**不**在此排入翻譯（排入只在 [onActivated]）。
+     *  - Both outcomes restore the delegate's state and reload the current readable file.
      */
     override fun retryPage(page: ReaderPage) {
         if (isRecycled) return
+        // Restore the delegate's loading state after a manual page operation. A reload counter
+        // alone cannot display a page left in Queue; preserve Error if the delegate reports it.
+        delegate.retryPage(page)
+        page.reload()
         ensureResolved()
         // 先登記再查（與 [handleDownloadedPage] 同：避免查→翻好→登記的競態漏換頁）。
         synchronized(tracked) { tracked[page.index] = page }
         val dir = chapterDir
-        val pageFile = pageFiles.getOrNull(page.index)
+        val pageFile = pageFile(page)
         if (dir != null && pageFile != null && pageTranslator.isPageTranslated(dir, pageFile.name.orEmpty())) {
-            // 已翻（含剛重繪覆蓋）→ 原子取出再 [swapToFile] 重 decode 那個檔（與 [DownloadPageLoader.retryPage] 等效）。
-            val hit = synchronized(tracked) { tracked.remove(page.index) }
-            if (hit != null) swapToFile(page)
+            // The current file was already reloaded above; completed pages need no pending observer.
+            synchronized(tracked) { tracked.remove(page.index) }
         }
     }
 
@@ -308,7 +325,7 @@ internal class TranslatingPageLoader(
         if (synchronized(selectedSwapped) { page.index in selectedSwapped }) return
         ensureResolved()
         val dir = chapterDir ?: return
-        val pageFile = pageFiles.getOrNull(page.index) ?: return
+        val pageFile = pageFile(page) ?: return
         if (pageTranslator.isPageTranslated(dir, pageFile.name.orEmpty())) {
             synchronized(tracked) { tracked.remove(page.index) }
             synchronized(selectedSwapped) { selectedSwapped.add(page.index) }
@@ -325,9 +342,5 @@ internal class TranslatingPageLoader(
         scope.cancel()
         delegate.recycle()
         super.recycle()
-    }
-
-    companion object {
-        private val IMAGE_EXT = setOf("jpg", "jpeg", "png", "webp")
     }
 }

@@ -117,8 +117,8 @@ class PagerDoublePageHolder(
     private suspend fun setImage() {
         progressIndicator?.setProgress(0)
 
-        val firstStreamFn = first.stream ?: return
-        val secondStreamFn = second?.stream
+        val firstStreamFn = first.displayStream ?: return
+        val secondStreamFn = second?.displayStream
         // 同一組頁重新解碼（切日常／夜讀、換夜讀檔位、譯圖換上）：保住目前的縮放與位置（第一次載入＝null）。
         val restore = captureState()
 

@@ -45,6 +45,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,7 +58,9 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.i18n.stringResource
@@ -271,9 +274,26 @@ fun BrowseSourceFloatingBall(
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.width(12.dp))
+                        val queryText = searchQuery.orEmpty()
+                        var editingValue by remember {
+                            mutableStateOf(TextFieldValue(queryText, TextRange(queryText.length)))
+                        }
+                        val displayedValue = if (editingValue.text == queryText) {
+                            editingValue
+                        } else {
+                            // Move to the end only for an external replacement, not for local edits.
+                            TextFieldValue(queryText, TextRange(queryText.length))
+                        }
+                        SideEffect {
+                            if (editingValue != displayedValue) editingValue = displayedValue
+                        }
                         BasicTextField(
-                            value = searchQuery ?: "",
-                            onValueChange = { onSearchQueryChange(it) },
+                            value = displayedValue,
+                            onValueChange = { value ->
+                                val textChanged = value.text != editingValue.text
+                                editingValue = value
+                                if (textChanged) onSearchQueryChange(value.text)
+                            },
                             modifier = Modifier
                                 .weight(1f)
                                 .focusRequester(focusRequester)

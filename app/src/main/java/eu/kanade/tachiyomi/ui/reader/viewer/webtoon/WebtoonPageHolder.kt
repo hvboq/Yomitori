@@ -192,7 +192,7 @@ class WebtoonPageHolder(
     private suspend fun setImage() {
         progressIndicator.setProgress(0)
 
-        val streamFn = page?.stream ?: return
+        val streamFn = page?.displayStream ?: return
 
         try {
             val (source, isAnimated) = withIOContext {

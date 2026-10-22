@@ -7,13 +7,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
@@ -33,6 +36,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SmallExtendedFloatingActionButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,6 +60,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -84,13 +89,21 @@ import eu.kanade.tachiyomi.ui.category.CategoryScreen
 import eu.kanade.tachiyomi.ui.manga.MangaScreen
 import eu.kanade.tachiyomi.ui.webview.WebViewScreen
 import eu.kanade.tachiyomi.util.system.toast
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import mihon.feature.migration.dialog.MigrateMangaDialog
 import mihon.presentation.core.util.collectAsLazyPagingItems
+import mihon.source.hitomi.HitomiSearchQuery
+import mihon.source.hitomi.HitomiSearchSuggestion
+import mihon.source.hitomi.HitomiSource
 import tachiyomi.core.common.Constants
 import tachiyomi.core.common.preference.TriState
 import tachiyomi.core.common.util.lang.launchIO
@@ -176,6 +189,55 @@ data class BrowseSourceScreen(
         // 只在使用者主動點球展開時聚焦搜尋框（借鏡書庫）——初始/自動展開不搶焦點、不彈鍵盤。
         var pendingSearchFocus by remember { mutableStateOf(false) }
         val ballFocusRequester = remember { FocusRequester() }
+        // Suggestions are source-specific and never submit a search or rewrite a title by themselves.
+        val hitomiSource = viewModel.source as? HitomiSource
+        var hitomiQueryEdited by remember { mutableStateOf(false) }
+        var hitomiRequest by remember { mutableStateOf<HitomiSearchQuery.ActiveToken?>(null) }
+        var hitomiSuggestions by remember { mutableStateOf(emptyList<HitomiSearchSuggestion>()) }
+        val hitomiAutocompleteEnabled = hitomiSource != null && hitomiQueryEdited &&
+            !isSnapshotListing && (!floatingBar || ballExpanded)
+        LaunchedEffect(sourceId, state.toolbarQuery, hitomiAutocompleteEnabled) {
+            hitomiRequest = null
+            hitomiSuggestions = emptyList()
+            if (!hitomiAutocompleteEnabled) return@LaunchedEffect
+            val token = HitomiSearchQuery.activeToken(state.toolbarQuery) ?: return@LaunchedEffect
+            delay(250)
+            try {
+                val suggestions = withContext(Dispatchers.IO) {
+                    checkNotNull(hitomiSource).getSearchSuggestions(token.text)
+                }
+                currentCoroutineContext().ensureActive()
+                hitomiRequest = token
+                hitomiSuggestions = suggestions.distinctBy { it.value }.take(20)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Suggestion availability must not prevent ordinary searches or expose network errors.
+            }
+        }
+        val visibleHitomiSuggestions = if (hitomiAutocompleteEnabled && hitomiRequest?.query == state.toolbarQuery) {
+            hitomiSuggestions
+        } else {
+            emptyList()
+        }
+        val changeSearchQuery: (String?) -> Unit = { query ->
+            hitomiQueryEdited = query != null
+            viewModel.setToolbarQuery(query)
+        }
+        val submitSearch: (String) -> Unit = { query ->
+            hitomiQueryEdited = false
+            viewModel.search(query)
+        }
+        val chooseHitomiSuggestion: (HitomiSearchSuggestion) -> Unit = choose@{ suggestion ->
+            val token = hitomiRequest ?: return@choose
+            val query = viewModel.state.value.toolbarQuery ?: return@choose
+            val replacement = HitomiSearchQuery.replace(query, token, suggestion.value)
+            if (replacement != query) {
+                hitomiQueryEdited = false
+                viewModel.setToolbarQuery(replacement)
+                if (floatingBar) runCatching { ballFocusRequester.requestFocus() }
+            }
+        }
         val listingKind = when (state.listing) {
             is Listing.Latest -> BrowseListingKind.LATEST
             is Listing.Snapshot -> BrowseListingKind.SNAPSHOT
@@ -240,11 +302,15 @@ data class BrowseSourceScreen(
                 ballExpanded = false
             }
         }
+        val hitomiSuggestionsVisible = rememberUpdatedState(visibleHitomiSuggestions.isNotEmpty())
         val ballCollapseOnScroll = remember {
             object : NestedScrollConnection {
                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                     // 背景任務跑時不因捲動收合（維持展開顯示進度）。
-                    if (available.y != 0f && !bgJobRunningState.value) ballExpanded = false
+                    // Scrolling autocomplete candidates must not close the search field and its list.
+                    if (available.y != 0f && !bgJobRunningState.value && !hitomiSuggestionsVisible.value) {
+                        ballExpanded = false
+                    }
                     return Offset.Zero
                 }
             }
@@ -377,7 +443,7 @@ data class BrowseSourceScreen(
                     ) {
                         BrowseSourceToolbar(
                             searchQuery = state.toolbarQuery,
-                            onSearchQueryChange = viewModel::setToolbarQuery,
+                            onSearchQueryChange = changeSearchQuery,
                             source = viewModel.source,
                             displayMode = viewModel.displayMode,
                             onDisplayModeChange = { viewModel.displayMode = it },
@@ -385,7 +451,7 @@ data class BrowseSourceScreen(
                             onWebViewClick = onWebViewClick,
                             onHelpClick = onHelpClick,
                             onSettingsClick = { navigator.push(SourcePreferencesScreen(sourceId)) },
-                            onSearch = viewModel::search,
+                            onSearch = submitSearch,
                             // 錨點的 start/stop/mark 移到右下 FAB（比照擷取詳情：進度可見、就地可停；
                             // 最新＋有錨點→載入到錨點，其餘→直接存當前頁快照）。設錨點改由長按書本「設為錨點」。
                             onStopAutoLoad = null,
@@ -399,6 +465,8 @@ data class BrowseSourceScreen(
                             // 滑到錨點鈕移除：修剪後錨點一定是快照最後一筆，往下滑到底＝錨點，不需專用鈕。
                             onScrollToAnchor = null,
                         )
+
+                        HitomiSuggestionList(visibleHitomiSuggestions, chooseHitomiSuggestion)
 
                         Row(
                             modifier = Modifier
@@ -637,53 +705,58 @@ data class BrowseSourceScreen(
                             add(if (i == 0) item.copy(dividerBefore = true) else item)
                         }
                     }
-                    BrowseSourceFloatingBall(
-                        expanded = ballExpanded,
-                        onBallClick = {
-                            ballExpanded = true
-                            pendingSearchFocus = true
-                        },
-                        focusRequester = ballFocusRequester,
-                        searchQuery = state.toolbarQuery,
-                        onSearchQueryChange = viewModel::setToolbarQuery,
-                        onSubmitSearch = viewModel::search,
-                        onClearSearch = {
-                            // 清除＝清搜尋框並離開搜尋結果，回到搜尋前所在的列表清單（Search 當隱藏頁）。
-                            viewModel.setToolbarQuery(null)
-                            if (state.listing is Listing.Search) {
-                                viewModel.setListing(
-                                    when (preSearchListing) {
-                                        BrowseListingKind.LATEST -> Listing.Latest
-                                        else -> Listing.Popular
-                                    },
-                                )
-                            }
-                        },
-                        hasActiveFilters = favoriteFilter != TriState.DISABLED ||
-                            readFilter != TriState.DISABLED ||
-                            fetchedFilter != TriState.DISABLED ||
-                            state.listing is Listing.Search,
-                        onClickFilter = { showGlobalFilter = true },
-                        isSnapshot = isSnapshotListing,
-                        onFetchDetails = fetchDetailsAction,
-                        fetchRunning = fetchState.running,
-                        snapshotLeftText = snapshotLeftText,
-                        anchorInline = onAnchor,
-                        anchorInlineIcon = anchorIcon,
-                        anchorInlineDesc = anchorLabel,
-                        bgJobRunning = bgJobRunning,
-                        bgJobProgress = bgJobProgress,
-                        onStopBgJob = onStopBgJob,
-                        tapMenuItems = tapMenuItems,
-                        longPressMenuItems = longPressMenuItems,
-                        menuExpanded = ballMenuOpen,
-                        onMenuExpandedChange = { ballMenuOpen = it },
-                        onSearchFocusChanged = { ballSearchFocused = it },
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                             .padding(horizontal = 16.dp, vertical = 12.dp),
-                    )
+                    ) {
+                        HitomiSuggestionList(visibleHitomiSuggestions, chooseHitomiSuggestion)
+                        BrowseSourceFloatingBall(
+                            expanded = ballExpanded,
+                            onBallClick = {
+                                ballExpanded = true
+                                pendingSearchFocus = true
+                            },
+                            focusRequester = ballFocusRequester,
+                            searchQuery = state.toolbarQuery,
+                            onSearchQueryChange = changeSearchQuery,
+                            onSubmitSearch = submitSearch,
+                            onClearSearch = {
+                                // 清除＝清搜尋框並離開搜尋結果，回到搜尋前所在的列表清單（Search 當隱藏頁）。
+                                changeSearchQuery(null)
+                                if (state.listing is Listing.Search) {
+                                    viewModel.setListing(
+                                        when (preSearchListing) {
+                                            BrowseListingKind.LATEST -> Listing.Latest
+                                            else -> Listing.Popular
+                                        },
+                                    )
+                                }
+                            },
+                            hasActiveFilters = favoriteFilter != TriState.DISABLED ||
+                                readFilter != TriState.DISABLED ||
+                                fetchedFilter != TriState.DISABLED ||
+                                state.listing is Listing.Search,
+                            onClickFilter = { showGlobalFilter = true },
+                            isSnapshot = isSnapshotListing,
+                            onFetchDetails = fetchDetailsAction,
+                            fetchRunning = fetchState.running,
+                            snapshotLeftText = snapshotLeftText,
+                            anchorInline = onAnchor,
+                            anchorInlineIcon = anchorIcon,
+                            anchorInlineDesc = anchorLabel,
+                            bgJobRunning = bgJobRunning,
+                            bgJobProgress = bgJobProgress,
+                            onStopBgJob = onStopBgJob,
+                            tapMenuItems = tapMenuItems,
+                            longPressMenuItems = longPressMenuItems,
+                            menuExpanded = ballMenuOpen,
+                            onMenuExpandedChange = { ballMenuOpen = it },
+                            onSearchFocusChanged = { ballSearchFocused = it },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             },
             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
@@ -1013,5 +1086,39 @@ data class BrowseSourceScreen(
     sealed class SearchType(val txt: String) {
         class Text(txt: String) : SearchType(txt)
         class Genre(txt: String) : SearchType(txt)
+    }
+}
+
+@Composable
+private fun HitomiSuggestionList(
+    suggestions: List<HitomiSearchSuggestion>,
+    onSelect: (HitomiSearchSuggestion) -> Unit,
+) {
+    if (suggestions.isEmpty()) return
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        tonalElevation = 3.dp,
+    ) {
+        LazyColumn(modifier = Modifier.heightIn(max = 224.dp)) {
+            items(suggestions, key = { it.value }) { suggestion ->
+                TextButton(onClick = { onSelect(suggestion) }, modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = suggestion.label,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        suggestion.count?.let { count ->
+                            Text(text = count.toString(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+        }
     }
 }

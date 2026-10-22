@@ -30,7 +30,7 @@ class EngineConfigMappingTest {
         val p = prefs()
         EngineConfigMapping.inpainterConfig(p, "auto_whole") shouldBe InpainterConfig(method = "aot")
         EngineConfigMapping.inpainterConfig(p, "boxfill") shouldBe InpainterConfig(method = "boxfill")
-        EngineConfigMapping.renderConfig(p) shouldBe RenderConfig()
+        EngineConfigMapping.renderConfig(p) shouldBe RenderConfig(orientation = TextOrientation.HORIZONTAL)
     }
 
     @Test

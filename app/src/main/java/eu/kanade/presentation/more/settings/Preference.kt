@@ -148,6 +148,8 @@ sealed class Preference {
         data class EditTextPreference(
             val preference: PreferenceData<String>,
             override val title: String,
+            val allowEmpty: Boolean = false,
+            val isSecret: Boolean = false,
             override val subtitle: String? = "%s",
             override val enabled: Boolean = true,
             override val titleBadge: String? = null,

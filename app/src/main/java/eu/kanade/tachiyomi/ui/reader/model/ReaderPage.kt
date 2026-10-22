@@ -15,6 +15,24 @@ open class ReaderPage(
 
     open lateinit var chapter: ReaderChapter
 
+    @Volatile
+    private var originalPreview: (() -> InputStream)? = null
+
+    /** Session-only comparison. The loader's saved page and translation manifest are untouched. */
+    open val displayStream: (() -> InputStream)? get() = originalPreview ?: stream
+    open val isOriginalPreview: Boolean get() = originalPreview != null
+
+    open fun showOriginalPreview(open: () -> InputStream) {
+        originalPreview = open
+        reload()
+    }
+
+    open fun clearOriginalPreview() {
+        if (originalPreview == null) return
+        originalPreview = null
+        reload()
+    }
+
     /**
      * 即時翻譯換頁用的「重畫」訊號（單調遞增計數）。頁圖檔在原處被覆蓋成譯圖後，呼叫 [reload] 讓正在顯示本頁的
      * holder 重新 decode 當前檔。用獨立計數而非靠 status `Ready→Queue→Ready`：計數每次都是新值，**永遠不會**被

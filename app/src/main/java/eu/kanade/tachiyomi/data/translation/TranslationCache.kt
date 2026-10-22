@@ -6,19 +6,14 @@ import eu.kanade.tachiyomi.data.download.DownloadProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-import mihon.core.archive.archiveReader
+import logcat.LogPriority
+import logcat.logcat
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.domain.translation.service.TranslationPreferences
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
-import java.io.File
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 每本漫畫「已翻章數」的輕量快取（給書庫封面徽章用，對照 [eu.kanade.tachiyomi.data.download.DownloadCache]）。
@@ -36,36 +31,20 @@ class TranslationCache(
     // 「整章翻完」判準委派 PageTranslator.isChapterTranslated（單一真理來源）；lazy＝多數本徽章=0、根本不建。
     private val pageTranslator by lazy { PageTranslator(context) }
 
-    private val counts = ConcurrentHashMap<Long, Int>()
-
-    // 正在背景掃描的 mangaId（避免重複排程）。
-    private val scanning = ConcurrentHashMap.newKeySet<Long>()
-
     // 掃描在背景 IO 跑，絕不阻塞書庫 combine 的首次發射。
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    private val _changes = MutableStateFlow(0)
+    private val cache = TranslationCountCache(scope, ::scan) { error ->
+        logcat(LogPriority.WARN) { "Translation count scan failed: ${error.javaClass.simpleName}" }
+    }
 
     /** 版本計數：每次失效 +1（StateFlow 初始就有值，書庫 combine 才不會卡等）。 */
-    val changes: StateFlow<Int> = _changes.asStateFlow()
+    val changes: StateFlow<Int> = cache.changes
 
     /**
      * 某本已翻章數。**非阻塞**：已算過走快取；沒算過立刻回 0、同時在背景掃，掃完若 >0 才 bump [changes]
      * 讓書庫重組套上真值。避免在書庫 flow 上同步掃資料夾/開壓縮檔（本地多話 zip 會讓每次開 app 卡轉圈）。
      */
-    fun getTranslatedCount(manga: Manga): Int {
-        counts[manga.id]?.let { return it }
-        if (scanning.add(manga.id)) {
-            scope.launch {
-                val count = scan(manga)
-                counts[manga.id] = count
-                scanning.remove(manga.id)
-                // 多數本＝0（含本地書），靜默快取不打擾；只有真的有已翻章才觸發書庫重算徽章。
-                if (count > 0) _changes.update { it + 1 }
-            }
-        }
-        return 0
-    }
+    fun getTranslatedCount(manga: Manga): Int = cache.get(manga.id, manga)
 
     private suspend fun scan(manga: Manga): Int {
         // 排除的來源＝不會被翻、徽章必為 0 → 連掃都不用掃（便宜過濾，保留冷啟動效能）。
@@ -88,29 +67,12 @@ class TranslationCache(
     private fun hasMarker(file: UniFile): Boolean = if (file.isDirectory) {
         pageTranslator.isChapterTranslated(file) // 鬆散資料夾：manifest 需涵蓋所有現有圖頁
     } else {
-        runCatching {
-            // CBZ：archive 內有 marker entry（整章判準需解壓、CBZ 已預設關/罕見，維持 marker 存在判準）
-            file.archiveReader(context).use { reader ->
-                reader.useEntries { seq -> seq.any { File(it.name).name == MARKER } }
-            }
-        }.getOrDefault(false)
+        pageTranslator.isArchiveTranslated(file)
     }
 
     /** 清掉某本的快取（翻完一章 / 刪下載後叫）。下次查會重新背景掃。 */
-    fun invalidate(mangaId: Long) {
-        counts.remove(mangaId)
-        scanning.remove(mangaId)
-        _changes.update { it + 1 }
-    }
+    fun invalidate(mangaId: Long) = cache.invalidate(mangaId)
 
     /** 清掉全部快取。 */
-    fun invalidateAll() {
-        counts.clear()
-        scanning.clear()
-        _changes.update { it + 1 }
-    }
-
-    companion object {
-        private const val MARKER = ".yakuyomi_translated"
-    }
+    fun invalidateAll() = cache.invalidateAll()
 }

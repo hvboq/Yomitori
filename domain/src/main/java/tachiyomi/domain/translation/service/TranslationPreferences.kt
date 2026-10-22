@@ -1,6 +1,7 @@
 package tachiyomi.domain.translation.service
 
 import tachiyomi.core.common.preference.EncryptedStringPreference
+import tachiyomi.core.common.preference.InMemoryPreferenceStore
 import tachiyomi.core.common.preference.Preference
 import tachiyomi.core.common.preference.PreferenceStore
 import tachiyomi.core.common.preference.StringCrypto
@@ -69,7 +70,7 @@ class TranslationPreferences(
      * 目前選用的 LLM 供應商 id（對應引擎 `LlmProviders` 預設表：deepseek/openai/gemini/groq/qwen/openrouter/sakura/custom）。
      * 切換 provider 不改聊天協定（全 OpenAI 相容），只換 apiBase/model/key（每家一格，見 [apiKeyFor]）。
      */
-    val provider = preferenceStore.getString("translation_provider", "deepseek")
+    val provider = preferenceStore.getString("translation_provider", "custom")
 
     /** 選用的 model id（空＝用該 provider 的預設模型）。可手填或從「抓取模型」清單選（引擎 `LlmModels.list`）。 */
     val model = preferenceStore.getString("translation_model", "")
@@ -100,6 +101,21 @@ class TranslationPreferences(
     /** 目前 provider 的金鑰（明文；引擎建構用）。 */
     fun activeApiKey(): String = apiKeyFor(provider.get()).get()
 
+    /** Capture endpoint, provider and encrypted credentials from one SharedPreferences snapshot. */
+    fun snapshot(): TranslationPreferences {
+        // Preserve the one-time legacy plaintext migration in the persistent store.
+        apiKey.isSet()
+        val captured = preferenceStore.getAll().mapNotNull { (key, value) ->
+            if (value == null) return@mapNotNull null
+            val copy = if (value is Set<*>) value.toSet() else value
+            InMemoryPreferenceStore.InMemoryPreference(key, copy, copy)
+        }
+        return TranslationPreferences(InMemoryPreferenceStore(captured.asSequence()), cipher)
+    }
+
+    /** Local OpenAI-compatible servers can intentionally run without authentication. */
+    fun hasCredentials(): Boolean = activeApiKey().isNotBlank() || provider.get() in setOf("custom", "sakura")
+
     /** 是否已看過翻譯隱私揭露（一次性同意對話框只跳一次）。 */
     val privacyAcknowledged = preferenceStore.getBoolean("translation_privacy_ack", false)
 
@@ -127,7 +143,7 @@ class TranslationPreferences(
     val liveInpaintMethod = preferenceStore.getString("translation_live_inpaint_method", DEFAULT_LIVE_INPAINT_METHOD)
 
     /** 保留重繪素材：翻完每頁另存遮罩 + 文字區 + 原圖，日後可換去字方法低成本重繪（免重跑 OCR/翻譯）；約多一倍儲存。 */
-    val keepMaterials = preferenceStore.getBoolean("pref_translation_keep_materials", false)
+    val keepMaterials = preferenceStore.getBoolean("pref_translation_keep_materials", true)
 
     /**
      * 夜讀**表層總開關**（預設關；放「其他」頁翻譯總開關旁、不在設定頁裡）。
@@ -276,13 +292,12 @@ class TranslationPreferences(
     val thinking = preferenceStore.getBoolean("translation_thinking", false)
 
     companion object {
-        // ⚠️ 與引擎 TranslatorConfig.toLangName / fromLangName 預設「逐字一致」（引擎＝真理來源）。
-        //   鏡像而非共用：本類在 :domain，:domain 不依賴引擎（只 :app 依賴）→ 不能 import 引擎常數。
-        //   改一邊請同步改 engine/Config.kt，否則 few-shot 保留/清除判斷會 drift。
-        /** 預設目標＝台灣繁中。非此值時 PageTranslator 不放引擎內建的日→繁中 few-shot（避免範例語言衝突）。 */
-        const val DEFAULT_TARGET_LANG = "Traditional Chinese (Taiwan, 台灣慣用的繁體中文用語)"
+        // Yomitori defaults differ from the engine; Chinese few-shot selection uses TRAD_CHINESE_LANG.
+        /** Default translation target for this app. */
+        const val DEFAULT_TARGET_LANG = "Korean"
+        const val TRAD_CHINESE_LANG = "Traditional Chinese (Taiwan, 台灣慣用的繁體中文用語)"
         const val DEFAULT_SOURCE_LANG = "Japanese"
-        const val DEFAULT_ORIENTATION = "auto"
+        const val DEFAULT_ORIENTATION = "horizontal"
         const val DEFAULT_INPAINT_METHOD = "auto_whole" // 下載/手動翻＝AI 去字（引擎把非 boxfill 一律當 aot·整頁 768）
 
         // 即時翻也用 AI 去字：AOT-GAN 換掉 LaMa 後單頁去字快 5–9×，低延遲已不必用畫質換
