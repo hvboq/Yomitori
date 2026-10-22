@@ -3,7 +3,9 @@ package mihon.translation
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Shader
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
@@ -187,6 +189,25 @@ class TranslationReliabilityTest {
         val page = Bitmap.createBitmap(1200, 1200, Bitmap.Config.ARGB_8888).apply {
             Canvas(this).apply {
                 drawColor(Color.WHITE)
+                // A neutral gradient remains easy to OCR but is deliberately not a verified flat
+                // background. The released-AOT test below must actually reach native inference.
+                drawRect(
+                    0f,
+                    0f,
+                    1200f,
+                    1200f,
+                    Paint().apply {
+                        shader = LinearGradient(
+                            0f,
+                            0f,
+                            1200f,
+                            0f,
+                            Color.WHITE,
+                            Color.rgb(215, 215, 215),
+                            Shader.TileMode.CLAMP,
+                        )
+                    },
+                )
                 val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     color = Color.BLACK
                     textSize = 72f
@@ -229,6 +250,7 @@ class TranslationReliabilityTest {
                 assertTrue(mixed.toString(), mixed is PageResult.Translated)
                 mixed as PageResult.Translated
                 try {
+                    assertFalse(requireNotNull(mixed.analysis?.progress).hasPending)
                     assertEquals(1, mixed.analysis!!.regions.count { !it.preserveOriginal })
                     assertTrue(mixed.analysis!!.regions.any { it.preserveOriginal })
                     val kept = mixed.analysis!!.regions.single { !it.preserveOriginal }

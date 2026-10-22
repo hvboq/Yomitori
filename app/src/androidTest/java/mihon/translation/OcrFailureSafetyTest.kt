@@ -140,30 +140,30 @@ class OcrFailureSafetyTest {
         assertEquals(2, regions.size)
         // Exercise the exact candidate selector used by Pipeline without introducing fake native
         // outputs or depending on a model confidence threshold to produce a particular blank line.
-        val select = Class.forName("li.joye.yakuyomi.engine.OcrSafetyKt")
-            .getDeclaredMethod("completeOcrRegions", List::class.java).apply { isAccessible = true }
+        val select = Class.forName("li.joye.yakuyomi.engine.PageProgressKt")
+            .getDeclaredMethod("selectOcrRegions", List::class.java, Set::class.java).apply { isAccessible = true }
+        fun selection(input: List<TextRegion>): Any = select.invoke(null, input, emptySet<TextLine>())
+        fun selected(result: Any, getter: String): Any = result.javaClass.getDeclaredMethod(getter).apply {
+            isAccessible = true
+        }.invoke(result)
 
         @Suppress("UNCHECKED_CAST")
-        val candidates = select.invoke(null, regions) as List<TextRegion>
+        val candidates = selected(selection(regions), "getReady") as List<TextRegion>
         assertEquals(listOf("別の台詞"), candidates.map { it.sourceText })
         candidates.single().translatedText = "안녕"
         val protected = regions.single { it.preserveOriginal }
         assertEquals(2, protected.lines.size)
-        // Without the complete independent balloon, this is a retryable OCR failure, not a
-        // successful empty page. Pipeline calls this selector while its error stage is "ocr".
-        try {
-            select.invoke(null, listOf(protected))
-            fail("A partially recognized page must not be classified as OCR empty")
-        } catch (expected: java.lang.reflect.InvocationTargetException) {
-            assertTrue(expected.cause is IllegalStateException)
-            assertTrue(expected.cause?.message.orEmpty().startsWith("incomplete OCR:"))
-        }
+        // Pending is explicit even with no independent complete region; it cannot become done.
+        val partialSelection = selection(listOf(protected))
+        assertEquals(emptyList<TextRegion>(), selected(partialSelection, "getReady"))
+        assertEquals(setOf(protected), selected(partialSelection, "getPending"))
+        val blankRegions = Grouping.group(listOf(line(40f, 40f, 240f, 80f, "")))
+        val blankSelection = selection(blankRegions)
+
         @Suppress("UNCHECKED_CAST")
-        val blankCandidates = select.invoke(
-            null,
-            Grouping.group(listOf(line(40f, 40f, 240f, 80f, ""))),
-        ) as List<TextRegion>
-        assertTrue("All-blank OCR keeps its existing skip policy", blankCandidates.isEmpty())
+        val blankCandidates = selected(blankSelection, "getReady") as List<TextRegion>
+        assertTrue(blankCandidates.isEmpty())
+        assertEquals("All-blank OCR must remain pending", blankRegions.toSet(), selected(blankSelection, "getPending"))
         val page = Bitmap.createBitmap(600, 600, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.WHITE)
             Canvas(this).apply {

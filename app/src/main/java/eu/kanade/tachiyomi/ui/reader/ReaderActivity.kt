@@ -311,6 +311,9 @@ class ReaderActivity : BaseActivity() {
                         }
                         toast(stringResource(res))
                     }
+                    ReaderViewModel.Event.TranslatePagePartial -> {
+                        toast(stringResource(MR.strings.reader_translate_page_partial))
+                    }
                     ReaderViewModel.Event.ChapterTranslateStarted -> {
                         toast(stringResource(MR.strings.reader_translate_chapter_started))
                     }

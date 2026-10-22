@@ -106,11 +106,19 @@ internal object SafeArchiveRewrite {
         }
     }
 
-    /** Include original bytes/materials and completion checkpoints; verify every ZIP member after closing it. */
+    /**
+     * Repack the accepted root files and flat `.yakuyomi/` materials without filtering by extension.
+     * PartialPageStore's output/mask/record/commit/WIP files are opaque recovery data, not reader
+     * images; discarding them would lose both pending progress and rollback authority. Preserve
+     * existing archive members under [validateEntries]' policy and verify each ZIP member's bytes.
+     * This method only reads the caller's isolated staging directory, never other cache artifacts.
+     */
     fun packAndVerify(directory: File, zip: File, shouldStop: () -> Boolean) {
         val files = directory.walkTopDown().filter(File::isFile).toList()
         require(files.sumOf(File::length) <= MAX_BYTES) { "Rewritten archive exceeds safety limit" }
-        val expected = files.associate { it.relativeTo(directory).invariantSeparatorsPath to digest(it.inputStream()) }
+        val expected = files.associate {
+            it.relativeTo(directory).invariantSeparatorsPath to digest(it.inputStream(), shouldStop)
+        }
         validateEntries(expected.keys.map { it to true })
         ZipOutputStream(zip.outputStream().buffered()).use { output ->
             files.forEach { file ->
@@ -125,7 +133,9 @@ internal object SafeArchiveRewrite {
                 "Archive verification entry mismatch"
             }
             actual.forEach { entry ->
-                require(digest(archive.getInputStream(entry)) == expected[entry.name]) { "Archive verification failed" }
+                require(digest(archive.getInputStream(entry), shouldStop) == expected[entry.name]) {
+                    "Archive verification failed"
+                }
             }
         }
     }
@@ -138,15 +148,16 @@ internal object SafeArchiveRewrite {
         backup: Storage,
         shouldStop: () -> Boolean,
     ) {
-        val originalHash = digest(original.inputStream())
-        val replacementHash = digest(replacement.inputStream())
-        require(digest(target.read()) == originalHash) { "Archive changed during processing" }
+        val originalHash = digest(original.inputStream(), shouldStop)
+        val replacementHash = digest(replacement.inputStream(), shouldStop)
+        require(digest(target.read(), shouldStop) == originalHash) { "Archive changed during processing" }
         original.inputStream().use { input -> backup.write().use { copy(input, it, shouldStop) } }
-        require(digest(backup.read()) == originalHash) { "Original archive backup verification failed" }
-        require(digest(target.read()) == originalHash) { "Archive changed during backup" }
+        require(digest(backup.read(), shouldStop) == originalHash) { "Original archive backup verification failed" }
+        require(digest(target.read(), shouldStop) == originalHash) { "Archive changed during backup" }
         if (shouldStop()) throw IOException("Archive operation stopped before replacement")
         try {
             replacement.inputStream().use { input -> target.write().use { copy(input, it, shouldStop) } }
+            // After writing, finish integrity verification or rollback even if pause arrives now.
             require(digest(target.read()) == replacementHash) { "Replacement archive verification failed" }
         } catch (failure: Throwable) {
             // Restoration ignores pause/cancel: finishing the rollback prevents a truncated chapter.
@@ -160,10 +171,11 @@ internal object SafeArchiveRewrite {
         }
     }
 
-    private fun digest(input: InputStream): String = input.use {
+    private fun digest(input: InputStream, shouldStop: () -> Boolean = { false }): String = input.use {
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(64 * 1024)
         while (true) {
+            if (shouldStop()) throw IOException("Archive operation stopped")
             val count = it.read(buffer)
             if (count < 0) break
             digest.update(buffer, 0, count)

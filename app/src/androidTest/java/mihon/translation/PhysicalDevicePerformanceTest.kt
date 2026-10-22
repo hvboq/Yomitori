@@ -163,6 +163,14 @@ class PhysicalDevicePerformanceTest {
                     row.put("engineCallMs", elapsed(inferenceStart))
                     val translated = when (val outcome = result) {
                         is PageResult.Translated -> outcome
+                        is PageResult.Partial -> {
+                            row.put("stats", stats(outcome.stats))
+                                .put(
+                                    "pendingRegionIds",
+                                    JSONArray(outcome.analysis.progress?.pendingRegionIds.orEmpty()),
+                                )
+                            error("Partial OCR is not a completed performance page")
+                        }
                         is PageResult.Skipped -> {
                             row.put("stats", stats(outcome.stats))
                             error("Skipped: ${outcome.reason}")
@@ -223,9 +231,14 @@ class PhysicalDevicePerformanceTest {
                         row.put("pageBytesUnchangedAfterFailure", digest(pageFile) == originalHash)
                     }
                 } finally {
-                    (result as? PageResult.Translated)?.let { translated ->
-                        if (translated.page !== original) translated.page.recycle()
-                        translated.analysis?.mask?.let { if (it !== original && it !== translated.page) it.recycle() }
+                    val output = when (val outcome = result) {
+                        is PageResult.Translated -> outcome.page to outcome.analysis?.mask
+                        is PageResult.Partial -> outcome.page to outcome.analysis.mask
+                        else -> null
+                    }
+                    output?.let { (page, mask) ->
+                        if (page !== original) page.recycle()
+                        mask?.let { if (it !== original && it !== page) it.recycle() }
                     }
                     original?.recycle()
                     row.put("pageWallMs", elapsed(pageStart)).put("memoryAfterRelease", memory())

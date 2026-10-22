@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import li.joye.yakuyomi.engine.PageAnalysis
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.Yakuyomi
@@ -105,8 +106,8 @@ class TranslationEngineService(private val context: Context) {
     }
 
     /**
-     * 用 warm 引擎翻譯單頁，回**原始 [PageResult]**（Translated/Skipped/Failed 不收斂成 null——
-     * 呼叫端 [PageTranslator.translateChapter] 要靠這三態做 §11：成功覆蓋+記 manifest／略過記 manifest／失敗留原圖可重試）。
+     * 用 warm 引擎翻譯單頁，回原始 [PageResult]，包括不能記完成 manifest 的 Partial。
+     * 呼叫端保存原本、部分進度與成功譯文，再決定完成、略過或重試。
      *
      * 不 recycle 輸入 [src]（所有權屬呼叫端）；成功時 [PageResult.Translated.page] 是引擎產出的新 bitmap。
      *
@@ -119,13 +120,29 @@ class TranslationEngineService(private val context: Context) {
      * @param methodRaw 去字法原始字串（boxfill / auto_whole / auto_tile）；與 warm 引擎當前去字法不同 → 重建引擎。
      *   同一章逐頁去字法相同 → 首頁後 [ensureEngine] 是 no-op、不重建（重建只在章邊界、此時 [inFlight]=0）。
      */
-    suspend fun translatePage(src: Bitmap, methodRaw: String): PageResult = withEngineWork {
+    suspend fun translatePage(src: Bitmap, methodRaw: String): PageResult =
+        executePage(src, methodRaw, "translatePage") { it.translatePage(src) }
+
+    /**
+     * Resume pending OCR against the preserved original. The original and borrowed analysis mask
+     * remain caller-owned. This uses the same registration, cold-first inference, settings and
+     * idle-release protection as a new page; it never creates a separate unmanaged engine.
+     */
+    suspend fun resumePage(src: Bitmap, analysis: PageAnalysis, methodRaw: String): PageResult =
+        executePage(src, methodRaw, "resumePage") { it.resumePage(src, analysis) }
+
+    private suspend fun executePage(
+        src: Bitmap,
+        methodRaw: String,
+        operation: String,
+        run: suspend (TranslationEngine) -> PageResult,
+    ): PageResult = withEngineWork {
         // 在鎖下：確保引擎已建、註冊在飛頁，並判定「這是不是這個 build 的第一次推論」（[warmedUp]，鎖下讀無 TOCTOU）。
         // 冷引擎的第一頁 → **持鎖單緒**跑完（讓 NCNN 各 session 首次 lazy 初始化在單緒完成），之後才放行併發。
         // 修「開 app 後第一本翻譯（下載/即時皆是），多頁同時打進剛載好、還沒推論過的原生 session → SIGSEGV 閃退」。
         TraceLog.log(
             "svc",
-            "translatePage.enter ${src.width}x${src.height} method=$methodRaw warm=$warmedUp if=${inFlight.get()}",
+            "$operation.enter ${src.width}x${src.height} method=$methodRaw warm=$warmedUp if=${inFlight.get()}",
         )
         var engineForConcurrent: TranslationEngine? = null
         val handled: PageResult? = mutex.withLock {
@@ -136,7 +153,7 @@ class TranslationEngineService(private val context: Context) {
                 // 冷引擎首次推論：整段持鎖跑（其他頁在 mutex.withLock 上等），暖完設 warmedUp=true 才放行併發。
                 // 代價＝只有冷啟動後第一本的第一頁不被跨頁重疊（含一次網路往返）；換得不再撞冷 session。
                 try {
-                    e.translatePage(src).also { warmedUp = true }
+                    run(e).also { warmedUp = true }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (ex: Throwable) {
@@ -153,9 +170,9 @@ class TranslationEngineService(private val context: Context) {
         if (handled != null) return@withEngineWork handled
         // 已暖 → 放鎖、多頁並發進引擎（跨頁流水線）。
         val engine = engineForConcurrent!!
-        TraceLog.log("svc", "translatePage.concurrent.call inFlight=${inFlight.get()}")
+        TraceLog.log("svc", "$operation.concurrent.call inFlight=${inFlight.get()}")
         try {
-            engine.translatePage(src)
+            run(engine)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Throwable) {
@@ -163,7 +180,7 @@ class TranslationEngineService(private val context: Context) {
             PageResult.Failed(e.message ?: context.stringResource(MR.strings.translate_exception))
         } finally {
             inFlight.decrementAndGet()
-            TraceLog.log("svc", "translatePage.concurrent.done inFlight=${inFlight.get()}")
+            TraceLog.log("svc", "$operation.concurrent.done inFlight=${inFlight.get()}")
         }
     }
 

@@ -966,4 +966,5 @@
     <string name="reader_show_translation">번역 보기</string>
     <string name="reader_original_preview_summary">저장된 번역을 유지하며 원문과 비교합니다.</string>
     <string name="reader_original_preview_unavailable">이 페이지에 읽을 수 있는 원본이 저장되어 있지 않습니다.</string>
+    <string name="reader_translate_page_partial">일부 글자를 인식하지 못했습니다. 성공한 번역은 저장했으며 다시 시도해 이 페이지를 마칠 수 있습니다.</string>
 </resources>

@@ -7,7 +7,11 @@ import android.net.Uri
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.hippo.unifile.UniFile
+import eu.kanade.tachiyomi.data.translation.OcrProgressCodec
+import eu.kanade.tachiyomi.data.translation.OriginalMaterial
 import eu.kanade.tachiyomi.data.translation.PageTranslator
+import eu.kanade.tachiyomi.data.translation.PartialPageStore
+import eu.kanade.tachiyomi.data.translation.TranslationManager
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.loader.DownloadPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.PageLoader
@@ -20,11 +24,17 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import li.joye.yakuyomi.engine.OcrLineProgress
+import li.joye.yakuyomi.engine.PageProgress
+import li.joye.yakuyomi.engine.Pt
+import li.joye.yakuyomi.engine.RegionProgress
+import li.joye.yakuyomi.engine.RegionState
 import mihon.source.hitomi.HitomiSource
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -37,6 +47,7 @@ import tachiyomi.domain.chapter.model.Chapter
 import tachiyomi.domain.manga.model.Manga
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 
@@ -94,6 +105,128 @@ class ReaderPageOperationTest {
             assertTrue(page.isOriginalPreview)
             assertArrayEquals(savedResult, File(directory, "001.png").readBytes())
             assertFalse(PageTranslator(context).isPageTranslated(UniFile.fromFile(directory)!!, "001.png"))
+        }
+    }
+
+    @Test
+    fun partialAndFinalQueueEventsReloadTheSameReaderPageUntilCompletion() = runBlocking {
+        val manager = Injekt.get<TranslationManager>()
+
+        @Suppress("UNCHECKED_CAST")
+        val events = TranslationManager::class.java.getDeclaredField("_donePageEvents").apply {
+            isAccessible = true
+        }.get(manager) as MutableSharedFlow<Pair<Long, String>>
+        val subscriptionsBefore = events.subscriptionCount.value
+        val queueBefore = manager.queueState.value
+        try {
+            withPage { directory, page ->
+                val loader = page.chapter.pageLoader as TranslatingPageLoader
+                val chapterDir = checkNotNull(UniFile.fromFile(directory))
+                val materialsDir = checkNotNull(UniFile.fromFile(File(directory, ".yakuyomi")))
+                val originalBytes = File(directory, "001.png").readBytes()
+                val original = PartialPageStore.Original(
+                    OriginalMaterial.exactName("001.png"),
+                    PartialPageStore.sha256(originalBytes),
+                    originalBytes.size.toLong(),
+                )
+                val store = PartialPageStore.forUniFile(context, chapterDir, materialsDir)
+                val translator = PageTranslator(context)
+
+                @Suppress("UNCHECKED_CAST")
+                val tracked = TranslatingPageLoader::class.java.getDeclaredField("tracked").apply {
+                    isAccessible = true
+                }.get(loader) as MutableMap<Int, ReaderPage>
+                fun isTracked() = synchronized(tracked) { tracked[page.index] === page }
+
+                // Exercise the real loader observer without activating a real translation queue.
+                loader.retryPage(page)
+                assertTrue(isTracked())
+                TranslatingPageLoader::class.java.getDeclaredMethod("startQueueObserver").apply {
+                    isAccessible = true
+                }.invoke(loader)
+                withTimeout(3000) { events.subscriptionCount.first { it > subscriptionsBefore } }
+
+                // Typed OCR progress and actual 8x8 PNG persistence only; no native inference,
+                // translation server, ReaderActivity or user input is represented by this fixture.
+                val successful = RegionProgress(
+                    id = 0,
+                    state = RegionState.TRANSLATED,
+                    lines = listOf(
+                        OcrLineProgress(
+                            listOf(Pt(0f, 0f), Pt(8f, 0f), Pt(8f, 3f), Pt(0f, 3f)),
+                            1f,
+                            "h",
+                            "こんにちは",
+                        ),
+                    ),
+                    direction = "h",
+                    translatedText = "안녕하세요",
+                )
+                val pending = RegionProgress(
+                    id = 1,
+                    state = RegionState.OCR_PENDING,
+                    lines = listOf(
+                        OcrLineProgress(
+                            listOf(Pt(0f, 4f), Pt(8f, 4f), Pt(8f, 8f), Pt(0f, 8f)),
+                            1f,
+                            "h",
+                            "",
+                        ),
+                    ),
+                    direction = "h",
+                )
+                val rawMask = imageBytes(Color.BLACK)
+                val partial = store.commit(
+                    pageName = "001.png",
+                    original = original,
+                    width = 8,
+                    height = 8,
+                    progressPayload = OcrProgressCodec.encode(PageProgress(8, 8, listOf(successful, pending))),
+                    outputBytes = imageBytes(Color.GRAY),
+                    rawMaskBytes = rawMask,
+                    baseRevision = null,
+                    complete = false,
+                )
+                assertFalse(translator.isPageTranslated(chapterDir, "001.png"))
+                assertTrue(translator.hasDisplayableTranslation(chapterDir, "001.png"))
+                val beforePartial = page.reloadFlow.value
+                events.emit(requireNotNull(page.chapter.chapter.id) to "001.png")
+                withTimeout(3000) { page.reloadFlow.first { it > beforePartial } }
+                assertEquals("One partial event reloads this same page once", beforePartial + 1, page.reloadFlow.value)
+                assertReadable(page, Color.GRAY)
+                assertTrue("A partial page must stay registered for the final event", isTracked())
+
+                val resolved = pending.copy(
+                    state = RegionState.TRANSLATED,
+                    lines = pending.lines.map { it.copy(text = "ありがとう") },
+                    translatedText = "감사합니다",
+                )
+                store.commit(
+                    pageName = "001.png",
+                    original = original,
+                    width = 8,
+                    height = 8,
+                    progressPayload = OcrProgressCodec.encode(PageProgress(8, 8, listOf(successful, resolved))),
+                    outputBytes = imageBytes(Color.BLACK),
+                    rawMaskBytes = rawMask,
+                    baseRevision = partial.revision,
+                    complete = true,
+                )
+                assertTrue(translator.isPageTranslated(chapterDir, "001.png"))
+                assertTrue(translator.hasDisplayableTranslation(chapterDir, "001.png"))
+                val beforeFinal = page.reloadFlow.value
+                events.emit(requireNotNull(page.chapter.chapter.id) to "001.png")
+                withTimeout(3000) { page.reloadFlow.first { it > beforeFinal } }
+                assertEquals("The final event reloads the existing page again", beforeFinal + 1, page.reloadFlow.value)
+                assertReadable(page, Color.BLACK)
+                assertFalse("Only complete output can remove this page from the observer", isTracked())
+                assertSame(loader, page.chapter.pageLoader)
+                assertArrayEquals(originalBytes, File(directory, ".yakuyomi/${original.name}").readBytes())
+                assertEquals(queueBefore, manager.queueState.value)
+            }
+        } finally {
+            // withPage recycles the loader on both success and failure; wait for its collector to leave.
+            withTimeout(3000) { events.subscriptionCount.first { it <= subscriptionsBefore } }
         }
     }
 
@@ -237,6 +370,18 @@ class ReaderPageOperationTest {
         val bitmap = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(color) }
         try {
             file.outputStream().use { assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun imageBytes(color: Int): ByteArray {
+        val bitmap = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(color) }
+        try {
+            return ByteArrayOutputStream().use { output ->
+                assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                output.toByteArray()
+            }
         } finally {
             bitmap.recycle()
         }

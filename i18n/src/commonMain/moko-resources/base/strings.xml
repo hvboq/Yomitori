@@ -1601,6 +1601,7 @@
     <string name="reader_translating_page">Translating this page…</string>
     <string name="reader_translate_page_done">Page translated</string>
     <string name="reader_translate_page_failed">Translation failed (skipped or error)</string>
+    <string name="reader_translate_page_partial">Some text could not be recognized. Saved translations are preserved; retry to finish this page.</string>
     <string name="reader_translate_chapter_started">Started translating this chapter</string>
     <string name="reader_translate_chapter_stopped">Stopped translating this chapter</string>
     <!-- Yakuyomi: re-render -->

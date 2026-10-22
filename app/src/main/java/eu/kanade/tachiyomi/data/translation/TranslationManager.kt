@@ -1720,7 +1720,7 @@ class TranslationManager(private val context: Context) {
                     nightMaterials = false,
                 )
                 val done = pageTranslator.isChapterTranslated(tmpU)
-                ProcessResult(swap = n > 0 || done, success = done)
+                ProcessResult(swap = n > 0 || done || pageTranslator.hasPartialProgress(tmpU), success = done)
             }
         }
     }

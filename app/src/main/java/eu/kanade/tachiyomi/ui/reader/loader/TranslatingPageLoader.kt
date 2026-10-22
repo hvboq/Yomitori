@@ -75,7 +75,7 @@ internal class TranslatingPageLoader(
         get() = (delegate as? NightPageSource)?.nightStreams
 
     // PageTranslator 未在 DI 註冊（全 codebase 都直接 new、見 ReaderViewModel）→ 比照以 Application context 自建，避免 Injekt 取不到。
-    // 本 loader 只用它讀 manifest（[PageTranslator.isPageTranslated]/[PageTranslator.donePages]）——實際翻譯在佇列。
+    // Displayable partial output is independent of completed manifest state; inference stays in the queue.
     private val pageTranslator = PageTranslator(Injekt.get<Application>())
 
     /** 佇列觀察 / 換頁用的 scope（背景 IO）；[recycle] 時取消（只停觀察，**不**停佇列——整章要繼續在背景翻）。 */
@@ -219,10 +219,17 @@ internal class TranslatingPageLoader(
                 if (chapterDir == null) return@collect
                 val page = synchronized(tracked) {
                     val hit = tracked.entries.firstOrNull { (_, p) -> pageFile(p)?.name == name }
-                    if (hit != null) tracked.remove(hit.key)
                     hit?.value
                 }
-                page?.let { swapToFile(it) }
+                page?.let {
+                    // Partial output can be followed by another partial or the final generation.
+                    // Keep observing it until completion, otherwise the final event is lost.
+                    val dir = chapterDir
+                    if (dir != null && pageTranslator.isPageTranslated(dir, name)) {
+                        synchronized(tracked) { if (tracked[it.index] === it) tracked.remove(it.index) }
+                    }
+                    swapToFile(it)
+                }
             }
         }
     }
@@ -268,8 +275,11 @@ internal class TranslatingPageLoader(
         synchronized(tracked) { tracked[page.index] = page }
         // 登記後立即查一次：涵蓋「登記前就已翻好」（page-level resume / 重繪後 / 佇列搶先翻好）與「登記瞬間剛翻好」。
         // 命中就原子地從 tracked 取出再換（與觀察者互斥、同頁不重複換）。
-        if (pageTranslator.isPageTranslated(dir, pageFile.name.orEmpty())) {
-            val hit = synchronized(tracked) { tracked.remove(page.index) }
+        if (pageTranslator.hasDisplayableTranslation(dir, pageFile.name.orEmpty())) {
+            val complete = pageTranslator.isPageTranslated(dir, pageFile.name.orEmpty())
+            val hit = synchronized(tracked) {
+                if (complete) tracked.remove(page.index) else tracked[page.index]
+            }
             if (hit != null) swapToFile(page)
         }
     }
@@ -326,9 +336,11 @@ internal class TranslatingPageLoader(
         ensureResolved()
         val dir = chapterDir ?: return
         val pageFile = pageFile(page) ?: return
-        if (pageTranslator.isPageTranslated(dir, pageFile.name.orEmpty())) {
-            synchronized(tracked) { tracked.remove(page.index) }
-            synchronized(selectedSwapped) { selectedSwapped.add(page.index) }
+        if (pageTranslator.hasDisplayableTranslation(dir, pageFile.name.orEmpty())) {
+            if (pageTranslator.isPageTranslated(dir, pageFile.name.orEmpty())) {
+                synchronized(tracked) { tracked.remove(page.index) }
+                synchronized(selectedSwapped) { selectedSwapped.add(page.index) }
+            }
             swapToFile(page)
         }
     }
