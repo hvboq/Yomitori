@@ -20,12 +20,14 @@ import eu.kanade.tachiyomi.data.nightread.NightPump
 import eu.kanade.tachiyomi.data.nightread.NightTicket
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -187,15 +189,17 @@ class PageTranslator(private val context: Context) {
             }
         }
         val pendingNames = pending.mapNotNullTo(HashSet()) { it.name }
-        val carried = readErrorLines(chapterDir).filter { line ->
-            val page = line.substringBefore('\t')
-            page !in pendingNames && page in done && PageSizeCap.isTooLargeReason(line.substringAfter('\t', ""))
-        }
-        val allErrors = carried + errors
-        if (allErrors.isEmpty()) {
-            deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
-        } else {
-            overwriteBytes(chapterDir, ERRORS_FILE, allErrors.joinToString("\n", postfix = "\n").toByteArray())
+        manifestMutex.withLock {
+            val carried = readErrorLines(chapterDir).filter { line ->
+                val page = line.substringBefore('\t')
+                page !in pendingNames && page in done && PageSizeCap.isTooLargeReason(line.substringAfter('\t', ""))
+            }
+            val allErrors = carried + errors
+            if (allErrors.isEmpty()) {
+                deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
+            } else {
+                overwriteBytes(chapterDir, ERRORS_FILE, allErrors.joinToString("\n", postfix = "\n").toByteArray())
+            }
         }
         if (translated > 0 || promptTokens > 0 || completionTokens > 0) {
             statsStore.record(
@@ -532,7 +536,11 @@ class PageTranslator(private val context: Context) {
             } else {
                 null
             }
-            if (partial) recordSinglePageError(chapterDir, name, error!!)
+            if (partial) {
+                recordSinglePageError(chapterDir, name, error!!)
+            } else {
+                clearCompletedPageErrorLocked(chapterDir, name)
+            }
             PageAttempt(if (partial) AttemptKind.PARTIAL else AttemptKind.TRANSLATED, stats, error, warning, true)
         }
     }
@@ -675,7 +683,13 @@ class PageTranslator(private val context: Context) {
         val page = chapterImages(chapterDir).firstOrNull { it.name == pageFileName }
             ?: return SinglePageResult.NOT_TRANSLATED
         val attempt = translateStoredPage(chapterDir, page, method, true, true, false) { false }
-        attempt.error?.let { recordSinglePageError(chapterDir, pageFileName, it) }
+        // Persisted partials already recorded their diagnostic under the page lock. Repeating
+        // that write here could replace a newer completion/failure with an old pending message.
+        if (attempt.kind != AttemptKind.PARTIAL || !attempt.displayChanged) {
+            attempt.error?.let { reason ->
+                pageLock(page).withLock { recordSinglePageError(chapterDir, pageFileName, reason) }
+            }
+        }
         return when (attempt.kind) {
             AttemptKind.TRANSLATED, AttemptKind.ALREADY_DONE -> SinglePageResult.TRANSLATED
             AttemptKind.PARTIAL -> SinglePageResult.PARTIAL
@@ -1872,17 +1886,23 @@ class PageTranslator(private val context: Context) {
      * **只替換自己的行**：翻譯錯誤行是「未標記頁待重試」的線索，不能因夜讀跑一輪就被清掉；反過來夜讀重跑也不該累積
      * 重複行。合併後為空 → 刪檔（與 [translateChapter] 的「本輪無錯清舊檔」一致）。best-effort：失敗只記 log。
      */
-    private fun writeNightErrors(chapterDir: UniFile, nightErrors: List<String>) {
+    private suspend fun writeNightErrors(chapterDir: UniFile, nightErrors: List<String>) {
         runCatching {
-            val existing = chapterDir.findFile(ERRORS_FILE)?.let { f ->
-                context.contentResolver.openInputStream(f.uri)?.use { it.bufferedReader().readLines() }
-            }.orEmpty()
-            val kept = existing.filterNot { it.isBlank() || it.startsWith(NIGHT_ERROR_PREFIX) }
-            val merged = kept + nightErrors.map { "$NIGHT_ERROR_PREFIX\t$it" }
-            if (merged.isEmpty()) {
-                deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
-            } else {
-                overwriteBytes(chapterDir, ERRORS_FILE, merged.joinToString("\n").toByteArray())
+            // renderNightChapter also calls this from its cancellation finally block. Waiting for
+            // a translation writer must not discard the night errors already collected there.
+            withContext(NonCancellable) {
+                manifestMutex.withLock {
+                    val existing = chapterDir.findFile(ERRORS_FILE)?.let { f ->
+                        context.contentResolver.openInputStream(f.uri)?.use { it.bufferedReader().readLines() }
+                    }.orEmpty()
+                    val kept = existing.filterNot { it.isBlank() || it.startsWith(NIGHT_ERROR_PREFIX) }
+                    val merged = kept + nightErrors.map { "$NIGHT_ERROR_PREFIX\t$it" }
+                    if (merged.isEmpty()) {
+                        deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
+                    } else {
+                        overwriteBytes(chapterDir, ERRORS_FILE, merged.joinToString("\n").toByteArray())
+                    }
+                }
             }
         }.onFailure { logcat(LogPriority.WARN, it) { "寫夜讀錯誤檔失敗 ${chapterDir.name}" } }
     }
@@ -2420,11 +2440,43 @@ class PageTranslator(private val context: Context) {
      * reader 單頁路徑把一頁的失敗原因寫進該話錯誤檔（[ERRORS_FILE]，行格式同佇列：`<頁名>\t<原因>`）：同頁舊的翻譯錯誤行換成
      * 這行，別頁的行與夜讀行原樣保留。整章佇列下一輪跑完會照它自己的結果整檔重寫。best-effort：失敗只記 log。
      */
-    private fun recordSinglePageError(chapterDir: UniFile, pageName: String, reason: String) {
+    private suspend fun recordSinglePageError(chapterDir: UniFile, pageName: String, reason: String) {
         runCatching {
-            val kept = readErrorLines(chapterDir).filterNot { it.startsWith("$pageName\t") }
-            overwriteBytes(chapterDir, ERRORS_FILE, (kept + "$pageName\t$reason").joinToString("\n").toByteArray())
+            manifestMutex.withLock {
+                val kept = readErrorLines(chapterDir).filterNot { it.startsWith("$pageName\t") }
+                overwriteBytes(chapterDir, ERRORS_FILE, (kept + "$pageName\t$reason").joinToString("\n").toByteArray())
+            }
         }.onFailure { logcat(LogPriority.WARN, it) { "寫翻譯錯誤檔失敗 ${chapterDir.name}" } }
+    }
+
+    /** Caller holds the page lock, before returning a newly committed success to the reader. */
+    private suspend fun clearCompletedPageErrorLocked(chapterDir: UniFile, pageName: String) {
+        runCatching {
+            manifestMutex.withLock {
+                val file = chapterDir.findFile(ERRORS_FILE) ?: return@withLock
+                check(file.isFile && file.name == ERRORS_FILE) { "Invalid translation error file" }
+                // Unlike the display-only reader, a failed read cannot authorize deleting a file
+                // whose other-page/night/materials diagnostics are unknown.
+                val lines = context.contentResolver.openInputStream(file.uri)?.use {
+                    it.bufferedReader().readLines()
+                } ?: throw java.io.IOException("Cannot read translation error file")
+                val kept = lines.filterNot { it.startsWith("$pageName\t") }
+                if (kept.size == lines.size) return@withLock
+                // Only re-read large image/mask snapshots when this page has a diagnostic to clear.
+                // Pending or damaged journals must never inherit a legacy completed checkpoint.
+                val journal = loadJournal(chapterDir, pageName, recover = false)
+                if (journal?.complete == false || (journal == null && pageName !in readDonePages(chapterDir))) {
+                    return@withLock
+                }
+                if (kept.all { it.isBlank() }) {
+                    check(deleteFileOnly(file, ERRORS_FILE)) { "Cannot remove resolved translation error file" }
+                } else {
+                    check(overwriteBytes(chapterDir, ERRORS_FILE, kept.joinToString("\n").toByteArray())) {
+                        "Cannot remove resolved page diagnostic"
+                    }
+                }
+            }
+        }.onFailure { logcat(LogPriority.WARN, it) { "Cannot clear resolved translation error ${chapterDir.name}" } }
     }
 
     /** 該話錯誤檔（[ERRORS_FILE]）現有的非空行；沒有檔、讀不到 → 空。 */
@@ -2884,6 +2936,7 @@ class PageTranslator(private val context: Context) {
         /**
          * 保護 manifest 的「讀-改-寫」（[commitManifest]）。放在 companion＝行程內所有 [PageTranslator] 實例共用：
          * 佇列（[TranslationManager] 的實例）與 reader 單頁翻（[ReaderViewModel] 的實例）會同時寫同一章的 manifest。
+         * Shared translation/night diagnostics use this mutex too; page callers acquire their page lock first.
          */
         private val manifestMutex = Mutex()
 

@@ -13,7 +13,18 @@ import eu.kanade.tachiyomi.data.translation.PartialPageStore
 import eu.kanade.tachiyomi.data.translation.StoredTranslationContext
 import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import li.joye.yakuyomi.engine.OcrLineProgress
 import li.joye.yakuyomi.engine.PageAnalysis
 import li.joye.yakuyomi.engine.PageProgress
@@ -36,6 +47,10 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.lang.reflect.InvocationTargetException
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 
 /** Real journal/service integration with scripted engines, not native OCR or external translation. */
 @RunWith(AndroidJUnit4::class)
@@ -170,6 +185,231 @@ class StoredPageContextIntegrationTest {
             assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
             assertEquals(null, fixture.store.load(PAGE))
             assertFreshSkippedCompletes(fixture, null, "English", noText = true)
+        }
+    }
+
+    @Test
+    fun successfulSameContextResumeDeletesItsOnlyPendingDiagnostic() = runBlocking {
+        withPending { fixture, pending ->
+            assertTrue(fixture.errors.readText().startsWith("$PAGE\tOCR_PENDING:"))
+            fixture.selectSameContextCompletion()
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            val completed = requireNotNull(fixture.store.load(PAGE))
+            assertTrue(completed.complete)
+            assertEquals(pending.revision, completed.baseRevision)
+            assertFalse("A resolved page must not retain its old OCR_PENDING error", fixture.errors.exists())
+            fixture.assertOriginalPreserved()
+        }
+    }
+
+    @Test
+    fun successfulResumePreservesOtherPageNightAndMaterialsDiagnostics() = runBlocking {
+        withPending { fixture, _ ->
+            val kept = listOf(
+                "002.png\tOCR_PENDING: another page still needs recognition",
+                "001.png.extra\tfailed unrelated page with a shared prefix",
+                "(night)\t$PAGE\tnight generation failed",
+                "(materials)\toptional materials warning",
+            )
+            fixture.errors.writeText((kept + fixture.errors.readLines()).joinToString("\n", postfix = "\n"))
+            fixture.selectSameContextCompletion()
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertEquals(kept, fixture.errors.readLines())
+            assertTrue(fixture.store.load(PAGE)!!.complete)
+            fixture.assertOriginalPreserved()
+        }
+    }
+
+    @Test
+    fun pendingAndFailedResumeRetainCurrentDiagnosticAndOtherOwners() = runBlocking {
+        withPending { fixture, pending ->
+            val kept = listOf("002.png\tother page failed", "(night)\t$PAGE\tnight failed")
+            fixture.errors.writeText((kept + fixture.errors.readLines()).joinToString("\n"))
+            var calls = 0
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult = error("Expected pending resume")
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    if (++calls == 1) result("한국어", false) else PageResult.Failed("current scripted failure")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertEquals(PageTranslator.SinglePageResult.PARTIAL, fixture.translate())
+            val stillPending = requireNotNull(fixture.store.load(PAGE))
+            assertFalse(stillPending.complete)
+            assertEquals(pending.revision, stillPending.baseRevision)
+            assertEquals(kept, fixture.errors.readLines().filterNot { it.startsWith("$PAGE\t") })
+            assertTrue(fixture.errors.readLines().single { it.startsWith("$PAGE\t") }.contains("OCR_PENDING:"))
+            val output = fixture.page.readBytes()
+
+            assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, fixture.translate())
+            assertEquals(2, calls)
+            assertEquals(stillPending, fixture.store.load(PAGE))
+            assertArrayEquals(output, fixture.page.readBytes())
+            assertEquals(kept + "$PAGE\tcurrent scripted failure", fixture.errors.readLines())
+            fixture.assertOriginalPreserved()
+        }
+    }
+
+    @Test
+    fun failedManualRetryOfCompletedPageRetainsFailureDespiteCompletedJournal() = runBlocking {
+        withCompleted { fixture, completed ->
+            val output = fixture.page.readBytes()
+            val kept = listOf("002.png\tother page failed", "(materials)\told optional warning")
+            fixture.errors.writeText((kept + "$PAGE\tprevious failure").joinToString("\n"))
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult = PageResult.Failed("manual retry failed")
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("Completed pages must not resume pending analysis")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, fixture.translate())
+            assertEquals(completed, fixture.store.load(PAGE))
+            assertArrayEquals(output, fixture.page.readBytes())
+            assertEquals(kept + "$PAGE\tmanual retry failed", fixture.errors.readLines())
+            assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+            fixture.assertOriginalPreserved()
+        }
+    }
+
+    @Test
+    fun diagnosticDirectoryCannotTurnCommittedResumeIntoFailureOrBeDeleted() = runBlocking {
+        withPending { fixture, _ ->
+            check(fixture.errors.delete())
+            check(fixture.errors.mkdir())
+            val sentinel = File(fixture.errors, "unowned.txt").apply { writeText("preserve this directory") }
+            fixture.selectSameContextCompletion()
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertTrue(fixture.store.load(PAGE)!!.complete)
+            assertTrue(fixture.errors.isDirectory)
+            assertEquals("preserve this directory", sentinel.readText())
+            fixture.assertOriginalPreserved()
+        }
+    }
+
+    @Test
+    fun lateResumeSuccessCannotClearConcurrentCurrentFailureDiagnostic() = runBlocking {
+        withPending { fixture, pending ->
+            coroutineScope {
+                val firstEntered = CompletableDeferred<Unit>()
+                val secondEntered = CompletableDeferred<Unit>()
+                val allowSuccess = CompletableDeferred<Unit>()
+                val allowFailure = CompletableDeferred<Unit>()
+                val failureReturned = CompletableDeferred<Unit>()
+                val calls = AtomicInteger()
+                fixture.select(object : TranslationEngine {
+                    override val translationContext = semantic("Korean")
+                    override suspend fun translatePage(page: Bitmap): PageResult = error("Expected pending resumes")
+                    override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                        when (calls.incrementAndGet()) {
+                            1 -> {
+                                firstEntered.complete(Unit)
+                                allowSuccess.await()
+                                result("한국어", true)
+                            }
+                            2 -> {
+                                secondEntered.complete(Unit)
+                                allowFailure.await()
+                                failureReturned.complete(Unit)
+                                PageResult.Failed("concurrent current failure")
+                            }
+                            else -> error("Unexpected inference")
+                        }
+                    override fun warmUp() = Unit
+                    override fun close() = Unit
+                })
+                val manifestMutex = PageTranslator::class.java.getDeclaredField("manifestMutex").apply {
+                    isAccessible = true
+                }.get(null) as Mutex
+                val owner = Any()
+                manifestMutex.lock(owner)
+                var ownsManifestLock = true
+                try {
+                    val success = async(Dispatchers.Default) { fixture.translate() }
+                    withTimeout(5_000) { firstEntered.await() }
+                    val failure = async(Dispatchers.Default) { fixture.translate() }
+                    withTimeout(5_000) { secondEntered.await() }
+                    allowSuccess.complete(Unit)
+                    // The successful output is durable, but that attempt still owns the page lock
+                    // while awaiting the manifest. Let another already-running inference fail.
+                    withTimeout(5_000) {
+                        while (!runCatching { fixture.store.currentStateInfo(PAGE)?.complete == true }
+                                .getOrDefault(false)
+                        ) {
+                            delay(10)
+                        }
+                    }
+                    allowFailure.complete(Unit)
+                    withTimeout(5_000) { failureReturned.await() }
+                    assertEquals(null, withTimeoutOrNull(200) { failure.await() })
+                    manifestMutex.unlock(owner)
+                    ownsManifestLock = false
+                    assertEquals(PageTranslator.SinglePageResult.TRANSLATED, withTimeout(5_000) { success.await() })
+                    assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, withTimeout(5_000) { failure.await() })
+                    val completed = requireNotNull(fixture.store.load(PAGE))
+                    assertTrue(completed.complete)
+                    assertEquals(pending.revision, completed.baseRevision)
+                    assertEquals(listOf("$PAGE\tconcurrent current failure"), fixture.errors.readLines())
+                    fixture.assertOriginalPreserved()
+                } finally {
+                    allowSuccess.complete(Unit)
+                    allowFailure.complete(Unit)
+                    if (ownsManifestLock) manifestMutex.unlock(owner)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun cancelledNightDiagnosticWaitsForManifestLockAndPreservesOtherOwners() = runBlocking {
+        withFixture { fixture ->
+            coroutineScope {
+                val kept = listOf("$PAGE\tOCR_PENDING: translation pending", "(materials)\toptional warning")
+                val initial = kept + "(night)\t002.png\tprevious night failure"
+                fixture.errors.writeText(initial.joinToString("\n"))
+                val manifestMutex = PageTranslator::class.java.getDeclaredField("manifestMutex").apply {
+                    isAccessible = true
+                }.get(null) as Mutex
+                val owner = Any()
+                manifestMutex.lock(owner)
+                var ownsManifestLock = true
+                val cleanupEntered = CompletableDeferred<Unit>()
+                val writer = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        cleanupEntered.complete(Unit)
+                        // Exercise the actual private writer without opening native night models.
+                        fixture.writeNightErrorsForTest(listOf("002.png\tcollected before cancellation"))
+                    }
+                }
+                try {
+                    writer.cancel()
+                    withTimeout(5_000) { cleanupEntered.await() }
+                    // A cancellable lock would return without recording anything at this point.
+                    assertEquals(
+                        null,
+                        withTimeoutOrNull(200) {
+                            writer.join()
+                            true
+                        },
+                    )
+                    assertEquals(initial, fixture.errors.readLines())
+                    manifestMutex.unlock(owner)
+                    ownsManifestLock = false
+                    withTimeout(5_000) { writer.join() }
+                    assertTrue(writer.isCancelled)
+                    assertEquals(
+                        kept + "(night)\t002.png\tcollected before cancellation",
+                        fixture.errors.readLines(),
+                    )
+                } finally {
+                    writer.cancel()
+                    if (ownsManifestLock) manifestMutex.unlock(owner)
+                }
+            }
         }
     }
 
@@ -348,6 +588,7 @@ class StoredPageContextIntegrationTest {
     ) {
         val chapter = requireNotNull(UniFile.fromFile(directory))
         val materials get() = File(directory, ".yakuyomi")
+        val errors get() = File(directory, ".yakuyomi_errors.txt")
         val store get() = PartialPageStore.forUniFile(
             InstrumentationRegistry.getInstrumentation().targetContext,
             chapter,
@@ -356,6 +597,27 @@ class StoredPageContextIntegrationTest {
         fun select(engine: TranslationEngine) {
             field("engine").set(service, engine)
         }
+        fun selectSameContextCompletion() = select(object : TranslationEngine {
+            override val translationContext = semantic("Korean")
+            override suspend fun translatePage(page: Bitmap): PageResult = error("Expected same-context resume")
+            override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult = result("한국어", true)
+            override fun warmUp() = Unit
+            override fun close() = Unit
+        })
+        suspend fun writeNightErrorsForTest(lines: List<String>) =
+            suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
+                val writer = PageTranslator::class.java.getDeclaredMethod(
+                    "writeNightErrors",
+                    UniFile::class.java,
+                    List::class.java,
+                    Continuation::class.java,
+                ).apply { isAccessible = true }
+                try {
+                    writer.invoke(translator, chapter, lines, continuation)
+                } catch (failure: InvocationTargetException) {
+                    throw failure.targetException
+                }
+            }
         suspend fun translate() = translator.translateSinglePage(chapter, PAGE, "boxfill")
         fun assertOriginalPreserved() = assertArrayEquals(initialBytes, File(materials, "001.orig.png").readBytes())
     }
