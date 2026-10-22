@@ -2,12 +2,13 @@ package eu.kanade.presentation.more.settings.screen.data
 
 import android.app.Application
 import android.content.Context
-import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -20,6 +21,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.core.net.toUri
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -33,7 +35,14 @@ import eu.kanade.tachiyomi.data.backup.BackupFileValidator
 import eu.kanade.tachiyomi.data.backup.restore.BackupRestoreJob
 import eu.kanade.tachiyomi.data.backup.restore.RestoreOptions
 import eu.kanade.tachiyomi.util.system.DeviceUtil
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import mihon.core.viewmodel.StateViewModel
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.LabeledCheckbox
@@ -72,12 +81,22 @@ class RestoreBackupScreen(
             LazyColumnWithAction(
                 contentPadding = contentPadding,
                 actionLabel = stringResource(MR.strings.action_restore),
-                actionEnabled = state.canRestore && state.options.canRestore(),
+                actionEnabled = !state.isValidating && state.canRestore && state.options.canRestore(),
                 onClickAction = {
                     viewModel.startRestore()
                     navigator.pop()
                 },
             ) {
+                if (state.isValidating) {
+                    item {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(MaterialTheme.padding.medium),
+                        )
+                    }
+                }
+
                 if (DeviceUtil.isMiui && DeviceUtil.isMiuiOptimizationDisabled()) {
                     item {
                         WarningBanner(MR.strings.restore_miui_warning)
@@ -176,6 +195,13 @@ class RestoreBackupScreen(
 class RestoreBackupViewModel(
     private val context: Context,
     private val uri: String,
+    private val validationDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val validateBackup: (String) -> BackupFileValidator.Results = {
+        BackupFileValidator(context).validate(it.toUri())
+    },
+    private val restoreBackup: (String, RestoreOptions) -> Unit = { location, options ->
+        BackupRestoreJob.start(context = context, uri = location.toUri(), options = options)
+    },
 ) : StateViewModel<RestoreBackupViewModel.State>(State()) {
 
     companion object {
@@ -192,7 +218,9 @@ class RestoreBackupViewModel(
     }
 
     init {
-        validate(uri.toUri())
+        viewModelScope.launch {
+            validate()
+        }
     }
 
     fun toggle(setter: (RestoreOptions, Boolean) -> RestoreOptions, enabled: Boolean) {
@@ -204,17 +232,20 @@ class RestoreBackupViewModel(
     }
 
     fun startRestore() {
-        BackupRestoreJob.start(
-            context = context,
-            uri = uri.toUri(),
-            options = state.value.options,
-        )
+        val current = state.value
+        if (current.isValidating || !current.canRestore || !current.options.canRestore()) return
+        restoreBackup(uri, current.options)
     }
 
-    private fun validate(uri: Uri) {
+    private suspend fun validate() {
         val results = try {
-            BackupFileValidator(context).validate(uri)
+            withContext(validationDispatcher) {
+                validateBackup(uri)
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            currentCoroutineContext().ensureActive()
             setError(
                 error = InvalidRestore(uri, e.message.toString()),
                 canRestore = false,
@@ -222,6 +253,7 @@ class RestoreBackupViewModel(
             return
         }
 
+        currentCoroutineContext().ensureActive()
         if (results.missingSources.isNotEmpty() || results.missingTrackers.isNotEmpty()) {
             setError(
                 error = MissingRestoreComponents(uri, results.missingSources, results.missingTrackers),
@@ -238,6 +270,7 @@ class RestoreBackupViewModel(
             it.copy(
                 error = error,
                 canRestore = canRestore,
+                isValidating = false,
             )
         }
     }
@@ -246,17 +279,18 @@ class RestoreBackupViewModel(
     data class State(
         val error: Any? = null,
         val canRestore: Boolean = false,
+        val isValidating: Boolean = true,
         val options: RestoreOptions = RestoreOptions(),
     )
 }
 
-private data class MissingRestoreComponents(
-    val uri: Uri,
+internal data class MissingRestoreComponents(
+    val uri: String,
     val sources: List<String>,
     val trackers: List<String>,
 )
 
-private data class InvalidRestore(
-    val uri: Uri? = null,
+internal data class InvalidRestore(
+    val uri: String? = null,
     val message: String,
 )

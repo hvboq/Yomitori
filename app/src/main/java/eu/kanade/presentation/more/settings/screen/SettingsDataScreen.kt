@@ -188,8 +188,8 @@ object SettingsDataScreen : SearchableSettings {
         val lastAutoBackup by backupPreferences.lastAutoBackupTimestamp.collectAsState()
 
         val chooseBackup = rememberLauncherForActivityResult(
-            object : ActivityResultContracts.GetContent() {
-                override fun createIntent(context: Context, input: String): Intent {
+            object : ActivityResultContracts.OpenDocument() {
+                override fun createIntent(context: Context, input: Array<String>): Intent {
                     val intent = super.createIntent(context, input)
                     return Intent.createChooser(intent, context.stringResource(MR.strings.file_select_backup))
                 }
@@ -198,6 +198,14 @@ object SettingsDataScreen : SearchableSettings {
             if (it == null) {
                 context.toast(MR.strings.file_null_uri_error)
                 return@rememberLauncherForActivityResult
+            }
+
+            // The restore worker can outlive the activity that selected the backup.
+            try {
+                context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e: SecurityException) {
+                logcat(LogPriority.ERROR, e)
+                context.toast(MR.strings.file_picker_uri_permission_unsupported)
             }
 
             navigator.push(RestoreBackupScreen(it.toString()))
@@ -236,7 +244,7 @@ object SettingsDataScreen : SearchableSettings {
                                             }
 
                                             // no need to catch because it's wrapped with a chooser
-                                            chooseBackup.launch("*/*")
+                                            chooseBackup.launch(arrayOf("*/*"))
                                         } else {
                                             context.toast(MR.strings.restore_in_progress)
                                         }

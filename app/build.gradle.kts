@@ -29,6 +29,14 @@ val yakuyomiKeystore = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
+// Keep destructive UI fixtures out of both the user's release and normal debug stores.
+val isolatedAudit = providers.gradleProperty("yomitoriIsolatedAudit")
+    .map { value ->
+        value.toBooleanStrictOrNull()
+            ?: throw GradleException("yomitoriIsolatedAudit must be true or false")
+    }
+    .getOrElse(false)
+
 android {
     namespace = "eu.kanade.tachiyomi"
 
@@ -66,7 +74,7 @@ android {
 
     buildTypes {
         val debug = getByName("debug") {
-            applicationIdSuffix = ".dev"
+            applicationIdSuffix = if (isolatedAudit) ".audit" else ".dev"
             versionNameSuffix = "-${getLatestCommitCount()}"
             isPseudoLocalesEnabled = true
         }
