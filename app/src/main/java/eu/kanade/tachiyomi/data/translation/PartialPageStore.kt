@@ -512,6 +512,13 @@ internal class PartialPageStore(private val io: Io) {
 
         fun sha256(bytes: ByteArray): String = digest(bytes)
 
+        /** Exact journal-owned names for an explicit source replacement, including orphan blobs. */
+        fun artifactNames(pageName: String, materialNames: Set<String>): Set<String> {
+            requirePageName(pageName)
+            val pagePrefix = prefix(pageName) + "-"
+            return materialNames.filterTo(linkedSetOf()) { it.startsWith(pagePrefix) && JOURNAL_NAME.matches(it) }
+        }
+
         private fun prefix(pageName: String): String = PREFIX + digest(pageName.toByteArray(Charsets.UTF_8))
 
         private fun names(pageName: String, revision: String): Names {

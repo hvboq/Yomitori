@@ -55,6 +55,8 @@ import tachiyomi.domain.translation.service.TranslationPreferences
 import tachiyomi.i18n.MR
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 /**
@@ -129,6 +131,10 @@ class PageTranslator(private val context: Context) {
     ): Int {
         if (!TranslationEngineConfig.modelsResolvable(context)) return 0
         val images = chapterImages(chapterDir).takeIf { it.isNotEmpty() } ?: return 0
+        for (image in images) {
+            val name = image.name ?: continue
+            pageLock(image).withLock { recoverCapturedSourceLocked(chapterDir, image, name) }
+        }
         // Metadata is deliberately cheap. A journal-backed completed page is additionally checked
         // under its page lock before it is skipped; damaged bytes cannot inherit an old checkpoint.
         val done = readDonePages(chapterDir).toMutableSet()
@@ -247,7 +253,118 @@ class PageTranslator(private val context: Context) {
         val keepExistingOriginal: Boolean,
         val wasPending: Boolean,
         val preservedOriginal: UniFile? = null,
+        val sourceToken: SourceToken,
     )
+
+    private data class SourceToken(val epoch: String?, val processFence: Long)
+
+    private fun capturedStore(chapterDir: UniFile): CapturedSourceStore? {
+        val directory = chapterDir.findFile(MATERIALS_DIR) ?: return null
+        check(directory.isDirectory && directory.name == MATERIALS_DIR) { "Invalid capture materials directory" }
+        return CapturedSourceStore(CapturedSourceUniFileIo(context, chapterDir, directory))
+    }
+
+    private fun sourceToken(chapterDir: UniFile, page: UniFile, name: String): SourceToken = SourceToken(
+        capturedStore(chapterDir)?.sourceEpoch(name),
+        captureFences[page.uri.toString()] ?: 0L,
+    )
+
+    private fun verifySourceToken(chapterDir: UniFile, page: UniFile, name: String, expected: SourceToken) {
+        check(sourceToken(chapterDir, page, name) == expected) { "Captured source changed during processing" }
+    }
+
+    /** The caller holds this page's lock. A failed recapture invalidates old inference too. */
+    private suspend fun recoverCapturedSourceLocked(chapterDir: UniFile, page: UniFile, name: String) {
+        val store = capturedStore(chapterDir) ?: return
+        if (!store.hasPending(name)) return
+        captureFences[page.uri.toString()] = captureFenceSequence.incrementAndGet()
+        withContext(NonCancellable) {
+            manifestMutex.withLock {
+                store.recover(name) { complete -> setCapturedPageCompletionLocked(chapterDir, name, complete) }
+            }
+        }
+    }
+
+    /** Caller owns page lock then manifest lock. Verify the raw union, never a masking overlay. */
+    private fun setCapturedPageCompletionLocked(chapterDir: UniFile, name: String, complete: Boolean) {
+        val current = CompletionManifestCodec.resolve(readManifestFiles(chapterDir))
+        val replacement = if (complete) current + name else current - name
+        writeManifest(chapterDir, replacement)
+        check(CompletionManifestCodec.resolve(readManifestFiles(chapterDir)) == replacement) {
+            "Cannot verify captured page completion transition"
+        }
+    }
+
+    /** Explicit user recapture: archive the old generation before replacing source and display. */
+    suspend fun replaceCapturedSource(chapterDir: UniFile, pageName: String, encodedPng: ByteArray) {
+        withContext(Dispatchers.IO) {
+            require(pageName.isNotBlank() && pageName != "." && pageName != "..")
+            require(pageName.toByteArray(Charsets.UTF_8).size <= 1024)
+            require(pageName.none { it == '/' || it == '\\' || it.code < 32 || it.code == 127 })
+            require(OriginalMaterial.extension(pageName).equals("png", ignoreCase = true)) {
+                "Recapture requires an existing PNG page"
+            }
+            check(encodedPng.isNotEmpty() && encodedPng.size <= MAX_PAGE_BYTES) { "Invalid capture size" }
+            val bytes = encodedPng.copyOf()
+            check(bytes.size >= 8 && bytes.copyOfRange(0, 8).contentEquals(CAPTURE_PNG_SIGNATURE)) {
+                "Capture is not a PNG image"
+            }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            check(
+                bounds.outMimeType == "image/png" && PageSizeCap.check(bounds.outWidth, bounds.outHeight) ==
+                    PageSizeCap.Verdict.Ok,
+            ) { "Capture dimensions exceed the supported image bounds" }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: throw java.io.IOException("Cannot decode captured PNG")
+            decoded.recycle()
+            val page = chapterDir.findFile(pageName)
+                ?.takeIf { it.isFile && it.name == pageName }
+                ?: throw java.io.IOException("Existing capture page is missing")
+            pageLock(page).withLock {
+                captureFences[page.uri.toString()] = captureFenceSequence.incrementAndGet()
+                recoverCapturedSourceLocked(chapterDir, page, pageName)
+                // These legacy sidecars share a basename. Never retire another page's materials.
+                check(
+                    chapterImages(chapterDir).none {
+                        it.name != pageName && it.name?.let(OriginalMaterial::base) == OriginalMaterial.base(pageName)
+                    },
+                ) { "Capture page shares materials with another image" }
+                manifestMutex.withLock {
+                    // Read/recover all authoritative OCR state before archiving or mutating files.
+                    loadJournal(chapterDir, pageName)
+                    readDonePages(chapterDir)
+                    val previousComplete = pageName in CompletionManifestCodec.resolve(readManifestFiles(chapterDir))
+                    val directory = materialsDir(chapterDir) ?: throw java.io.IOException("Cannot archive capture")
+                    val names = directory.listFiles()?.mapTo(linkedSetOf()) {
+                        it.name ?: throw java.io.IOException("Capture material has no name")
+                    } ?: throw java.io.IOException("Cannot list capture materials")
+                    val store = CapturedSourceStore(CapturedSourceUniFileIo(context, chapterDir, directory))
+                    val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
+                    store.replace(
+                        pageName,
+                        bytes,
+                        capturedMaterialNames(pageName, names),
+                        previousComplete,
+                        setComplete = { complete -> setCapturedPageCompletionLocked(chapterDir, pageName, complete) },
+                        checkCancellation = { coroutineContext.ensureActive() },
+                    )
+                }
+            }
+        }
+    }
+
+    private fun capturedMaterialNames(pageName: String, names: Set<String>): Set<String> {
+        val base = OriginalMaterial.base(pageName)
+        val originalNames = listOf(OriginalMaterial.exactName(pageName), OriginalMaterial.legacyName(pageName))
+            .flatMap { listOf(it, it + OriginalMaterial.TMP_SUFFIX, it + OriginalMaterial.INFLIGHT_SUFFIX) }
+        val exactNames = setOf("$base.json", "$base$MASK_SUFFIX", NightTextBoxes.fileName(pageName)) +
+            NightPages.artifactNames(pageName).flatMap { listOf(it, NightPages.tmpName(it)) }
+        return names.filterTo(linkedSetOf()) { name ->
+            name in exactNames || originalNames.any { it.equals(name, ignoreCase = true) } ||
+                NightPages.parseRulesStamp(name)?.first == pageName
+        } + PartialPageStore.artifactNames(pageName, names)
+    }
 
     private fun ambiguousSourceAttempt() = PageAttempt(
         AttemptKind.SOURCE_AMBIGUOUS,
@@ -270,6 +387,8 @@ class PageTranslator(private val context: Context) {
         var borrowedAnalysis: PageAnalysis? = null
         try {
             val input = pageLock(pageFile).withLock {
+                recoverCapturedSourceLocked(chapterDir, pageFile, name)
+                val token = sourceToken(chapterDir, pageFile, name)
                 val journal = loadJournal(chapterDir, name)
                 val alreadyDone = name in readDonePages(chapterDir)
                 if (!forceRetranslate && alreadyDone) return PageAttempt(AttemptKind.ALREADY_DONE)
@@ -308,6 +427,7 @@ class PageTranslator(private val context: Context) {
                             chapterDir, pageFile, journal, targetSha256,
                             kept, decoded.sha256, AttemptKind.TOO_LARGE, null,
                             PageSizeCap.tooLargeReason(decoded.width, decoded.height), !forceRetranslate, shouldStop,
+                            token,
                         )
                     }
                     is PageDecode.Unreadable -> return PageAttempt(AttemptKind.FAILED, error = decoded.reason)
@@ -334,6 +454,7 @@ class PageTranslator(private val context: Context) {
                             kept != null,
                             !alreadyDone,
                             kept,
+                            token,
                         )
                         prepared!!
                     }
@@ -392,6 +513,7 @@ class PageTranslator(private val context: Context) {
                                 chapterDir, pageFile, previous, input.expectedPageSha256,
                                 input.preservedOriginal, input.decoded.sha256, AttemptKind.SKIPPED,
                                 pageResult.stats, null, !forceRetranslate, shouldStop,
+                                input.sourceToken,
                             )
                         }
                     }
@@ -432,11 +554,13 @@ class PageTranslator(private val context: Context) {
         error: String?,
         commitCompletion: Boolean,
         shouldStop: () -> Boolean,
+        expectedSourceToken: SourceToken,
     ): PageAttempt {
         val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
         coroutineContext.ensureActive()
         if (shouldStop()) return PageAttempt(AttemptKind.STOPPED, stats)
         val name = pageFile.name ?: throw java.io.IOException("Missing page name")
+        verifySourceToken(chapterDir, pageFile, name, expectedSourceToken)
         val latest = loadJournal(chapterDir, name)
         check(latest?.revision == journal?.revision) { "Stale unchanged-page classification" }
         check(PartialPageStore.sha256(readPageBytes(pageFile)) == expectedPageSha256) {
@@ -469,6 +593,7 @@ class PageTranslator(private val context: Context) {
         val name = pageFile.name ?: throw java.io.IOException("Missing page name")
         val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
         return pageLock(pageFile).withLock {
+            verifySourceToken(chapterDir, pageFile, name, input.sourceToken)
             val store = partialStore(chapterDir)
             val latest = loadJournal(chapterDir, name)
             check(output.width == input.decoded.bitmap.width && output.height == input.decoded.bitmap.height) {
@@ -634,6 +759,11 @@ class PageTranslator(private val context: Context) {
         val name = pageFile.name ?: return false
         return try {
             val input = pageLock(pageFile).withLock {
+                recoverCapturedSourceLocked(chapterDir, pageFile, name)
+                val token = sourceToken(chapterDir, pageFile, name)
+                // This compatibility API receives already-computed pixels, not a pre-inference
+                // token. After an explicit recapture it cannot prove which source produced them.
+                if (token.epoch != null || token.processFence != 0L) return false
                 val journal = loadJournal(chapterDir, name)
                 val alreadyDone = name in readDonePages(chapterDir)
                 if (wasPending && alreadyDone) return true
@@ -669,6 +799,7 @@ class PageTranslator(private val context: Context) {
                     keep,
                     wasPending,
                     source.takeIf { keep },
+                    token,
                 )
             }
             val partial = analysis?.progress?.hasPending == true
@@ -766,6 +897,7 @@ class PageTranslator(private val context: Context) {
      * [reRenderPage] 載去字模型前也先問。讀不到 → false。IO。
      */
     fun hasReRenderMaterials(chapterDir: UniFile, pageFileName: String): Boolean = runCatching {
+        capturedStore(chapterDir)?.sourceEpoch(pageFileName)
         partialStore(chapterDir)?.currentStateInfo(pageFileName)?.let { return true }
         val matDir = chapterDir.findFile(MATERIALS_DIR) ?: return false
         matDir.findFile(NightTextBoxes.materialsJsonName(pageFileName))?.isFile == true &&
@@ -779,6 +911,7 @@ class PageTranslator(private val context: Context) {
 
     /** UI-only metadata status: partial output can be visible without completing every OCR group. */
     fun hasDisplayableTranslation(chapterDir: UniFile, pageName: String): Boolean = runCatching {
+        capturedStore(chapterDir)?.sourceEpoch(pageName)
         val journal = partialStore(chapterDir)?.currentStateInfo(pageName)
         if (journal != null) {
             OcrProgressCodec.decode(journal.progressPayload, journal.width, journal.height)
@@ -854,6 +987,10 @@ class PageTranslator(private val context: Context) {
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
         shouldStop: () -> Boolean = { false },
     ): Int {
+        for (image in chapterImages(chapterDir)) {
+            val name = image.name ?: continue
+            pageLock(image).withLock { recoverCapturedSourceLocked(chapterDir, image, name) }
+        }
         // Original restoration needs only a saved source. Each page validates that source;
         // optional OCR JSON/masks remain requirements of the text-removal path below.
         if (newMethod == ORIGINAL_METHOD) {
@@ -937,6 +1074,9 @@ class PageTranslator(private val context: Context) {
     ): Boolean = TranslationBusy.track { reRenderPageImpl(chapterDir, pageFileName, newMethod) }
 
     private suspend fun reRenderPageImpl(chapterDir: UniFile, pageFileName: String, newMethod: String): Boolean {
+        chapterDir.findFile(pageFileName)?.takeIf { it.isFile && it.name == pageFileName }?.let { page ->
+            pageLock(page).withLock { recoverCapturedSourceLocked(chapterDir, page, pageFileName) }
+        }
         // 原圖：用素材的原圖還原該頁，不需 lama / 排版 → 早於 lama 載入處理（避免為還原白載 ~100MB）。
         if (newMethod == ORIGINAL_METHOD) {
             val img = chapterDir.listFiles()
@@ -1037,6 +1177,10 @@ class PageTranslator(private val context: Context) {
         val images = listed
             .filter { f -> f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in IMAGE_EXT }
             .sortedBy { it.name.orEmpty() }
+        for (image in images) {
+            val name = image.name ?: continue
+            pageLock(image).withLock { recoverCapturedSourceLocked(chapterDir, image, name) }
+        }
         val total = images.size
 
         // 列一次素材夾（無素材夾＝沒東西可清、也沒有夜讀版；這裡只 find 不 create，全章新鮮時不必建夾），照
@@ -1056,9 +1200,20 @@ class PageTranslator(private val context: Context) {
         // 否則一次列目錄失敗會把整章的夜讀版刪光。
         val pageNames = listed.mapNotNullTo(HashSet()) { it.name }.takeIf { total > 0 || MATERIALS_DIR in it }
         val doomed = NightPages.cleanupPlan(matFiles.keys, pageNames)
-        for (n in doomed) {
-            runCatching { deleteFileOnly(matFiles.getValue(n), n) }
-                .onFailure { logcat(LogPriority.WARN, it) { "清夜讀殘留檔失敗 $n" } }
+        val cleanupDirectory = chapterDir.findFile(MATERIALS_DIR)
+        val cleanupOwners = doomed.groupBy { name ->
+            images.firstOrNull { name.startsWith("${it.name}.night") }
+        }
+        for ((owner, names) in cleanupOwners) {
+            fun cleanCurrent() {
+                val directory = cleanupDirectory ?: return
+                val currentNames = directory.listFiles()?.mapNotNullTo(mutableSetOf()) { it.name } ?: return
+                val stillDoomed = NightPages.cleanupPlan(currentNames, pageNames)
+                for (name in names) {
+                    if (name in stillDoomed) runCatching { deleteFileOnly(directory.findFile(name), name) }
+                }
+            }
+            if (owner == null) cleanCurrent() else pageLock(owner).withLock { cleanCurrent() }
         }
         // 已經不在這章的頁留下的夜讀文字框檔（[NightTextBoxes.orphans]；列目錄不可信時不清，同上）。只給夜讀用的檔，在這裡一起清。
         for (n in NightTextBoxes.orphans(matFiles.keys, pageNames)) {
@@ -1128,6 +1283,7 @@ class PageTranslator(private val context: Context) {
         }
 
         val chapter = NightChapter(
+            chapterDir = chapterDir,
             matDir = matDir,
             namesAtStart = HashSet(existing.keys),
             startedAt = startedAt,
@@ -1217,6 +1373,7 @@ class PageTranslator(private val context: Context) {
      * 鎖的順序＝這裡 → TranslationManager 的 lock（manager 不會回呼進來，不會死鎖）。
      */
     private class NightChapter(
+        val chapterDir: UniFile,
         val matDir: UniFile,
         /**
          * 開跑時（清完殘留後）`.yakuyomi/` 的夜讀最終檔與規則版本記號檔名，唯讀。彩頁略過時判這頁有沒有舊夜讀版要刪、
@@ -1332,6 +1489,8 @@ class PageTranslator(private val context: Context) {
      *     這頁的夜讀版照樣能看、但會顯示「可更新」，重試時重做。
      * **本函式不 suspend**：效能探針的 `thr=` 量的是同一條執行緒。
      */
+    private class ObsoleteNightSource : RuntimeException()
+
     private fun renderNightPage(
         job: NightJob,
         ticket: NightTicket<NightNets>,
@@ -1339,9 +1498,18 @@ class PageTranslator(private val context: Context) {
     ): NightPageOutcome {
         val img = job.img
         val name = job.name
-        val round = NightRound(chapter.matDir, name, chapter.webpFmt)
+        val round = NightRound(chapter.chapterDir, chapter.matDir, img, name, chapter.webpFmt)
         try {
-            val bounds = job.bounds ?: probeNightBounds(img) ?: throw IllegalStateException("頁圖解碼失敗")
+            val sourceLock = pageLock(img)
+            if (!sourceLock.tryLock(round)) return NightPageOutcome.DROPPED
+            val token = try {
+                sourceToken(chapter.chapterDir, img, name)
+            } finally {
+                sourceLock.unlock(round)
+            }
+            round.bindSource(token)
+            // The producer's budget probe can precede a recapture; decode using current bounds.
+            val bounds = probeNightBounds(img) ?: throw IllegalStateException("頁圖解碼失敗")
             // 過期競態的前置快照：decode 前記成品頁 (mtime, size)，寫完後再比（見下）。
             val stamp = img.lastModified() to img.length()
             TraceLog.log("night", "$name decode.start")
@@ -1364,8 +1532,14 @@ class PageTranslator(private val context: Context) {
                     // 這頁走到這裡＝它的夜讀版（若有）已不新鮮、被強制重做、或是舊規則產生的：照目前設定彩頁不該有夜讀版，
                     // 留著它就一直是舊版（章節列永遠「可更新」、一鍵更新也補不掉），所以一起刪掉（同作廢的順序）。
                     TraceLog.log("night", "$name SKIP colour page")
-                    if (NightPages.hasAnyArtifact(chapter.namesAtStart, name)) {
-                        deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
+                    if (!sourceLock.tryLock(round)) return NightPageOutcome.DROPPED
+                    try {
+                        if (sourceToken(chapter.chapterDir, img, name) != token) return NightPageOutcome.DROPPED
+                        if (NightPages.hasAnyArtifact(chapter.namesAtStart, name)) {
+                            deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
+                        }
+                    } finally {
+                        sourceLock.unlock(round)
                     }
                     chapter.pageDone(skip = true)
                     return NightPageOutcome.DONE
@@ -1449,7 +1623,13 @@ class PageTranslator(private val context: Context) {
                         // 1. 與前一檔相同（bmp == null；只會是更多）不存；有圖的檔位一律只寫暫存
                         if (bmp != null) {
                             val level = checkNotNull(NightLevel.ofTier(tier)) { "引擎交回非產品檔位 ${tier.key}" }
-                            round.write(level, bmp)
+                            if (!sourceLock.tryLock(round)) throw ObsoleteNightSource()
+                            try {
+                                if (sourceToken(chapter.chapterDir, img, name) != token) throw ObsoleteNightSource()
+                                round.write(level, bmp)
+                            } finally {
+                                sourceLock.unlock(round)
+                            }
                         }
                     }
                 } catch (t: Throwable) {
@@ -1467,54 +1647,69 @@ class PageTranslator(private val context: Context) {
             } finally {
                 page.recycle()
             }
-            // 3. 過期競態：產生期間成品頁被覆寫（重翻／重繪／即時翻落地）→ 剛寫的夜讀版是舊畫面，且它的 mtime 晚於覆寫、
-            // isFresh 會誤判新鮮；刪掉、記錯、不計 done，留待下次補做（覆寫端的 invalidateNightPage 可能搶在我們落地之前
-            // 跑、刪不到這份，所以這裡要自己驗；換檔前驗一次＝大多數情況連完成標記都不落地）。舊檔也一起刪：成品頁變了，
-            // 舊夜讀版同樣是舊畫面。
-            if (stamp != (img.lastModified() to img.length())) {
+            if (!sourceLock.tryLock(round)) {
                 round.discard()
-                deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
-                return nightPageStale(chapter, name)
+                return NightPageOutcome.DROPPED
             }
-            // 4. 換檔：刪舊 std→more（std 刪不掉就停）→ 新 more 改名 → 新 std 改名（完成標記）。舊檔刪不掉＝放棄這頁、記錯、
-            // 下次再做。
-            if (!round.commit()) {
-                round.discard()
-                TraceLog.log("night", "$name CLEAR FAILED old night files kept")
-                logcat(LogPriority.WARN) { "夜讀頁 $name 舊夜讀檔刪不掉，放棄這頁、留待下次補做" }
-                chapter.error("$name\t舊夜讀檔刪不掉，留待下次補做")
+            try {
+                if (sourceToken(chapter.chapterDir, img, name) != token) {
+                    round.discard()
+                    return NightPageOutcome.DROPPED
+                }
+                // 3. 過期競態：產生期間成品頁被覆寫（重翻／重繪／即時翻落地）→ 剛寫的夜讀版是舊畫面，且它的 mtime 晚於覆寫、
+                // isFresh 會誤判新鮮；刪掉、記錯、不計 done，留待下次補做（覆寫端的 invalidateNightPage 可能搶在我們落地之前
+                // 跑、刪不到這份，所以這裡要自己驗；換檔前驗一次＝大多數情況連完成標記都不落地）。舊檔也一起刪：成品頁變了，
+                // 舊夜讀版同樣是舊畫面。
+                if (stamp != (img.lastModified() to img.length())) {
+                    round.discard()
+                    deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
+                    return nightPageStale(chapter, name)
+                }
+                // 4. 換檔：刪舊 std→more（std 刪不掉就停）→ 新 more 改名 → 新 std 改名（完成標記）。舊檔刪不掉＝放棄這頁、記錯、
+                // 下次再做。
+                if (!round.commit()) {
+                    round.discard()
+                    TraceLog.log("night", "$name CLEAR FAILED old night files kept")
+                    logcat(LogPriority.WARN) { "夜讀頁 $name 舊夜讀檔刪不掉，放棄這頁、留待下次補做" }
+                    chapter.error("$name\t舊夜讀檔刪不掉，留待下次補做")
+                    return NightPageOutcome.DONE
+                }
+                // 5. 改名後再驗一次過期，然後刪舊格式
+                if (stamp != (img.lastModified() to img.length())) {
+                    deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
+                    return nightPageStale(chapter, name)
+                }
+                // 5b. 素材讀完之後才寫好（同章翻譯並行：頁檔在記快照之前已被覆蓋，遮罩／文字框或完整素材 json 卻還沒寫完）→
+                // 剛換好的夜讀版少了框（泡會維持灰底黑字），而且它比頁檔新、之後會一直被當成新鮮版。刪掉、留待下次補做。
+                // 只在讀素材之前翻譯正在跑、而且當時沒拿到可用的框時才查（[NightTextBoxes.appearedLate]），平常不多列素材夾。
+                if (translatingAtRead &&
+                    lateNightMaterials(chapter.matDir, name, pickSource, bounds.w, bounds.h, stamp.second)
+                ) {
+                    deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
+                    return nightPageStale(chapter, name, "翻譯素材在產生期間才寫好，留待下次補做")
+                }
+                // 完成標記落地 → 三檔格式與舊版單檔作廢（有 std 就只讀兩檔）。刪不掉也無害：不會再被顯示，下次開跑清掉。
+                deleteNightFiles(chapter.matDir, NightPages.oldFormatNames(name))
+                // 6. 規則版本記號：std 落地之後才寫（中途被殺＝新頁看起來像舊版、下次多做一次，不會讓舊頁冒充新版）
+                if (!writeRulesStamp(chapter, name)) {
+                    chapter.stampFailed("$name\t規則版本記號寫不出來（這頁會一直顯示可更新，這章標失敗、重試只補這種頁）")
+                }
+                val scaled = stats.scaledTo?.let { "${it.first}x${it.second}" } ?: "-"
+                val line = "detect=${stats.detectMs}ms mask=${stats.maskMs}ms render=${stats.renderMs}ms " +
+                    "decode=${decodeMs}ms encode=${round.encodeMs}ms tiers=[${stats.tierMs.orEmpty()}] " +
+                    "files=${round.written()} scaledTo=$scaled extraLines=$extraCount($extraFrom) inpaint=$inpaintDims"
+                val perf = "${ticket.describe()} ${probe.finish(context)} stages=[${stats.stagesMs.orEmpty()}]"
+                logcat { "夜讀 $name $line $perf" }
+                TraceLog.log("night", "$name done $line")
+                TraceLog.log("night", "$name perf $perf")
+                chapter.pageDone(skip = false)
                 return NightPageOutcome.DONE
+            } finally {
+                sourceLock.unlock(round)
             }
-            // 5. 改名後再驗一次過期，然後刪舊格式
-            if (stamp != (img.lastModified() to img.length())) {
-                deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
-                return nightPageStale(chapter, name)
-            }
-            // 5b. 素材讀完之後才寫好（同章翻譯並行：頁檔在記快照之前已被覆蓋，遮罩／文字框或完整素材 json 卻還沒寫完）→
-            // 剛換好的夜讀版少了框（泡會維持灰底黑字），而且它比頁檔新、之後會一直被當成新鮮版。刪掉、留待下次補做。
-            // 只在讀素材之前翻譯正在跑、而且當時沒拿到可用的框時才查（[NightTextBoxes.appearedLate]），平常不多列素材夾。
-            if (translatingAtRead &&
-                lateNightMaterials(chapter.matDir, name, pickSource, bounds.w, bounds.h, stamp.second)
-            ) {
-                deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
-                return nightPageStale(chapter, name, "翻譯素材在產生期間才寫好，留待下次補做")
-            }
-            // 完成標記落地 → 三檔格式與舊版單檔作廢（有 std 就只讀兩檔）。刪不掉也無害：不會再被顯示，下次開跑清掉。
-            deleteNightFiles(chapter.matDir, NightPages.oldFormatNames(name))
-            // 6. 規則版本記號：std 落地之後才寫（中途被殺＝新頁看起來像舊版、下次多做一次，不會讓舊頁冒充新版）
-            if (!writeRulesStamp(chapter, name)) {
-                chapter.stampFailed("$name\t規則版本記號寫不出來（這頁會一直顯示可更新，這章標失敗、重試只補這種頁）")
-            }
-            val scaled = stats.scaledTo?.let { "${it.first}x${it.second}" } ?: "-"
-            val line = "detect=${stats.detectMs}ms mask=${stats.maskMs}ms render=${stats.renderMs}ms " +
-                "decode=${decodeMs}ms encode=${round.encodeMs}ms tiers=[${stats.tierMs.orEmpty()}] " +
-                "files=${round.written()} scaledTo=$scaled extraLines=$extraCount($extraFrom) inpaint=$inpaintDims"
-            val perf = "${ticket.describe()} ${probe.finish(context)} stages=[${stats.stagesMs.orEmpty()}]"
-            logcat { "夜讀 $name $line $perf" }
-            TraceLog.log("night", "$name done $line")
-            TraceLog.log("night", "$name perf $perf")
-            chapter.pageDone(skip = false)
-            return NightPageOutcome.DONE
+        } catch (_: ObsoleteNightSource) {
+            round.discard()
+            return NightPageOutcome.DROPPED
         } catch (e: NcnnForwardAbortedException) {
             // 推論前／等鎖時放棄（暫停／取消，或讓路時不是最早那頁）：同重繪前放棄，丟回待做（page 已由 finally recycle；
             // 推論階段還沒刪舊檔、也沒寫新檔）
@@ -1616,10 +1811,18 @@ class PageTranslator(private val context: Context) {
      * 失敗時 [discard] 刪掉這一輪的暫存（與換檔途中已改名的 more），不留半套。
      */
     private inner class NightRound(
+        private val chapterDir: UniFile,
         private val matDir: UniFile,
+        private val sourcePage: UniFile,
         private val page: String,
         private val format: Bitmap.CompressFormat,
     ) {
+        private var expectedSourceToken: SourceToken? = null
+
+        fun bindSource(token: SourceToken) {
+            expectedSourceToken = token
+        }
+
         /** 已寫好暫存、還沒改名的檔位。 */
         private val tmps = ArrayList<NightLevel>(2)
 
@@ -1665,15 +1868,28 @@ class PageTranslator(private val context: Context) {
 
         /** 刪掉這一輪的暫存與換檔途中已改名的 more（best-effort）。可重複呼叫。 */
         fun discard() {
-            tmps.forEach { level ->
-                deleteFileOnly(
-                    matDir.findFile(NightPages.tmpName(NightPages.levelName(page, level))),
-                    NightPages.tmpName(NightPages.levelName(page, level)),
-                )
+            val lock = pageLock(sourcePage)
+            val alreadyHeld = lock.holdsLock(this)
+            if (!alreadyHeld && !lock.tryLock(this)) return
+            try {
+                val expected = expectedSourceToken ?: return
+                if (runCatching { sourceToken(chapterDir, sourcePage, page) }.getOrNull() != expected) {
+                    tmps.clear()
+                    finals.clear()
+                    return
+                }
+                tmps.forEach { level ->
+                    deleteFileOnly(
+                        matDir.findFile(NightPages.tmpName(NightPages.levelName(page, level))),
+                        NightPages.tmpName(NightPages.levelName(page, level)),
+                    )
+                }
+                tmps.clear()
+                finals.forEach { n -> deleteFileOnly(matDir.findFile(n), n) }
+                finals.clear()
+            } finally {
+                if (!alreadyHeld) lock.unlock(this)
             }
-            tmps.clear()
-            finals.forEach { n -> deleteFileOnly(matDir.findFile(n), n) }
-            finals.clear()
         }
 
         /** 寫出的檔位（log 用），例如 `std,more`。 */
@@ -1976,6 +2192,7 @@ class PageTranslator(private val context: Context) {
     ): Boolean {
         val name = img.name ?: return false
         return pageLock(img).withLock {
+            recoverCapturedSourceLocked(chapterDir, img, name)
             reRenderOnePageLocked(chapterDir, matDir, img, name, newMethod, inpainter, renderCfg)
         }
     }
@@ -2266,6 +2483,9 @@ class PageTranslator(private val context: Context) {
 
     /** Authoritative processing state: unreadable storage cannot authorize inference or replacement. */
     private fun readDonePages(chapterDir: UniFile): Set<String> {
+        check(capturedStore(chapterDir)?.pendingPages().isNullOrEmpty()) {
+            "Captured source recovery is required before reading completion"
+        }
         val legacy = CompletionManifestCodec.resolve(readManifestFiles(chapterDir))
         return partialStore(chapterDir)?.applyDoneOverlay(legacy) ?: legacy
     }
@@ -2756,6 +2976,7 @@ class PageTranslator(private val context: Context) {
     /** Read-only original lookup for reader comparison, independent of optional OCR materials. */
     fun originalForPreview(chapterDir: UniFile, pageName: String): UniFile? {
         if (pageName.isBlank() || pageName.any { it == '/' || it == '\\' || it == '\u0000' }) return null
+        if (runCatching { capturedStore(chapterDir)?.sourceEpoch(pageName) }.isFailure) return null
         val matDir = chapterDir.findFile(MATERIALS_DIR)?.takeIf { it.isDirectory } ?: return null
         val original = findOriginalMaterial(matDir, pageName)?.first ?: return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -3021,6 +3242,11 @@ class PageTranslator(private val context: Context) {
          * 只擋同一頁（雜湊撞條的頁偶爾互等一下，無害），別頁照樣並發。拿鎖順序固定：頁鎖 → 章內狀態鎖 → manifest 鎖。
          */
         private val pageLocks = Array(32) { Mutex() }
+
+        // Only explicitly recaptured pages get an entry; ordinary inference does not grow this map.
+        private val captureFences = ConcurrentHashMap<String, Long>()
+        private val captureFenceSequence = AtomicLong()
+        private val CAPTURE_PNG_SIGNATURE = byteArrayOf(-119, 80, 78, 71, 13, 10, 26, 10)
 
         private fun pageLock(pageFile: UniFile): Mutex = pageLocks[pageFile.uri.hashCode().mod(pageLocks.size)]
 

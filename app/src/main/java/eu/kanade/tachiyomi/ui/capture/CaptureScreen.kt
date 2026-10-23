@@ -25,9 +25,11 @@ import eu.kanade.domain.ui.UiPreferences
 import eu.kanade.presentation.capture.CaptureReviewScreenContent
 import eu.kanade.presentation.capture.CaptureScreenContent
 import eu.kanade.presentation.util.Screen
+import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.ui.manga.MangaScreen
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import eu.kanade.tachiyomi.util.system.toast
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -48,6 +50,7 @@ import tachiyomi.domain.storage.service.StorageManager
 import tachiyomi.i18n.MR
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import kotlin.coroutines.resume
 import kotlin.math.abs
@@ -713,6 +716,23 @@ class CaptureViewModel(
         }
     }
 
+    /** Encode the new source before the replacement transaction can touch any existing file. */
+    private fun encodeReCapture(bitmap: Bitmap, url: String?): ByteArray {
+        val setting = settingForSave(url)
+        val cropped = cropForSave(bitmap, setting)
+        var out = cropped
+        try {
+            if (setting.autoTrim) out = autoTrimForSave(cropped)
+            return ByteArrayOutputStream().use { output ->
+                check(out.compress(Bitmap.CompressFormat.PNG, 100, output)) { "Cannot encode captured page" }
+                output.toByteArray().also { check(it.isNotEmpty()) { "Captured page is empty" } }
+            }
+        } finally {
+            if (out !== cropped && out !== bitmap && !out.isRecycled) out.recycle()
+            if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+        }
+    }
+
     /**
      * 掃 `<local>/<safeBook>/` 下的**話夾名稱**（給「新話數」panel 的「已截話數總覽 + 話數建議」用）。
      * 只列目錄、不看內容；書名空 / 該書還沒有夾子 / local 目錄不可用 → 空清單。
@@ -1152,7 +1172,7 @@ class CaptureViewModel(
         safeChapter: String,
         pageName: String,
     ): CaptureSaveResult = withIOContext {
-        runCatching {
+        try {
             val base = storageManager.getLocalSourceDirectory()
                 ?: throw CaptureSaveException(CaptureSaveError.NO_STORAGE)
             val mangaDir = base.findFile(safeBook)?.takeIf { it.isDirectory }
@@ -1160,17 +1180,24 @@ class CaptureViewModel(
             val chapterDir = mangaDir.findFile(safeChapter)?.takeIf { it.isDirectory }
                 ?: throw CaptureSaveException(CaptureSaveError.CHAPTER_DIR)
 
-            val file = chapterDir.findFile(pageName)
-                ?: chapterDir.createFile(pageName)
+            val file = chapterDir.findFile(pageName)?.takeIf { it.isFile && it.name == pageName }
                 ?: throw CaptureSaveException(CaptureSaveError.WRITE)
-            writePage(file, bitmap, url)
+            val encoded = encodeReCapture(bitmap, url)
+            PageTranslator(context).replaceCapturedSource(chapterDir, pageName, encoded)
 
             val page = pageName.substringBeforeLast('.').toIntOrNull() ?: 0
-            updateMetaUrl(chapterDir, page, url)
-            // 安全網同 [saveCapture]：純靠重截補頁的書也要有漫畫層 meta（否則「繼續擷取」開不回原站）。
-            ensureMangaMeta(mangaDir, url)
+            // URL metadata is best-effort; failure after a committed source must not report that
+            // the image replacement failed. Cancellation still propagates to the capture caller.
+            runCatching {
+                updateMetaUrl(chapterDir, page, url)
+                ensureMangaMeta(mangaDir, url)
+            }.onFailure { if (it is CancellationException) throw it }
             CaptureSaveResult.Saved(page, file.uri.toString())
-        }.getOrElse { it.toCaptureFailure() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            failure.toCaptureFailure()
+        }
     }
 
     /**
