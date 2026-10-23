@@ -383,16 +383,17 @@ private fun MangaScreenSmallImpl(
             val isFABVisible = remember(chapters) {
                 chapters.fastAny { !it.chapter.read } && !isAnySelected
             }
+            val isReading = remember(state.chapters) {
+                state.chapters.fastAny { it.chapter.read }
+            }
+            val readingActionLabel = stringResource(
+                if (isReading) MR.strings.action_resume else MR.strings.action_start,
+            )
             SmallExtendedFloatingActionButton(
-                text = {
-                    val isReading = remember(state.chapters) {
-                        state.chapters.fastAny { it.chapter.read }
-                    }
-                    Text(
-                        text = stringResource(if (isReading) MR.strings.action_resume else MR.strings.action_start),
-                    )
+                text = { Text(text = readingActionLabel) },
+                icon = {
+                    Icon(imageVector = Icons.Filled.PlayArrow, contentDescription = readingActionLabel)
                 },
-                icon = { Icon(imageVector = Icons.Filled.PlayArrow, contentDescription = null) },
                 onClick = onContinueReading,
                 expanded = chapterListState.shouldExpandFAB(),
                 modifier = Modifier.animateFloatingActionButton(
@@ -639,18 +640,17 @@ fun MangaScreenLargeImpl(
             val isFABVisible = remember(chapters) {
                 chapters.fastAny { !it.chapter.read } && !isAnySelected
             }
+            val isReading = remember(state.chapters) {
+                state.chapters.fastAny { it.chapter.read }
+            }
+            val readingActionLabel = stringResource(
+                if (isReading) MR.strings.action_resume else MR.strings.action_start,
+            )
             SmallExtendedFloatingActionButton(
-                text = {
-                    val isReading = remember(state.chapters) {
-                        state.chapters.fastAny { it.chapter.read }
-                    }
-                    Text(
-                        text = stringResource(
-                            if (isReading) MR.strings.action_resume else MR.strings.action_start,
-                        ),
-                    )
+                text = { Text(text = readingActionLabel) },
+                icon = {
+                    Icon(imageVector = Icons.Filled.PlayArrow, contentDescription = readingActionLabel)
                 },
-                icon = { Icon(imageVector = Icons.Filled.PlayArrow, contentDescription = null) },
                 onClick = onContinueReading,
                 expanded = chapterListState.shouldExpandFAB(),
                 modifier = Modifier.animateFloatingActionButton(
