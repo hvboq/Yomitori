@@ -266,7 +266,7 @@ class PageTranslator(private val context: Context) {
 
     private fun sourceToken(chapterDir: UniFile, page: UniFile, name: String): SourceToken = SourceToken(
         capturedStore(chapterDir)?.sourceEpoch(name),
-        captureFences[page.uri.toString()] ?: 0L,
+        captureFences[PageIdentity.fromUri(page.uri)] ?: 0L,
     )
 
     private fun verifySourceToken(chapterDir: UniFile, page: UniFile, name: String, expected: SourceToken) {
@@ -277,7 +277,7 @@ class PageTranslator(private val context: Context) {
     private suspend fun recoverCapturedSourceLocked(chapterDir: UniFile, page: UniFile, name: String) {
         val store = capturedStore(chapterDir) ?: return
         if (!store.hasPending(name)) return
-        captureFences[page.uri.toString()] = captureFenceSequence.incrementAndGet()
+        captureFences[PageIdentity.fromUri(page.uri)] = captureFenceSequence.incrementAndGet()
         withContext(NonCancellable) {
             manifestMutex.withLock {
                 store.recover(name) { complete -> setCapturedPageCompletionLocked(chapterDir, name, complete) }
@@ -322,7 +322,7 @@ class PageTranslator(private val context: Context) {
                 ?.takeIf { it.isFile && it.name == pageName }
                 ?: throw java.io.IOException("Existing capture page is missing")
             pageLock(page).withLock {
-                captureFences[page.uri.toString()] = captureFenceSequence.incrementAndGet()
+                captureFences[PageIdentity.fromUri(page.uri)] = captureFenceSequence.incrementAndGet()
                 recoverCapturedSourceLocked(chapterDir, page, pageName)
                 // These legacy sidecars share a basename. Never retire another page's materials.
                 check(
@@ -3244,11 +3244,12 @@ class PageTranslator(private val context: Context) {
         private val pageLocks = Array(32) { Mutex() }
 
         // Only explicitly recaptured pages get an entry; ordinary inference does not grow this map.
-        private val captureFences = ConcurrentHashMap<String, Long>()
+        private val captureFences = ConcurrentHashMap<PageIdentity, Long>()
         private val captureFenceSequence = AtomicLong()
         private val CAPTURE_PNG_SIGNATURE = byteArrayOf(-119, 80, 78, 71, 13, 10, 26, 10)
 
-        private fun pageLock(pageFile: UniFile): Mutex = pageLocks[pageFile.uri.hashCode().mod(pageLocks.size)]
+        private fun pageLock(pageFile: UniFile): Mutex =
+            pageLocks[PageIdentity.fromUri(pageFile.uri).hashCode().mod(pageLocks.size)]
 
         /**
          * 重繪的「原圖」方法：用素材的原圖還原該頁（不去字/不排版、不載 lama）；有原檔就位元組原樣寫回，只有舊版 WebP
