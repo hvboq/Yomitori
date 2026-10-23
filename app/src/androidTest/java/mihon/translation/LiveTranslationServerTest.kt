@@ -11,7 +11,9 @@ import com.hippo.unifile.UniFile
 import eu.kanade.tachiyomi.data.translation.PageMaterials
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import li.joye.yakuyomi.engine.LlmModels
@@ -51,15 +53,28 @@ class LiveTranslationServerTest {
 
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val prefs = Injekt.get<TranslationPreferences>()
-        val restore = mutableListOf<Pair<Boolean, () -> Unit>>()
+        val restore = mutableListOf<PreferenceRestore>()
         fun <T> set(preference: Preference<T>, value: T, permanent: Boolean = false) {
             val wasSet = preference.isSet()
             val previous = preference.get()
-            restore += permanent to { if (wasSet) preference.set(previous) else preference.delete() }
+            restore += PreferenceRestore(
+                permanent = permanent,
+                restore = { if (wasSet) preference.set(previous) else preference.delete() },
+                verifyValue = {
+                    // Boolean assertions never print prior values, endpoints, or credentials.
+                    assertTrue("Temporary preference value was not restored", preference.get() == previous)
+                },
+                verifyPresence = {
+                    assertTrue("Temporary preference presence was not restored", preference.isSet() == wasSet)
+                },
+            )
             preference.set(value)
         }
 
         var succeeded = false
+        var failure: Throwable? = null
+        var result: Pair<File, JSONObject>? = null
+        var restoredPreferenceCount = 0
         try {
             set(prefs.apiKeyFor("custom"), "", permanent = true)
             set(prefs.apiBase, base, permanent = true)
@@ -122,18 +137,63 @@ class LiveTranslationServerTest {
                         regions.forEach { put(JSONObject().put("source", it.source).put("target", it.target)) }
                     },
                 )
-            File(output, "result.json").writeText(report.toString(2))
-            println("LIVE_TRANSLATION_RESULT=${output.absolutePath}")
-            println(report.toString(2))
+            result = output to report
             succeeded = true
+        } catch (caught: Throwable) {
+            failure = caught
+            throw caught
         } finally {
-            try {
-                Injekt.get<TranslationEngineService>().shutdown()
-            } finally {
-                restore.asReversed().forEach { (permanent, action) ->
-                    if (!(permanent && keepSettings && succeeded)) action()
+            val cleanupFailures = mutableListOf<Throwable>()
+            withContext(NonCancellable) {
+                try {
+                    Injekt.get<TranslationEngineService>().shutdown()
+                } catch (caught: Throwable) {
+                    cleanupFailures += caught
+                }
+                val temporary = restore.asReversed().filterNot { it.permanent && keepSettings && succeeded }
+                fun attempt(label: String, action: () -> Unit) {
+                    try {
+                        action()
+                    } catch (_: Throwable) {
+                        // Preference exceptions may contain sensitive values; keep only the stage.
+                        cleanupFailures += AssertionError(label)
+                    }
+                }
+                temporary.forEachIndexed { index, saved ->
+                    attempt("Live translation preference restore failed at slot $index", saved.restore)
+                }
+                temporary.forEachIndexed { index, saved ->
+                    attempt("Live translation preference value check failed at slot $index", saved.verifyValue)
+                    attempt("Live translation preference presence check failed at slot $index", saved.verifyPresence)
+                }
+                restoredPreferenceCount = temporary.size
+            }
+            val originalFailure = failure
+            if (originalFailure != null) {
+                cleanupFailures.forEach(originalFailure::addSuppressed)
+            } else if (cleanupFailures.isNotEmpty()) {
+                throw AssertionError("Live translation fixture cleanup failed").apply {
+                    cleanupFailures.forEach(::addSuppressed)
                 }
             }
         }
+        val (output, report) = requireNotNull(result)
+        report.put("temporaryPreferencesRestored", true)
+            .put("temporaryPreferenceValuesVerified", true)
+            .put("temporaryPreferencePresenceVerified", true)
+            .put("restoredPreferenceCount", restoredPreferenceCount)
+            .put("retainedPreferenceCount", restore.size - restoredPreferenceCount)
+            .put("translationSettingsIntentionallyRetained", keepSettings && succeeded)
+            .put("engineShutdownCompleted", true)
+        File(output, "result.json").writeText(report.toString(2))
+        println("LIVE_TRANSLATION_RESULT=${output.absolutePath}")
+        println(report.toString(2))
     }
+
+    private data class PreferenceRestore(
+        val permanent: Boolean,
+        val restore: () -> Unit,
+        val verifyValue: () -> Unit,
+        val verifyPresence: () -> Unit,
+    )
 }

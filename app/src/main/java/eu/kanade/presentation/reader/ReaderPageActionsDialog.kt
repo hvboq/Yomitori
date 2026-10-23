@@ -254,13 +254,16 @@ private fun SetCoverDialog(
 fun ReRenderMethodDialog(
     onDismissRequest: () -> Unit,
     onSelect: (String) -> Unit,
+    allowReRender: Boolean = true,
 ) {
     // 顯示名 → 去字法字串（與設定頁/引擎 when 映射一致）；「原圖」＝用素材還原未翻原圖（不去字、不載 lama）。
-    val options = listOf(
-        stringResource(MR.strings.rerender_boxfill) to "boxfill",
-        stringResource(MR.strings.rerender_auto_whole) to "auto_whole",
-        stringResource(MR.strings.rerender_original) to "original",
-    )
+    val options = buildList {
+        if (allowReRender) {
+            add(stringResource(MR.strings.rerender_boxfill) to "boxfill")
+            add(stringResource(MR.strings.rerender_auto_whole) to "auto_whole")
+        }
+        add(stringResource(MR.strings.rerender_original) to "original")
+    }
     AlertDialog(
         onDismissRequest = onDismissRequest,
         title = { Text(text = stringResource(MR.strings.rerender_method_title)) },

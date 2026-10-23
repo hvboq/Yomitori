@@ -967,6 +967,7 @@
     <string name="reader_original_preview_summary">저장된 번역을 유지하며 원문과 비교합니다.</string>
     <string name="reader_original_preview_unavailable">이 페이지에 읽을 수 있는 원본이 저장되어 있지 않습니다.</string>
     <string name="reader_translate_page_partial">일부 글자를 인식하지 못했습니다. 성공한 번역은 저장했으며 다시 시도해 이 페이지를 마칠 수 있습니다.</string>
+    <string name="reader_translate_page_source_ambiguous">번역 기록이 없어 저장된 원본이 현재 페이지의 원본인지 확인할 수 없습니다. 재식자 메뉴에서 원본을 복원한 뒤 번역을 다시 시도하세요.</string>
     <string name="pref_translation_live_inpaint_method">읽는 중 원문 제거</string>
     <string name="pref_translation_live_inpaint_summary">AI 배경 복원은 원문 뒤의 배경을 복원합니다. 빠른 채우기는 단색 배경에서 처리 시간을 줄이는 데 적합합니다.</string>
 </resources>

@@ -1597,6 +1597,7 @@
     <string name="reader_rerender_failed">Re-render failed (no materials or error)</string>
     <string name="reader_rerender_no_materials">This page has no re-render materials (\"Keep re-render materials\" was off when it was translated), so it can\'t be re-rendered or restored to the original</string>
     <string name="reader_translate_page_no_original">This page is already translated and its original wasn\'t kept, so it can\'t be translated again</string>
+    <string name="reader_translate_page_source_ambiguous">The saved original cannot be matched to this page because its translation records are missing. Restore the original from the re-render menu, then retry translation.</string>
     <string name="reader_translate_page_too_large">This page is too large to translate (over 40 megapixels). The original is kept</string>
     <string name="reader_translating_page">Translating this page…</string>
     <string name="reader_translate_page_done">Page translated</string>

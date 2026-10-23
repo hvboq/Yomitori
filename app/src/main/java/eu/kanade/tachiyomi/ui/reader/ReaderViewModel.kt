@@ -1768,10 +1768,9 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     /**
-     * 開「重繪當頁」去字法選擇對話框（由頁動作對話框的「重繪」鈕觸發、帶著該頁）。先查這頁有沒有重繪素材
-     * （[PageTranslator.hasReRenderMaterials]：完整素材 json＋原圖）：沒有（翻譯時沒開「保留重繪素材」、只存了夜讀素材）
-     * 就不開對話框、提示一句（[Event.ReRenderNoMaterials]）——重繪與「原圖（還原未翻）」都做不到，別讓使用者選了方法、
-     * 等模型載完才看到「重繪失敗」。查不到章節夾／頁檔時照舊開（交給重繪本身回報）。
+     * Offer text-removal methods only when complete re-render materials exist. A readable saved
+     * original alone still permits restoration, even if OCR materials and completion records were
+     * lost. Keep the existing fallback when the chapter directory or page cannot be resolved.
      */
     fun openReRenderDialog(page: ReaderPage) {
         viewModelScope.launchIO {
@@ -1782,12 +1781,25 @@ class ReaderViewModel @JvmOverloads constructor(
                 logcat(LogPriority.WARN, e) { "查重繪素材失敗" }
                 null
             }
-            if (target != null && !pageTranslator.hasReRenderMaterials(target.first, target.second)) {
-                closeDialog()
-                eventChannel.send(Event.ReRenderNoMaterials)
-                return@launchIO
+            var allowReRender = true
+            if (target != null) {
+                allowReRender = pageTranslator.hasReRenderMaterials(target.first, target.second)
+                if (!allowReRender) {
+                    val hasOriginal = try {
+                        pageTranslator.originalForPreview(target.first, target.second) != null
+                    } catch (e: Throwable) {
+                        if (e is CancellationException) throw e
+                        logcat(LogPriority.WARN, e) { "Checking saved original for restoration failed" }
+                        false
+                    }
+                    if (!hasOriginal) {
+                        closeDialog()
+                        eventChannel.send(Event.ReRenderNoMaterials)
+                        return@launchIO
+                    }
+                }
             }
-            mutableState.update { it.copy(dialog = Dialog.ReRenderMethod(page)) }
+            mutableState.update { it.copy(dialog = Dialog.ReRenderMethod(page, allowReRender)) }
         }
     }
 
@@ -1948,7 +1960,9 @@ class ReaderViewModel @JvmOverloads constructor(
      * 線上/封存頁無素材 → reRenderPage 回 false → 走「重新顯示原圖 + 提示失敗」路徑。
      */
     fun reRenderPage(method: String) {
-        val selected = (state.value.dialog as? Dialog.ReRenderMethod)?.page ?: return
+        val dialog = state.value.dialog as? Dialog.ReRenderMethod ?: return
+        if (!dialog.allowReRender && method != "original") return
+        val selected = dialog.page
         val page = (selected as? InsertPage)?.parent ?: selected
         closeDialog()
         if (!translationPreferences.translationMasterEnabled.get()) return // 硬總開關：關時不重繪、不載引擎
@@ -2057,6 +2071,8 @@ class ReaderViewModel @JvmOverloads constructor(
                     PageTranslator.SinglePageResult.NOT_TRANSLATED -> finish(false)
                     // 已翻過、沒有原圖素材（只存夜讀素材的頁）：什麼都沒動，說清楚為什麼不翻、別冒充「翻譯失敗」
                     PageTranslator.SinglePageResult.NO_ORIGINAL -> finish(false, Event.TranslatePageNoOriginal)
+                    PageTranslator.SinglePageResult.SOURCE_AMBIGUOUS ->
+                        finish(false, Event.TranslatePageSourceAmbiguous)
                     // 頁圖超過像素上限：沒翻、原圖沒動，說清楚原因
                     PageTranslator.SinglePageResult.TOO_LARGE -> finish(false, Event.TranslatePageTooLarge)
                 }
@@ -2329,7 +2345,7 @@ class ReaderViewModel @JvmOverloads constructor(
         data class PageActions(val page: ReaderPage) : Dialog
 
         /** 重繪當頁去字法選擇對話框（帶著要重繪的頁）。 */
-        data class ReRenderMethod(val page: ReaderPage) : Dialog
+        data class ReRenderMethod(val page: ReaderPage, val allowReRender: Boolean = true) : Dialog
 
         /** Yakuyomi：reader 內章節清單（點章跳轉，不離開 reader）。 */
         data object ChapterList : Dialog
@@ -2360,13 +2376,16 @@ class ReaderViewModel @JvmOverloads constructor(
         /** 重繪當頁結果（true＝成功覆蓋並刷新／false＝無素材或失敗），給 UI 提示。 */
         data class ReRenderResult(val success: Boolean) : Event
 
-        /** 這頁沒有重繪素材（翻譯時沒開保留素材、只存了夜讀素材）：不開重繪對話框，提示重繪與還原原圖都做不到。 */
+        /** Neither complete re-render materials nor a readable saved original are available. */
         data object ReRenderNoMaterials : Event
 
         data object OriginalPreviewUnavailable : Event
 
         /** 「翻譯這頁」拒絕：這頁已翻過、沒有原圖素材（頁檔就是譯圖），再翻沒有意義。什麼都沒動。 */
         data object TranslatePageNoOriginal : Event
+
+        /** Saved original exists, but missing records cannot establish the displayed page's source. */
+        data object TranslatePageSourceAmbiguous : Event
 
         /** 「翻譯這頁」沒翻：頁圖超過像素上限（[eu.kanade.tachiyomi.data.translation.PageSizeCap]），原圖沒動。 */
         data object TranslatePageTooLarge : Event

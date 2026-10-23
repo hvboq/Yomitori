@@ -196,6 +196,263 @@ class StoredPageContextIntegrationTest {
         }
     }
 
+    @Test
+    fun orphanExactAndLegacyOriginalsWithDifferentDisplayFailBeforeInference() = runBlocking {
+        for (legacy in listOf(false, true)) {
+            withSourceProtectionFixture { fixture ->
+                check(fixture.materials.mkdir())
+                val original = File(fixture.materials, if (legacy) "001.orig.webp" else "001.orig.png")
+                original.writeBytes(if (legacy) encodedWebp(Color.WHITE) else fixture.initialBytes)
+                fixture.page.writeBytes(encoded(Color.BLACK))
+                File(fixture.directory, "002.png").writeBytes(encoded(Color.BLUE))
+                File(fixture.materials, "unrelated.txt").writeText("neutral unrelated material")
+                assertEquals(setOf(original.name, "unrelated.txt"), fixture.materials.list()!!.toSet())
+                assertEquals(setOf(PAGE, "002.png", ".yakuyomi"), fixture.directory.list()!!.toSet())
+                val calls = AtomicInteger()
+                fixture.select(object : TranslationEngine {
+                    override val translationContext = semantic("Korean")
+                    override suspend fun translatePage(page: Bitmap): PageResult {
+                        calls.incrementAndGet()
+                        return PageResult.Translated(image(Color.GREEN), stats(0))
+                    }
+                    override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult {
+                        calls.incrementAndGet()
+                        error("An orphan original has no pending journal")
+                    }
+                    override fun warmUp() = Unit
+                    override fun close() = Unit
+                })
+                val before = protectedFileHashes(fixture.directory)
+                val actual = fixture.translate()
+                val after = protectedFileHashes(fixture.directory)
+                assertEquals(
+                    "legacy=$legacy, calls=${calls.get()}, protectedFilesUnchanged=${before == after}",
+                    "SOURCE_AMBIGUOUS",
+                    actual.name,
+                )
+                assertEquals("Unproven displayed pixels must never reach inference", 0, calls.get())
+                assertEquals("Source, current display and unrelated files must stay byte-identical", before, after)
+                assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+            }
+        }
+    }
+
+    @Test
+    fun orphanExactOriginalIdenticalToDisplayCanTranslateWithoutReplacingSource() = runBlocking {
+        withSourceProtectionFixture { fixture ->
+            check(fixture.materials.mkdir())
+            val original = File(fixture.materials, "001.orig.png").apply { writeBytes(fixture.initialBytes) }
+            File(fixture.materials, "unrelated.txt").writeText("neutral unrelated material")
+            val unrelated = File(fixture.materials, "unrelated.txt").readBytes()
+            assertArrayEquals(original.readBytes(), fixture.page.readBytes())
+            val sourceHash = decodedPixelHash(original)
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    assertEquals(sourceHash, pixelHash(page))
+                    return PageResult.Translated(image(Color.GREEN), stats(0))
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A matching orphan source requires fresh inference")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertEquals(1, calls.get())
+            assertArrayEquals(fixture.initialBytes, original.readBytes())
+            assertArrayEquals(unrelated, File(fixture.materials, "unrelated.txt").readBytes())
+            assertSolidPage(fixture.page, Color.GREEN)
+            assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+        }
+    }
+
+    @Test
+    fun exactOriginalWithoutOptionalMaterialsCanRestoreThenTranslateFresh() = runBlocking {
+        withSourceProtectionFixture { fixture ->
+            check(fixture.materials.mkdir())
+            val original = File(fixture.materials, "001.orig.png").apply { writeBytes(fixture.initialBytes) }
+            fixture.page.writeBytes(encoded(Color.BLACK))
+            File(fixture.directory, "002.png").writeBytes(encoded(Color.BLUE))
+            File(fixture.materials, "unrelated.txt").writeText("neutral unrelated material")
+            val sourceHash = decodedPixelHash(original)
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    assertEquals(
+                        "The restored preserved source must be freshly recognized",
+                        sourceHash,
+                        pixelHash(page),
+                    )
+                    return PageResult.Translated(image(Color.GREEN), stats(0))
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("An original-only restore has no pending OCR progress")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertEquals(setOf("001.orig.png", "unrelated.txt"), fixture.materials.list()!!.toSet())
+            val before = protectedFileHashes(fixture.directory)
+            assertTrue(fixture.translator.reRenderPage(fixture.chapter, PAGE, "original"))
+            assertEquals("Restoring an original must not invoke inference", 0, calls.get())
+            assertArrayEquals(fixture.initialBytes, original.readBytes())
+            assertArrayEquals(original.readBytes(), fixture.page.readBytes())
+            val afterRestore = protectedFileHashes(fixture.directory)
+            for ((name, hash) in before) {
+                if (name != PAGE) assertEquals(name, hash, afterRestore[name])
+            }
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertEquals(1, calls.get())
+            assertArrayEquals(fixture.initialBytes, original.readBytes())
+            for ((name, hash) in before) {
+                if (name != PAGE) assertEquals(name, hash, protectedFileHashes(fixture.directory)[name])
+            }
+            assertSolidPage(fixture.page, Color.GREEN)
+            assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+        }
+    }
+
+    @Test
+    fun legacyWebpOriginalWithoutOptionalMaterialsRestoresPngThenTranslatesFresh() = runBlocking {
+        withSourceProtectionFixture { fixture ->
+            check(fixture.materials.mkdir())
+            val sourceBytes = encodedWebp(Color.WHITE)
+            val original = File(fixture.materials, "001.orig.webp").apply { writeBytes(sourceBytes) }
+            fixture.page.writeBytes(encoded(Color.BLACK))
+            File(fixture.directory, "002.png").writeBytes(encoded(Color.BLUE))
+            File(fixture.materials, "unrelated.txt").writeText("neutral unrelated material")
+            val sourceHash = decodedPixelHash(original)
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    assertEquals("Fresh inference must retain the legacy source pixels", sourceHash, pixelHash(page))
+                    return PageResult.Translated(image(Color.GREEN), stats(0))
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A legacy source-only restore has no pending OCR progress")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertEquals(setOf("001.orig.webp", "unrelated.txt"), fixture.materials.list()!!.toSet())
+            val before = protectedFileHashes(fixture.directory)
+            assertTrue(fixture.translator.reRenderPage(fixture.chapter, PAGE, "original"))
+            assertEquals("Restoring legacy pixels must not invoke inference", 0, calls.get())
+            assertArrayEquals(sourceBytes, original.readBytes())
+            val restoredBytes = fixture.page.readBytes()
+            assertArrayEquals(
+                byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+                restoredBytes.copyOfRange(0, 8),
+            )
+            assertEquals(
+                "A PNG page must decode to every preserved legacy pixel",
+                sourceHash,
+                decodedPixelHash(fixture.page),
+            )
+            assertFalse(File(fixture.materials, "001.orig.png").exists())
+            for ((name, hash) in before) {
+                if (name != PAGE) assertEquals(name, hash, protectedFileHashes(fixture.directory)[name])
+            }
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertEquals(1, calls.get())
+            assertArrayEquals("The legacy source must not be re-encoded or deleted", sourceBytes, original.readBytes())
+            assertFalse(
+                "Fresh translation must not promote a PNG copy over the legacy source",
+                File(fixture.materials, "001.orig.png").exists(),
+            )
+            for ((name, hash) in before) {
+                if (name != PAGE) assertEquals(name, hash, protectedFileHashes(fixture.directory)[name])
+            }
+            assertSolidPage(fixture.page, Color.GREEN)
+            assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+        }
+    }
+
+    @Test
+    fun originalRestoreMissingCorruptOrReservedDirectoryFailsWithoutChangingFiles() = runBlocking {
+        for (invalid in listOf("missing", "corrupt-exact", "corrupt-legacy", "directory-exact", "directory-legacy")) {
+            withSourceProtectionFixture { fixture ->
+                check(fixture.materials.mkdir())
+                fixture.page.writeBytes(encoded(Color.BLACK))
+                File(fixture.directory, "002.png").writeBytes(encoded(Color.BLUE))
+                File(fixture.materials, "unrelated.txt").writeText("neutral unrelated material")
+                val original = File(
+                    fixture.materials,
+                    if (invalid.endsWith("legacy")) "001.orig.webp" else "001.orig.png",
+                )
+                when {
+                    invalid.startsWith("corrupt") -> original.writeBytes(byteArrayOf(1, 2, 3))
+                    invalid.startsWith("directory") -> {
+                        check(original.mkdir())
+                        File(original, "unowned.txt").writeText("preserve this reserved-name directory")
+                    }
+                }
+                val calls = AtomicInteger()
+                fixture.select(object : TranslationEngine {
+                    override val translationContext = semantic("Korean")
+                    override suspend fun translatePage(page: Bitmap): PageResult {
+                        calls.incrementAndGet()
+                        error("An original restore must never run inference")
+                    }
+                    override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult {
+                        calls.incrementAndGet()
+                        error("An original restore must never resume inference")
+                    }
+                    override fun warmUp() = Unit
+                    override fun close() = Unit
+                })
+                val before = protectedFileHashes(fixture.directory)
+                assertFalse(invalid, fixture.translator.reRenderPage(fixture.chapter, PAGE, "original"))
+                assertEquals(invalid, 0, calls.get())
+                assertEquals(invalid, before, protectedFileHashes(fixture.directory))
+                assertEquals(invalid, invalid.startsWith("directory"), original.isDirectory)
+                assertEquals(invalid, invalid != "missing", original.exists())
+                assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+            }
+        }
+    }
+
+    private fun decodedPixelHash(file: File): String {
+        val bitmap = requireNotNull(BitmapFactory.decodeFile(file.path))
+        return try {
+            assertEquals(SIZE, bitmap.width)
+            assertEquals(SIZE, bitmap.height)
+            pixelHash(bitmap)
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun assertSolidPage(file: File, color: Int) {
+        val bitmap = requireNotNull(BitmapFactory.decodeFile(file.path))
+        try {
+            assertEquals(SIZE, bitmap.width)
+            assertEquals(SIZE, bitmap.height)
+            val pixels = IntArray(SIZE * SIZE)
+            bitmap.getPixels(pixels, 0, SIZE, 0, 0, SIZE, SIZE)
+            assertTrue("Every output pixel must match the scripted fresh result", pixels.all { it == color })
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun encodedWebp(color: Int): ByteArray {
+        val bitmap = image(color)
+        return try {
+            ByteArrayOutputStream().use {
+                @Suppress("DEPRECATION")
+                check(bitmap.compress(Bitmap.CompressFormat.WEBP, 100, it))
+                it.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
     private fun protectedFileHashes(directory: File): Map<String, String> = directory.walkTopDown()
         .filter { it.isFile && it.name != ".yakuyomi_errors.txt" }
         .associate { it.relativeTo(directory).invariantSeparatorsPath to PartialPageStore.sha256(it.readBytes()) }

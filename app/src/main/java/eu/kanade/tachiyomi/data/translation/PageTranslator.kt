@@ -228,6 +228,7 @@ class PageTranslator(private val context: Context) {
         FAILED,
         TOO_LARGE,
         NO_ORIGINAL,
+        SOURCE_AMBIGUOUS,
         STOPPED,
     }
 
@@ -246,6 +247,11 @@ class PageTranslator(private val context: Context) {
         val keepExistingOriginal: Boolean,
         val wasPending: Boolean,
         val preservedOriginal: UniFile? = null,
+    )
+
+    private fun ambiguousSourceAttempt() = PageAttempt(
+        AttemptKind.SOURCE_AMBIGUOUS,
+        error = "Cannot verify the current page against its saved original. Restore the original before retrying.",
     )
 
     /** Inference runs outside the page lock; source digest and journal revision bind its commit. */
@@ -267,6 +273,7 @@ class PageTranslator(private val context: Context) {
                 val journal = loadJournal(chapterDir, name)
                 val alreadyDone = name in readDonePages(chapterDir)
                 if (!forceRetranslate && alreadyDone) return PageAttempt(AttemptKind.ALREADY_DONE)
+                var detachedOriginal: Pair<UniFile, Boolean>? = null
                 val kept = if (journal != null) {
                     chapterDir.findFile(MATERIALS_DIR)?.findFile(journal.original.name)
                         ?: throw java.io.IOException("Missing journal original")
@@ -276,7 +283,10 @@ class PageTranslator(private val context: Context) {
                     if (!recoverInterrupted(chapterDir, pageFile, name)) {
                         return PageAttempt(AttemptKind.FAILED, error = "Cannot recover previous page replacement")
                     }
-                    null
+                    // Missing records cannot authorize replacing a source: the visible page
+                    // could be our old output or an externally replaced, unrelated image.
+                    detachedOriginal = chapterDir.findFile(MATERIALS_DIR)?.let { findOriginalMaterial(it, name) }
+                    detachedOriginal?.first
                 }
                 // Legacy completion does not prove that the displayed pixels are an OCR source.
                 // Never promote a completed display to a replacement original when its source is missing.
@@ -285,16 +295,34 @@ class PageTranslator(private val context: Context) {
                 }
                 val source = kept ?: pageFile
                 when (val decoded = decodePageCapped(source)) {
-                    is PageDecode.TooLarge -> return completeUnchangedPageLocked(
-                        chapterDir, pageFile, journal,
-                        if (kept == null) decoded.sha256 else PartialPageStore.sha256(readPageBytes(pageFile)),
-                        kept, decoded.sha256, AttemptKind.TOO_LARGE, null,
-                        PageSizeCap.tooLargeReason(decoded.width, decoded.height), !forceRetranslate, shouldStop,
-                    )
+                    is PageDecode.TooLarge -> {
+                        val targetSha256 = if (kept ==
+                            null
+                        ) {
+                            decoded.sha256
+                        } else {
+                            PartialPageStore.sha256(readPageBytes(pageFile))
+                        }
+                        if (detachedOriginal != null && decoded.sha256 != targetSha256) return ambiguousSourceAttempt()
+                        return completeUnchangedPageLocked(
+                            chapterDir, pageFile, journal, targetSha256,
+                            kept, decoded.sha256, AttemptKind.TOO_LARGE, null,
+                            PageSizeCap.tooLargeReason(decoded.width, decoded.height), !forceRetranslate, shouldStop,
+                        )
+                    }
                     is PageDecode.Unreadable -> return PageAttempt(AttemptKind.FAILED, error = decoded.reason)
                     is PageDecode.Ok -> {
                         val targetSha256 = try {
-                            if (kept == null) decoded.sha256 else PartialPageStore.sha256(readPageBytes(pageFile))
+                            val displayBytes = if (kept == null) null else readPageBytes(pageFile)
+                            val targetSha = displayBytes?.let { PartialPageStore.sha256(it) } ?: decoded.sha256
+                            val detached = detachedOriginal
+                            if (detached != null && decoded.sha256 != targetSha &&
+                                (detached.second || !encodePage(name, decoded.bitmap).contentEquals(displayBytes!!))
+                            ) {
+                                decoded.bitmap.recycle()
+                                return ambiguousSourceAttempt()
+                            }
+                            targetSha
                         } catch (failure: Throwable) {
                             decoded.bitmap.recycle()
                             throw failure
@@ -610,7 +638,12 @@ class PageTranslator(private val context: Context) {
                 val alreadyDone = name in readDonePages(chapterDir)
                 if (wasPending && alreadyDone) return true
                 if (journal == null && !alreadyDone && !recoverInterrupted(chapterDir, pageFile, name)) return false
-                val keep = journal != null || keepExistingOriginal || alreadyDone
+                val detached = if (journal == null && !alreadyDone && !keepExistingOriginal) {
+                    chapterDir.findFile(MATERIALS_DIR)?.let { findOriginalMaterial(it, name) }
+                } else {
+                    null
+                }
+                val keep = journal != null || keepExistingOriginal || alreadyDone || detached != null
                 val source = if (keep) {
                     chapterDir.findFile(MATERIALS_DIR)?.let { directory ->
                         if (journal !=
@@ -625,10 +658,14 @@ class PageTranslator(private val context: Context) {
                     pageFile
                 }
                 val bytes = readPageBytes(source)
+                val displayBytes = readPageBytes(pageFile)
+                // Compatibility callers can retry a recovered exact source, but cannot
+                // silently replace an unrelated original after completion records disappeared.
+                if (detached != null && !bytes.contentEquals(displayBytes)) return false
                 PreparedInput(
                     PageDecode.Ok(original, PartialPageStore.sha256(bytes), bytes.size.toLong()),
                     journal,
-                    PartialPageStore.sha256(readPageBytes(pageFile)),
+                    PartialPageStore.sha256(displayBytes),
                     keep,
                     wasPending,
                     source.takeIf { keep },
@@ -696,6 +733,7 @@ class PageTranslator(private val context: Context) {
             AttemptKind.TRANSLATED, AttemptKind.ALREADY_DONE -> SinglePageResult.TRANSLATED
             AttemptKind.PARTIAL -> SinglePageResult.PARTIAL
             AttemptKind.NO_ORIGINAL -> SinglePageResult.NO_ORIGINAL
+            AttemptKind.SOURCE_AMBIGUOUS -> SinglePageResult.SOURCE_AMBIGUOUS
             AttemptKind.TOO_LARGE -> SinglePageResult.TOO_LARGE
             else -> SinglePageResult.NOT_TRANSLATED
         }
@@ -714,6 +752,9 @@ class PageTranslator(private val context: Context) {
 
         /** 已處理但沒有保留原圖，無法證明頁檔仍是原文：拒絕再翻，什麼都沒動。 */
         NO_ORIGINAL,
+
+        /** Preserved source and display cannot be associated after processing records were lost. */
+        SOURCE_AMBIGUOUS,
 
         /** 頁圖超過像素上限（[PageSizeCap]）：沒解碼、沒翻，原圖未動；原因已寫進該話錯誤檔。 */
         TOO_LARGE,
@@ -1955,7 +1996,11 @@ class PageTranslator(private val context: Context) {
             loadJournal(chapterDir, name)?.let { journal ->
                 return reRenderJournalPage(chapterDir, matDir, img, journal, newMethod, inpainter, renderCfg)
             }
-            val materials = decodeMaterials(matDir, base) ?: return false
+            val materials = decodeMaterials(matDir, base)
+            if (materials == null && newMethod == ORIGINAL_METHOD) {
+                return restoreOriginalWithoutMaterials(matDir, img, name)
+            }
+            if (materials == null) return false
             val (originalFile, byteCopy) = findOriginalMaterial(matDir, name) ?: return false
 
             // 原圖：用素材的原圖還原該頁（不去字/不排版）。記 method=original、保留 manifest（即時翻譯視為已處理、
@@ -2311,8 +2356,33 @@ class PageTranslator(private val context: Context) {
         return encoded.toByteArray().also { check(it.size <= MAX_PAGE_BYTES) { "Encoded page exceeds storage bound" } }
     }
 
-    private fun writeBack(file: UniFile, bmp: Bitmap) {
-        val encoded = encodePage(file.name, bmp)
+    /** Explicit recovery needs the preserved source, not optional OCR JSON or masks. Page lock held. */
+    private suspend fun restoreOriginalWithoutMaterials(matDir: UniFile, page: UniFile, name: String): Boolean {
+        val (original, byteCopy) = findOriginalMaterial(matDir, name) ?: return false
+        val decoded = decodePageCapped(original) as? PageDecode.Ok ?: return false
+        try {
+            val sourceBytes = readPageBytes(original)
+            check(PartialPageStore.sha256(sourceBytes) == decoded.sha256) { "Original changed during recovery" }
+            val replacement = if (byteCopy) sourceBytes else encodePage(name, decoded.bitmap)
+            val previousOutput = readPageBytes(page)
+            val operationContext = kotlinx.coroutines.currentCoroutineContext()
+            operationContext.ensureActive()
+            writeBackOrRestore(page, decoded.bitmap, SavedOriginal(original, null), previousOutput, replacement) {
+                operationContext.ensureActive()
+                check(PartialPageStore.sha256(readPageBytes(original)) == decoded.sha256) {
+                    "Original changed during recovery"
+                }
+            }
+            invalidateNightPage(matDir, name)
+            return true
+        } finally {
+            decoded.bitmap.recycle()
+        }
+    }
+
+    private fun writeBack(file: UniFile, bmp: Bitmap) = writeBackBytes(file, encodePage(file.name, bmp))
+
+    private fun writeBackBytes(file: UniFile, encoded: ByteArray) {
         try {
             // Never fall back to a non-truncating SAF stream; opening can itself truncate then fail.
             val os = openTruncating(file) ?: throw java.io.IOException("Cannot open page for replacement")
@@ -2343,12 +2413,20 @@ class PageTranslator(private val context: Context) {
      * also avoids copying a legacy WebP source verbatim into a PNG/JPEG target during recovery.
      * Rollback deliberately finishes without checking cancellation, then propagates the failure.
      */
-    private fun writeBackOrRestore(page: UniFile, bmp: Bitmap, saved: SavedOriginal?, previousOutputBytes: ByteArray) {
+    private fun writeBackOrRestore(
+        page: UniFile,
+        bmp: Bitmap,
+        saved: SavedOriginal?,
+        previousOutputBytes: ByteArray,
+        encodedOverride: ByteArray? = null,
+        afterWrite: () -> Unit = {},
+    ) {
         checkNotNull(saved) {
             "Cannot preserve the original page. Translation was not saved; check storage access and free space."
         }
         try {
-            writeBack(page, bmp)
+            if (encodedOverride == null) writeBack(page, bmp) else writeBackBytes(page, encodedOverride)
+            afterWrite()
         } catch (t: Throwable) {
             val restored = runCatching {
                 val stream = openTruncating(page) ?: throw java.io.IOException("Cannot restore previous page")
@@ -2619,10 +2697,11 @@ class PageTranslator(private val context: Context) {
      * **一定要在頁檔被譯圖覆蓋之前呼叫**，而且頁檔這時必須真的是原圖。呼叫端（[translateChapter]／[persistLivePage]）
      * 握著頁鎖、確認過三件事才會來：這頁不是別人剛落地的譯圖（落地前重讀清單）、不是上次覆蓋到一半留下的
      * （[recoverInterrupted] 先寫回）、不是我們自己的成品（[ownOutputOriginal]，那種情況原圖素材原封不動）。
-     * 通過之後才重新複製、蓋掉同名舊檔——素材反映「這次翻譯前頁檔的內容」（擷取功能重截同名頁時，要存的是新截的那張）。
+     * Existing source files are immutable. A detached source must be verified/reused or rejected
+     * before inference; recapturing a same-named page requires an explicit source-generation transition.
      *
      * 步驟：先寫暫存 `<最終名>.tmp`、長度與來源相同才改名成最終名，改名後再確認檔名與長度（SAF 上舊檔沒刪掉時，
-     * 改名可能變成另一個檔名）；然後刪掉同頁舊版的有損 WebP、建立進行中記號 `<最終名>.wip`。被殺在半路只會留下暫存
+     * 改名可能變成另一個檔名）；不取代既有原檔、再建立進行中記號 `<最終名>.wip`。被殺在半路只會留下暫存
      * （讀取端不認），不會留下半截的「原圖」讓之後的還原把壞檔寫回頁檔（§11）。
      * Any failed step returns null; callers must not replace the page without a verified original and recovery marker.
      */
@@ -2633,6 +2712,8 @@ class PageTranslator(private val context: Context) {
         var pendingTmp: UniFile? = null // 還沒變成最終檔的暫存（失敗時要刪）
         return runCatching {
             val d = materialsDir(chapterDir) ?: return@runCatching null
+            // A source that appeared after inference began is not ours to replace either.
+            if (d.findFile(finalName) != null || findOriginalMaterial(d, pageName) != null) return@runCatching null
             val tmp = d.findFile(tmpName) ?: d.createFile(tmpName) ?: return@runCatching null
             if (!tmp.isFile || tmp.name != tmpName) return@runCatching null
             pendingTmp = tmp
@@ -2649,8 +2730,7 @@ class PageTranslator(private val context: Context) {
                 }
                 return@runCatching null
             }
-            val existing = d.findFile(finalName)
-            if (existing != null && !deleteFileOnly(existing, finalName)) return@runCatching null
+            if (d.findFile(finalName) != null || findOriginalMaterial(d, pageName) != null) return@runCatching null
             // 改名後再看一次：檔名要真的是最終名、長度要是這次複製的長度（舊檔沒刪掉時 SAF 可能改成別的檔名還回成功）。
             if (!tmp.renameTo(finalName) || tmp.name != finalName || tmp.length() != copied) {
                 TraceLog.log("page", "$pageName orig rename failed -> ${tmp.name} len=${tmp.length()} want=$copied")
@@ -2658,10 +2738,8 @@ class PageTranslator(private val context: Context) {
                 return@runCatching null
             }
             pendingTmp = null // 已是最終檔
-            // 原檔存好了 → 同頁舊版的有損 WebP 用不到了（查找本來就先看原檔），刪掉省空間。
-            OriginalMaterial.supersededLegacyName(pageName)?.let { legacy ->
-                deleteFileOnly(d.findFile(legacy), legacy)
-            }
+            // Existing exact/legacy originals are immutable; a new capture needs an explicit
+            // source-generation transition, never implicit deletion during translation.
             // 進行中記號：從這裡到這頁進清單之間被打斷，下次靠它把原檔寫回頁檔（[recoverInterrupted]）。
             val markerName = OriginalMaterial.inflightName(pageName)
             val marker = runCatching { d.findFile(markerName) ?: d.createFile(markerName) }.getOrNull()

@@ -292,6 +292,9 @@ class ReaderActivity : BaseActivity() {
                     ReaderViewModel.Event.TranslatePageNoOriginal -> {
                         toast(stringResource(MR.strings.reader_translate_page_no_original))
                     }
+                    ReaderViewModel.Event.TranslatePageSourceAmbiguous -> {
+                        toast(stringResource(MR.strings.reader_translate_page_source_ambiguous))
+                    }
                     ReaderViewModel.Event.OriginalPreviewUnavailable -> {
                         toast(stringResource(MR.strings.reader_original_preview_unavailable))
                     }
@@ -550,6 +553,7 @@ class ReaderActivity : BaseActivity() {
                 ReRenderMethodDialog(
                     onDismissRequest = onDismissRequest,
                     onSelect = { method -> viewModel.reRenderPage(method) },
+                    allowReRender = dialog.allowReRender,
                 )
             }
             is ReaderViewModel.Dialog.ChapterList -> {
