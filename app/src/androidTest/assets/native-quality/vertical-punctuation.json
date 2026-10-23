@@ -1,0 +1,48 @@
+{
+  "license": "CC0-1.0; original neutral synthetic fixture generated for this test",
+  "width": 1200,
+  "height": 1600,
+  "font": "Meiryo Regular",
+  "fontSizePx": 72,
+  "cellHeightPx": 78,
+  "fontFileSha256": "457b306f719a002f1d037b2a3942f2abfa8a55d7bb109bf8950341a3129adb46",
+  "punctuation": "Real vertical presentation glyphs FE41/FE42/FE11/FE12; semantic ground truth is 「 」 、 。",
+  "columns": [
+    {
+      "expected": "少し待って、",
+      "x": 430,
+      "balloon": "left",
+      "y": 280
+    },
+    {
+      "expected": "ください。",
+      "x": 310,
+      "balloon": "left",
+      "y": 280
+    },
+    {
+      "expected": "「明日もよろしく",
+      "x": 1000,
+      "balloon": "right",
+      "y": 280
+    },
+    {
+      "expected": "お願いします。」",
+      "x": 880,
+      "balloon": "right",
+      "y": 280
+    }
+  ],
+  "files": [
+    {
+      "name": "vertical-punctuation-clean.png",
+      "sha256": "0578fee16b8ef07922abf629aa2c67b8344e22454d2a924e3976c0abf1ec3a7e"
+    },
+    {
+      "name": "vertical-punctuation.png",
+      "sha256": "281ffb1cc92aa692bddf6ea1429ecbb32a3ea6cfc974c09329154abd628010f3"
+    }
+  ],
+  "expectedLeft": "少し待って、ください。",
+  "expectedRight": "「明日もよろしくお願いします。」"
+}

@@ -293,6 +293,166 @@ class PartialOcrIntegrationTest {
     }
 
     @Test
+    fun nativeClosedVerticalBalloonRemainsWholeAndResumesOnlyItsMissingColumn() = runBlocking<Unit> {
+        check(context.packageName == "app.yomitori.yakuyomi.audit") {
+            "Closed-balloon native resume regression requires the isolated audit installation"
+        }
+        // Real DBNet/NCNN removal/rendering plus scripted loopback HTTP, not real-server quality
+        // or an Activity test. The existing nativePipeline helper requires root's idle preflight:
+        // it shuts down the shared audit engine before constructing its independent native models.
+        FixtureTranslationServer().use { server ->
+            nativePipeline(force = Force.RIGHT_VERTICAL_ONE_LINE, server = server) { pipeline, ocr ->
+                val input = InstrumentationRegistry.getInstrumentation().context.assets
+                    .open("native-quality/vertical-punctuation.png").use { it.readBytes() }
+                val inputHash = MessageDigest.getInstance("SHA-256").digest(input)
+                    .joinToString("") { "%02x".format(it.toInt() and 255) }
+                assertEquals("281ffb1cc92aa692bddf6ea1429ecbb32a3ea6cfc974c09329154abd628010f3", inputHash)
+                val original = requireNotNull(BitmapFactory.decodeByteArray(input, 0, input.size))
+                val originalHash = digest(original)
+                var first: PageResult.Partial? = null
+                var finished: PageResult.Translated? = null
+                var borrowedMask: Bitmap? = null
+                try {
+                    val partial = partial(pipeline.translatePage(original))
+                    first = partial
+                    val before = requireNotNull(partial.analysis.progress)
+                    assertEquals(
+                        "The two closed balloons must remain two logical source regions",
+                        2,
+                        before.regions.size,
+                    )
+                    val completed = before.regions.single { it.state == RegionState.TRANSLATED }
+                    val pending = before.regions.single { it.state == RegionState.OCR_PENDING }
+                    assertEquals("少し待って、ください。", source(completed))
+                    assertEquals(2, completed.lines.size)
+                    assertEquals(2, pending.lines.size)
+                    assertEquals(listOf("「明日もよろしく", ""), pending.lines.map { it.text })
+                    assertTrue(pending.lines.all { line -> line.quad.all { it.x > 600f } })
+                    assertEquals(listOf(pending.id), before.pendingRegionIds)
+                    assertTrue(
+                        "The complete right balloon must retain its original",
+                        partial.analysis.regions[pending.id].preserveOriginal,
+                    )
+                    assertFalse(partial.analysis.regions[completed.id].preserveOriginal)
+                    assertTrue(
+                        "Pending text must remain in the original detector mask",
+                        maskedPixels(partial.analysis.mask, pending) > 0,
+                    )
+                    assertEquals(1, ocr.calls)
+                    assertEquals(1, server.requests.size)
+                    assertEquals(listOf("少し待って、ください。"), texts(server.requests.single()))
+                    assertEquals(1, JSONArray(server.requests.single()).getJSONObject(0).getInt("id"))
+                    assertEquals(1, partial.stats.kept)
+                    assertEquals(originalHash, digest(original))
+                    assertFalse(
+                        "The left balloon should already display its translation",
+                        original.sameAs(partial.page),
+                    )
+
+                    val beforeRow = IntArray(original.width - 600)
+                    val partialRow = IntArray(beforeRow.size)
+                    for (y in 0 until original.height) {
+                        original.getPixels(beforeRow, 0, beforeRow.size, 600, y, beforeRow.size, 1)
+                        partial.page.getPixels(partialRow, 0, partialRow.size, 600, y, partialRow.size, 1)
+                        assertArrayEquals(
+                            "Right source half changed before OCR completion at y=$y",
+                            beforeRow,
+                            partialRow,
+                        )
+                    }
+                    val partialPixelsHash = digest(partial.page)
+                    val partialMaskHash = digest(partial.analysis.mask)
+                    val payload = OcrProgressCodec.encode(before)
+                    val restored = OcrProgressCodec.decode(payload, original.width, original.height)
+                    assertEquals("Serialized partial progress must retain exact source ownership", before, restored)
+                    val mask = requireNotNull(partial.analysis.mask.copy(Bitmap.Config.ARGB_8888, false))
+                    borrowedMask = mask
+                    val borrowedMaskHash = digest(mask)
+                    val borrowed = PageAnalysis(mask, restored.toTextRegions(), restored)
+                    val translated = translated(pipeline.resumePage(original, borrowed))
+                    finished = translated
+                    val after = requireNotNull(translated.analysis?.progress)
+                    assertFalse(after.hasPending)
+                    assertEquals(2, after.regions.size)
+                    assertEquals(before.regions.map { it.id }, after.regions.map { it.id })
+                    assertEquals(
+                        "Successful left target and geometry must not change",
+                        completed,
+                        after.regions[completed.id],
+                    )
+                    val resolved = after.regions[pending.id]
+                    assertEquals(RegionState.TRANSLATED, resolved.state)
+                    assertEquals("「明日もよろしくお願いします。」", source(resolved))
+                    assertEquals(pending.lines.map { it.copy(text = "") }, resolved.lines.map { it.copy(text = "") })
+                    assertEquals(
+                        "Pending region geometry must retain its saved identity",
+                        pending.copy(
+                            state = resolved.state,
+                            lines = resolved.lines,
+                            translatedText = resolved.translatedText,
+                        ),
+                        resolved,
+                    )
+                    assertEquals(2, ocr.calls)
+                    assertEquals(
+                        "Only the forced missing column may be recognized again",
+                        listOf(requireNotNull(ocr.forcedQuad)),
+                        ocr.lastInputQuads,
+                    )
+                    assertEquals(2, server.requests.size)
+                    assertEquals(listOf("「明日もよろしくお願いします。」"), texts(server.requests.last()))
+                    // Wire IDs restart at one within this pending-only batch; progress IDs do not.
+                    assertEquals(1, JSONArray(server.requests.last()).getJSONObject(0).getInt("id"))
+                    assertEquals(originalHash, digest(original))
+                    assertEquals(partialPixelsHash, digest(partial.page))
+                    assertEquals(partialMaskHash, digest(partial.analysis.mask))
+                    assertEquals(borrowedMaskHash, digest(mask))
+                    assertFalse(mask.isRecycled)
+                    assertNotSame(mask, requireNotNull(translated.analysis).mask)
+                    assertEquals(borrowedMaskHash, digest(requireNotNull(translated.analysis).mask))
+                    assertEquals(payload, OcrProgressCodec.encode(before))
+                    assertEquals(payload, OcrProgressCodec.encode(restored))
+                    assertEquals(payload, OcrProgressCodec.encode(requireNotNull(partial.analysis.progress)))
+
+                    val leftBefore = IntArray(600)
+                    val leftAfter = IntArray(600)
+                    for (y in 0 until original.height) {
+                        partial.page.getPixels(leftBefore, 0, 600, 0, y, 600, 1)
+                        translated.page.getPixels(leftAfter, 0, 600, 0, y, 600, 1)
+                        assertArrayEquals(
+                            "The previously rendered left half changed during resume at y=$y",
+                            leftBefore,
+                            leftAfter,
+                        )
+                    }
+                    assertNull(server.failure)
+                    println(
+                        "NATIVE_CLOSED_BALLOON_RESUME=" + JSONObject()
+                            .put("realNativeOcr", true).put("scriptedLoopbackHttp", true)
+                            .put("realExternalServer", false).put("actualReaderActivity", false)
+                            .put("regions", after.regions.size).put("recognizerCalls", ocr.calls)
+                            .put(
+                                "resumeLineCount",
+                                ocr.lastInputQuads.size,
+                            ).put("logicalHttpBatches", server.requests.size)
+                            .put("firstBatchTexts", JSONArray(texts(server.requests.first())))
+                            .put("resumeBatchTexts", JSONArray(texts(server.requests.last())))
+                            .put("progressIds", JSONArray(after.regions.map { it.id }))
+                            .put("rightSourcePixelsPreservedUntilResume", true)
+                            .put("leftOutputPixelsPreservedAcrossResume", true)
+                            .put("originalPixelsPreserved", true).put("borrowedMaskPreserved", true),
+                    )
+                } finally {
+                    release(first)
+                    release(finished)
+                    borrowedMask?.recycle()
+                    original.recycle()
+                }
+            }
+        }
+    }
+
+    @Test
     fun malformedAndCancelledResumeKeepPreviousProgressAndCanResumeAgain() = runBlocking<Unit> {
         FixtureTranslationServer().use { server ->
             nativePipeline(server = server) { pipeline, _ ->
@@ -1264,7 +1424,7 @@ class PartialOcrIntegrationTest {
         }
     }
 
-    private enum class Force { NONE, ONE_LINE, ALL }
+    private enum class Force { NONE, ONE_LINE, ALL, RIGHT_VERTICAL_ONE_LINE }
 
     /** Deliberately controls only OCR availability; all recognized text comes from the real model. */
     private class ForcedFirstOcr(private val native: Ocr, private val force: Force) : OcrRecognizer {
@@ -1291,6 +1451,16 @@ class PartialOcrIntegrationTest {
                     val group = groups.firstOrNull { it.lines.size >= 2 }
                         ?: error("Fixture must contain a multiline group")
                     val missing = group.lines.last()
+                    forcedQuad = missing.quad.toList()
+                    missing.text = ""
+                } else if (force == Force.RIGHT_VERTICAL_ONE_LINE) {
+                    val right = lines.filter { line -> line.quad.map { it.x }.average() > 600.0 }
+                        .sortedByDescending { line -> line.quad.map { it.x }.average() }
+                    check(right.map { it.text } == listOf("「明日もよろしく", "お願いします。」")) {
+                        "The fixed CC0 fixture must have exactly the expected two right vertical columns"
+                    }
+                    check(right.all { it.direction == "v" }) { "The right fixture columns must be vertical" }
+                    val missing = right.last()
                     forcedQuad = missing.quad.toList()
                     missing.text = ""
                 }
