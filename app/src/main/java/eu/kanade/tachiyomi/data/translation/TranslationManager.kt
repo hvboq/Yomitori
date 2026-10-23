@@ -2077,27 +2077,51 @@ class TranslationManager(private val context: Context) {
                 )
             }
             val result = process(checkNotNull(UniFile.fromFile(pages)))
-            if (shouldStop() || !result.swap) return false
-            val replacement = File(work, "replacement.zip")
-            SafeArchiveRewrite.packAndVerify(pages, replacement, shouldStop)
-            if (shouldStop()) return false
-            kotlinx.coroutines.currentCoroutineContext().ensureActive()
-
-            // Never delete a preexisting .yakutmp or the chapter. Keep an independently verified
-            // original next to it even when the SAF provider cannot roll back a failed write.
-            val backupName = "$cbzName.yomitori-original-${java.util.UUID.randomUUID()}.bak"
-            check(parent.findFile(backupName) == null) { "Archive backup path already exists" }
-            val backup = checkNotNull(parent.createFile(backupName)) { "Cannot create original archive backup" }
-            check(backup.uri != cbz.uri && backup.name == backupName && backup.isFile) {
-                "Archive provider did not create a distinct backup file"
+            if (!result.swap) return false
+            val checkpointContext = kotlinx.coroutines.currentCoroutineContext()
+            checkpointContext.ensureActive()
+            // A cooperative pause stops inference, but must still save completed pages and pending
+            // materials before this staging directory is removed. A hard coroutine cancellation
+            // still aborts packing/replacement; SafeArchiveRewrite finishes rollback if necessary.
+            val checkpointShouldStop: () -> Boolean = {
+                checkpointContext.ensureActive()
+                false
             }
-            SafeArchiveRewrite.commit(
-                original,
-                replacement,
-                archiveStorage(cbz),
-                archiveStorage(backup),
-                shouldStop,
-            )
+            try {
+                val replacement = File(work, "replacement.zip")
+                SafeArchiveRewrite.packAndVerify(pages, replacement, checkpointShouldStop)
+                checkpointContext.ensureActive()
+
+                // Never delete a preexisting .yakutmp or the chapter. Keep an independently verified
+                // original next to it even when the SAF provider cannot roll back a failed write.
+                val backupName = "$cbzName.yomitori-original-${java.util.UUID.randomUUID()}.bak"
+                check(parent.findFile(backupName) == null) { "Archive backup path already exists" }
+                val backup = checkNotNull(parent.createFile(backupName)) { "Cannot create original archive backup" }
+                check(backup.uri != cbz.uri && backup.name == backupName && backup.isFile) {
+                    "Archive provider did not create a distinct backup file"
+                }
+                SafeArchiveRewrite.commit(
+                    original,
+                    replacement,
+                    archiveStorage(cbz),
+                    archiveStorage(backup),
+                    checkpointShouldStop,
+                )
+                checkpointContext.ensureActive()
+            } catch (failure: Exception) {
+                // Commit can wrap cancellation after completing rollback. Preserve that failure
+                // (including a suppressed rollback error) while keeping coroutine cancellation.
+                try {
+                    checkpointContext.ensureActive()
+                } catch (cancelled: CancellationException) {
+                    if (failure is CancellationException) throw failure
+                    throw CancellationException("Archive checkpoint cancelled").apply {
+                        initCause(failure)
+                        addSuppressed(cancelled)
+                    }
+                }
+                throw failure
+            }
             return result.success
         } finally {
             work.deleteRecursively()
