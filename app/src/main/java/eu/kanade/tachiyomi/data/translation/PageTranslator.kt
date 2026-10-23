@@ -278,7 +278,9 @@ class PageTranslator(private val context: Context) {
                     }
                     null
                 }
-                if (kept == null && alreadyDone && isNightOnlyOutput(chapterDir, pageFile, name)) {
+                // Legacy completion does not prove that the displayed pixels are an OCR source.
+                // Never promote a completed display to a replacement original when its source is missing.
+                if (kept == null && alreadyDone) {
                     return PageAttempt(AttemptKind.NO_ORIGINAL)
                 }
                 val source = kept ?: pageFile
@@ -664,7 +666,7 @@ class PageTranslator(private val context: Context) {
      *
      * @param method 去字法原始字串（boxfill / auto_whole / auto_tile）；預設＝目前全域偏好。傳給引擎、也存進素材。
      * @return [SinglePageResult.TRANSLATED]＝翻成功並已覆蓋落地；[SinglePageResult.NOT_TRANSLATED]＝略過/失敗/解析不到檔
-     *   （原圖未動）；[SinglePageResult.NO_ORIGINAL]＝這頁已翻過、沒有原圖素材，頁檔就是我們寫的譯圖（[isNightOnlyOutput]），
+     *   （原圖未動）；[SinglePageResult.NO_ORIGINAL]＝這頁已處理、沒有保留原圖，不能證明頁檔仍是未翻譯原文，
      *   拒絕再翻（什麼都不動）；[SinglePageResult.TOO_LARGE]＝頁圖超過像素上限（[PageSizeCap]），沒翻、原圖未動。
      * 整段算進 [TranslationBusy]（夜讀讓路）。
      */
@@ -710,26 +712,12 @@ class PageTranslator(private val context: Context) {
         /** 略過（無字）／失敗（網路、引擎）／找不到檔：原圖未動。 */
         NOT_TRANSLATED,
 
-        /** 已翻過、沒有原圖素材，頁檔就是我們寫的譯圖：拒絕再翻，什麼都沒動。 */
+        /** 已處理但沒有保留原圖，無法證明頁檔仍是原文：拒絕再翻，什麼都沒動。 */
         NO_ORIGINAL,
 
         /** 頁圖超過像素上限（[PageSizeCap]）：沒解碼、沒翻，原圖未動；原因已寫進該話錯誤檔。 */
         TOO_LARGE,
     }
-
-    /**
-     * 頁檔是不是**只存夜讀素材時我們寫的譯圖**：沒有完整素材 json，有這頁的夜讀文字框檔（[NightTextBoxes]），而且它對得上
-     * 現在的頁檔（寬高＋位元組數，[NightTextBoxes.fits]）。對得上＝頁檔跟當初翻譯落地時一個位元組不差。
-     * 任何一步讀不到 → false（照以前的做法處理這頁）。
-     */
-    private fun isNightOnlyOutput(chapterDir: UniFile, pageFile: UniFile, name: String): Boolean = runCatching {
-        val matDir = chapterDir.findFile(MATERIALS_DIR) ?: return false
-        if (matDir.findFile(NightTextBoxes.materialsJsonName(name))?.isFile == true) return false
-        val boxes = findNightBoxes(matDir, name)?.let { readNightBoxes(it, name) } ?: return false
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(pageFile.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        NightTextBoxes.fits(boxes, bounds.outWidth, bounds.outHeight, pageFile.length())
-    }.getOrDefault(false)
 
     /**
      * 這頁有沒有重繪素材（完整素材 json `<base>.json` 加原圖素材，[OriginalMaterial]）：重繪與「原圖（還原未翻）」都要兩者齊。

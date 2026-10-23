@@ -289,6 +289,14 @@ class WebtoonRecyclerView @JvmOverloads constructor(
                     downX = (ev.getX(actionIndex) + 0.5f).toInt()
                     downY = (ev.getY(actionIndex) + 0.5f).toInt()
                 }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    if (ev.getPointerId(actionIndex) == scrollPointerId) {
+                        val remainingIndex = if (actionIndex == 0) 1 else 0
+                        scrollPointerId = ev.getPointerId(remainingIndex)
+                        downX = (ev.getX(remainingIndex) + 0.5f).toInt()
+                        downY = (ev.getY(remainingIndex) + 0.5f).toInt()
+                    }
+                }
                 MotionEvent.ACTION_MOVE -> {
                     if (isDoubleTapping && isQuickScaling) {
                         return true

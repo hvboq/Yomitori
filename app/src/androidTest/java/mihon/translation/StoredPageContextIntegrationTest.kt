@@ -42,12 +42,15 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import tachiyomi.core.common.preference.InMemoryPreferenceStore
 import tachiyomi.domain.translation.service.TranslationPreferences
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.InvocationTargetException
+import java.nio.ByteBuffer
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
@@ -56,6 +59,194 @@ import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 @RunWith(AndroidJUnit4::class)
 class StoredPageContextIntegrationTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
+
+    @Test
+    fun manualLegacyCompletedPageWithoutOriginalNeverPromotesItsDisplayToSource() = runBlocking {
+        withSourceProtectionFixture { fixture ->
+            check(fixture.materials.mkdir())
+            File(fixture.materials, "unrelated.txt").writeText("neutral unrelated material")
+            fixture.page.writeBytes(encoded(Color.BLACK))
+            val completion = CompletionManifestCodec.encode(setOf(PAGE))
+            for (name in listOf(
+                CompletionManifestCodec.PRIMARY,
+                CompletionManifestCodec.PREVIOUS,
+                CompletionManifestCodec.CHECKPOINT_PREFIX + UUID.randomUUID(),
+            )) {
+                File(fixture.directory, name).writeBytes(completion)
+            }
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    return PageResult.Translated(image(Color.GREEN), stats(0))
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult {
+                    calls.incrementAndGet()
+                    error("Legacy completion has no resumable journal")
+                }
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+            val before = protectedFileHashes(fixture.directory)
+            val original = File(fixture.materials, "001.orig.png")
+            assertFalse(original.exists())
+            val actual = fixture.translate()
+            val after = protectedFileHashes(fixture.directory)
+            assertEquals(
+                "calls=${calls.get()}, protectedFilesUnchanged=${before == after}, promotedOriginal=${original.exists()}",
+                PageTranslator.SinglePageResult.NO_ORIGINAL,
+                actual,
+            )
+            assertEquals("A completed display is not an OCR source", 0, calls.get())
+            assertEquals("Display, all completion files and unrelated materials must remain unchanged", before, after)
+            assertFalse("No replacement original may be invented from translated pixels", original.exists())
+        }
+    }
+
+    @Test
+    fun manualLegacyCompletedPageWithOriginalUsesPreservedSourceAndCanTranslateAgain() = runBlocking {
+        withSourceProtectionFixture { fixture ->
+            check(fixture.materials.mkdir())
+            val original = File(fixture.materials, "001.orig.png").apply { writeBytes(fixture.initialBytes) }
+            fixture.page.writeBytes(encoded(Color.BLACK))
+            File(fixture.directory, CompletionManifestCodec.PRIMARY)
+                .writeBytes(CompletionManifestCodec.encode(setOf(PAGE)))
+            val sourceBitmap = requireNotNull(BitmapFactory.decodeFile(original.path))
+            val displayBitmap = requireNotNull(BitmapFactory.decodeFile(fixture.page.path))
+            val sourceHash: String
+            val displayHash: String
+            try {
+                sourceHash = pixelHash(sourceBitmap)
+                displayHash = pixelHash(displayBitmap)
+            } finally {
+                sourceBitmap.recycle()
+                displayBitmap.recycle()
+            }
+            assertFalse("The source and old display must have different pixels", sourceHash == displayHash)
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    assertEquals("Inference must read the preserved original", sourceHash, pixelHash(page))
+                    assertFalse(
+                        "The previous translated display must not be recognized",
+                        displayHash == pixelHash(page),
+                    )
+                    return PageResult.Translated(image(Color.GREEN), stats(0))
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A legacy page must start from its preserved source")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertEquals(1, calls.get())
+            assertArrayEquals(fixture.initialBytes, original.readBytes())
+            val translated = requireNotNull(BitmapFactory.decodeFile(fixture.page.path))
+            try {
+                assertEquals(Color.GREEN, translated.getPixel(0, 0))
+            } finally {
+                translated.recycle()
+            }
+            assertTrue(fixture.translator.isChapterTranslated(fixture.chapter))
+        }
+    }
+
+    @Test
+    fun manualCompletedJournalMissingOrCorruptOriginalFailsBeforeInference() = runBlocking {
+        for (missing in listOf(true, false)) {
+            withSourceProtectionFixture { fixture ->
+                fixture.select(object : TranslationEngine {
+                    override val translationContext = semantic("Korean")
+                    override suspend fun translatePage(page: Bitmap): PageResult = result("한국어", false)
+                    override fun warmUp() = Unit
+                    override fun close() = Unit
+                })
+                assertEquals(PageTranslator.SinglePageResult.PARTIAL, fixture.translate())
+                fixture.selectSameContextCompletion()
+                assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+                val complete = requireNotNull(fixture.store.load(PAGE))
+                assertTrue(complete.complete)
+                val original = File(fixture.materials, complete.original.name)
+                if (missing) check(original.delete()) else original.writeBytes(byteArrayOf(1, 2, 3))
+                val calls = AtomicInteger()
+                fixture.select(object : TranslationEngine {
+                    override val translationContext = semantic("Korean")
+                    override suspend fun translatePage(page: Bitmap): PageResult {
+                        calls.incrementAndGet()
+                        return result("실행되면 안 됨", true)
+                    }
+                    override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult {
+                        calls.incrementAndGet()
+                        return result("실행되면 안 됨", true)
+                    }
+                    override fun warmUp() = Unit
+                    override fun close() = Unit
+                })
+                val before = protectedFileHashes(fixture.directory)
+                assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, fixture.translate())
+                assertEquals("A missing or corrupt journal source must fail before inference", 0, calls.get())
+                assertEquals(before, protectedFileHashes(fixture.directory))
+                assertFalse(fixture.translator.isChapterTranslated(fixture.chapter))
+                assertEquals(!missing, original.exists())
+            }
+        }
+    }
+
+    private fun protectedFileHashes(directory: File): Map<String, String> = directory.walkTopDown()
+        .filter { it.isFile && it.name != ".yakuyomi_errors.txt" }
+        .associate { it.relativeTo(directory).invariantSeparatorsPath to PartialPageStore.sha256(it.readBytes()) }
+
+    private fun pixelHash(bitmap: Bitmap): String {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val bytes = ByteBuffer.allocate(pixels.size * 4)
+        for (pixel in pixels) bytes.putInt(pixel)
+        return PartialPageStore.sha256(bytes.array())
+    }
+
+    /** Own in-memory translation preferences and private UUID files; no global preference is changed. */
+    private suspend fun withSourceProtectionFixture(block: suspend (Fixture) -> Unit) {
+        check(context.packageName == "app.yomitori.yakuyomi.audit") {
+            "Source protection regression requires the isolated audit installation"
+        }
+        assertTrue("PageTranslator requires the prepared model set", TranslationEngineConfig.modelsResolvable(context))
+        val directory = File(context.cacheDir, "source-protection-${UUID.randomUUID()}").apply { check(mkdir()) }
+        check(directory.canonicalFile.parentFile == context.cacheDir.canonicalFile)
+        var service: TranslationEngineService? = null
+        try {
+            val page = File(directory, PAGE)
+            page.writeBytes(encoded(Color.WHITE))
+            val preferences = TranslationPreferences(InMemoryPreferenceStore())
+            val activeService = TranslationEngineService(context)
+            service = activeService
+            field("translationPreferences").set(activeService, preferences)
+            val signature = TranslationEngineService::class.java.getDeclaredMethod(
+                "configSignature",
+                String::class.java,
+                TranslationPreferences::class.java,
+            ).apply { isAccessible = true }.invoke(activeService, "boxfill", preferences.snapshot())
+            field("builtSignature").set(activeService, signature)
+            field("warmedUp").setBoolean(activeService, true)
+            val translator = PageTranslator(context).also {
+                PageTranslator::class.java.getDeclaredField("translationPreferences").apply { isAccessible = true }
+                    .set(it, preferences)
+                PageTranslator::class.java.getDeclaredField("engineService").apply { isAccessible = true }
+                    .set(it, activeService)
+            }
+            block(Fixture(directory, page, page.readBytes(), activeService, translator))
+        } finally {
+            try {
+                service?.shutdown()
+            } finally {
+                check(directory.canonicalFile.parentFile == context.cacheDir.canonicalFile)
+                check(directory.deleteRecursively())
+            }
+        }
+    }
 
     @Test
     fun languageRestartFailurePreservesPriorOutputThenReplacesAllTargetsAndResumes() = runBlocking {

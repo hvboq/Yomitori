@@ -17,6 +17,11 @@ import eu.kanade.tachiyomi.data.backup.models.BackupManga
 import eu.kanade.tachiyomi.data.backup.models.BackupPreference
 import eu.kanade.tachiyomi.data.backup.models.BackupSource
 import eu.kanade.tachiyomi.data.backup.models.BackupSourcePreferences
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.protobuf.ProtoBuf
 import logcat.LogPriority
 import okio.buffer
@@ -35,6 +40,7 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import kotlin.time.Clock
 
 class BackupCreator(
@@ -52,24 +58,23 @@ class BackupCreator(
     private val extensionStoresBackupCreator: ExtensionStoresBackupCreator = ExtensionStoresBackupCreator(),
     private val sourcesBackupCreator: SourcesBackupCreator = SourcesBackupCreator(),
     private val backupFileValidator: BackupFileValidator = BackupFileValidator(context),
+    private val autoBackupFilename: () -> String = ::getFilename,
 ) {
 
-    suspend fun backup(uri: Uri, options: BackupOptions): String {
+    suspend fun backup(uri: Uri, options: BackupOptions): String = if (isAutoBackup) {
+        automaticBackupMutex.withLock { createBackup(uri, options) }
+    } else {
+        createBackup(uri, options)
+    }
+
+    private suspend fun createBackup(uri: Uri, options: BackupOptions): String {
         var file: UniFile? = null
+        var automaticDirectory: UniFile? = null
+        var committed = false
         try {
             file = if (isAutoBackup) {
-                // Get dir of file and create
-                val dir = UniFile.fromUri(context, uri)
-
-                // Delete older backups
-                dir?.listFiles { _, filename -> FILENAME_REGEX.matches(filename) }
-                    .orEmpty()
-                    .sortedByDescending { it.name }
-                    .drop(MAX_AUTO_BACKUPS - 1)
-                    .forEach { it.delete() }
-
-                // Create new file to place backup
-                dir?.createFile(getFilename())
+                automaticDirectory = UniFile.fromUri(context, uri)?.takeIf { it.isDirectory }
+                automaticDirectory?.let(::createAutomaticFile)
             } else {
                 UniFile.fromUri(context, uri)
             }
@@ -109,14 +114,53 @@ class BackupCreator(
             backupFileValidator.validate(fileUri)
 
             if (isAutoBackup) {
+                currentCoroutineContext().ensureActive()
                 backupPreferences.lastAutoBackupTimestamp.set(Clock.System.now().toEpochMilliseconds())
+                committed = true
+                pruneAutomaticBackups(checkNotNull(automaticDirectory), fileUri)
             }
 
             return fileUri.toString()
         } catch (e: Exception) {
             logcat(LogPriority.ERROR, e)
-            file?.delete()
+            if (!isAutoBackup || !committed) file?.delete()
             throw e
+        }
+    }
+
+    private fun createAutomaticFile(directory: UniFile): UniFile? {
+        val previousFiles = checkNotNull(directory.listFiles()) { "Could not enumerate automatic backup directory" }
+        val previousUris = previousFiles.map { it.uri }.toSet()
+        val basename = autoBackupFilename().removeSuffix(".tachibk")
+        repeat(MAX_ALLOCATION_ATTEMPTS) {
+            val filename = "${basename}_${UUID.randomUUID()}.tachibk"
+            if (directory.findFile(filename) != null) return@repeat
+            val created = directory.createFile(filename) ?: return null
+            // Do not take ownership if a provider returns an already existing document.
+            check(created.uri !in previousUris) { "Automatic backup allocation reused an existing document" }
+            return created
+        }
+        return null
+    }
+
+    private suspend fun pruneAutomaticBackups(directory: UniFile, committedUri: Uri) {
+        try {
+            val previousFiles = checkNotNull(directory.listFiles { _, filename -> FILENAME_REGEX.matches(filename) }) {
+                "Could not enumerate older automatic backups"
+            }
+            previousFiles
+                .filter { it.isFile && it.uri != committedUri }
+                .sortedWith(compareByDescending<UniFile> { it.lastModified() }.thenByDescending { it.name })
+                .drop(MAX_AUTO_BACKUPS - 1)
+                .forEach {
+                    currentCoroutineContext().ensureActive()
+                    it.delete()
+                }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            // Retention is best effort after a valid backup commits; preserve that backup.
+            logcat(LogPriority.ERROR, error) { "Failed to prune older automatic backups" }
         }
     }
 
@@ -156,7 +200,12 @@ class BackupCreator(
 
     companion object {
         private const val MAX_AUTO_BACKUPS: Int = 4
-        private val FILENAME_REGEX = """${BuildConfig.APPLICATION_ID}_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}.tachibk""".toRegex()
+        private const val MAX_ALLOCATION_ATTEMPTS: Int = 3
+        private val automaticBackupMutex = Mutex()
+        private val FILENAME_REGEX = (
+            """${Regex.escape(BuildConfig.APPLICATION_ID)}_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}""" +
+                """(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.tachibk"""
+            ).toRegex()
 
         fun getFilename(): String {
             val date = SimpleDateFormat("yyyy-MM-dd_HH-mm", Locale.ENGLISH).format(Date())

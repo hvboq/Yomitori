@@ -15,6 +15,7 @@ import com.eygraber.sqldelight.androidx.driver.AndroidxSqliteDatabaseType
 import com.eygraber.sqldelight.androidx.driver.AndroidxSqliteDriver
 import com.eygraber.sqldelight.androidx.driver.FileProvider
 import eu.kanade.domain.manga.interactor.UpdateManga
+import eu.kanade.tachiyomi.BuildConfig
 import eu.kanade.tachiyomi.data.backup.BackupDecoder
 import eu.kanade.tachiyomi.data.backup.BackupFileValidator
 import eu.kanade.tachiyomi.data.backup.create.BackupCreator
@@ -512,6 +513,173 @@ class BackupRoundTripIntegrationTest {
         }
     }
 
+    @Test
+    fun failedAutomaticBackupPreservesAllFourPreviousValidFilesAndTimestamp() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            val valid = fixture.createBackup().readBytes()
+            val directory = File(fixture.root, "automatic-retention").apply { check(mkdirs()) }
+            val previous = (0 until 4).associate { minute ->
+                val name = "${BuildConfig.APPLICATION_ID}_2000-01-01_00-0$minute.tachibk"
+                name to valid.copyOf().also { bytes -> File(directory, name).writeBytes(bytes) }
+            }
+            val timestamp = BackupPreferences(fixture.source.store).lastAutoBackupTimestamp
+            timestamp.set(1_234_567L)
+            val expectedFailure = IllegalStateException("isolated automatic backup validation failure")
+            val validator = fixture.observedValidator { throw expectedFailure }
+            val failure = runCatching {
+                fixture.creator(
+                    isAutoBackup = true,
+                    validator = validator,
+                    autoBackupFilename = { "${BuildConfig.APPLICATION_ID}_2000-01-02_03-04.tachibk" },
+                )
+                    .backup(Uri.fromFile(directory), BackupOptions(privateSettings = true))
+            }.exceptionOrNull()
+            assertTrue("real validation must fail at the injected tracker lookup", failure === expectedFailure)
+            assertEquals(
+                "failed automatic creation must not prune any previously valid backup",
+                previous.keys,
+                directory.listFiles()!!.map { it.name }.toSet(),
+            )
+            previous.forEach { (name, bytes) -> assertArrayEquals(bytes, File(directory, name).readBytes()) }
+            assertEquals(1_234_567L, timestamp.get())
+        }
+    }
+
+    @Test
+    fun failedAutomaticBackupDoesNotOverwriteOrDeleteExistingSameMinuteFile() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            val valid = fixture.createBackup().readBytes()
+            val directory = File(fixture.root, "automatic-collision").apply { check(mkdirs()) }
+            val basename = "${BuildConfig.APPLICATION_ID}_2000-01-02_03-04.tachibk"
+            val previous = File(directory, basename).apply { writeBytes(valid) }
+            val timestamp = BackupPreferences(fixture.source.store).lastAutoBackupTimestamp
+            timestamp.set(1_234_567L)
+            val expectedFailure = IllegalStateException("isolated same-minute validation failure")
+            val validator = fixture.observedValidator { throw expectedFailure }
+            val failure = runCatching {
+                fixture.creator(isAutoBackup = true, validator = validator, autoBackupFilename = { basename })
+                    .backup(Uri.fromFile(directory), BackupOptions(privateSettings = true))
+            }.exceptionOrNull()
+            assertTrue("real validation must reach the injected tracker lookup", failure === expectedFailure)
+            assertTrue("the existing same-minute backup must survive failure", previous.isFile)
+            assertArrayEquals(valid, previous.readBytes())
+            assertEquals(setOf(basename), directory.listFiles()!!.map { it.name }.toSet())
+            assertEquals(1_234_567L, timestamp.get())
+        }
+    }
+
+    @Test
+    fun cancellingAutomaticBackupDuringValidationDoesNotAdvanceTimestampOrKeepAttemptFile() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            val directory = File(fixture.root, "automatic-cancellation").apply { check(mkdirs()) }
+            val timestamp = BackupPreferences(fixture.source.store).lastAutoBackupTimestamp
+            timestamp.set(1_234_567L)
+            val entered = CompletableDeferred<Unit>()
+            val release = CountDownLatch(1)
+            val validator = fixture.observedValidator {
+                entered.complete(Unit)
+                check(release.await(20, TimeUnit.SECONDS)) { "automatic validation gate was not released" }
+            }
+            coroutineScope {
+                val operation = async(Dispatchers.IO) {
+                    fixture.creator(
+                        isAutoBackup = true,
+                        validator = validator,
+                        autoBackupFilename = { "${BuildConfig.APPLICATION_ID}_2000-01-02_03-04.tachibk" },
+                    )
+                        .backup(Uri.fromFile(directory), BackupOptions(privateSettings = true))
+                }
+                try {
+                    withTimeout(10_000) { entered.await() }
+                    assertFalse("creation is held in the actual synchronous validator", operation.isCompleted)
+                    operation.cancel()
+                    assertTrue(operation.isCancelled)
+                    release.countDown()
+                    withTimeout(20_000) { operation.join() }
+                    assertTrue(operation.isCompleted)
+                    assertEquals(
+                        "a cancelled attempt must not publish a successful timestamp",
+                        1_234_567L,
+                        timestamp.get(),
+                    )
+                    assertTrue("the cancelled attempt's own file must be removed", directory.listFiles()!!.isEmpty())
+                } finally {
+                    release.countDown()
+                    withContext(NonCancellable) {
+                        withTimeout(20_000) { operation.cancelAndJoin() }
+                    }
+                }
+            }
+            assertEquals(listOf(TRACKER_ID), fixture.trackerLookups.toList())
+        }
+    }
+
+    @Test
+    fun automaticRetentionDoesNotMatchLookalikePackageOrExtensionNames() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            val valid = fixture.createBackup().readBytes()
+            val directory = File(fixture.root, "automatic-scope").apply { check(mkdirs()) }
+            (0 until 4).forEach { minute ->
+                File(directory, "${BuildConfig.APPLICATION_ID}_2000-01-01_00-0$minute.tachibk").writeBytes(valid)
+            }
+            val unrelated = listOf(
+                "${BuildConfig.APPLICATION_ID.replace('.', 'x')}_1999-01-01_00-00.tachibk",
+                "${BuildConfig.APPLICATION_ID}_1999-01-01_00-00xtachibk",
+            ).associateWith { valid.copyOf().also { bytes -> File(directory, it).writeBytes(bytes) } }
+            fixture.creator(
+                isAutoBackup = true,
+                autoBackupFilename = { "${BuildConfig.APPLICATION_ID}_2000-01-02_03-04.tachibk" },
+            ).backup(Uri.fromFile(directory), BackupOptions(privateSettings = true))
+            unrelated.forEach { (name, bytes) ->
+                val file = File(directory, name)
+                assertTrue("automatic retention must preserve unrelated filename $name", file.isFile)
+                assertArrayEquals(bytes, file.readBytes())
+            }
+            assertEquals(
+                "four managed backups plus two unrelated documents must remain",
+                6,
+                directory.listFiles()!!.size,
+            )
+        }
+    }
+
+    @Test
+    fun successfulAutomaticBackupsAllocateDistinctFilesAndRetainFourValidBackups() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            val valid = fixture.createBackup().readBytes()
+            val directory = File(fixture.root, "automatic-success").apply { check(mkdirs()) }
+            val previous = (0 until 4).associate { minute ->
+                val name = "${BuildConfig.APPLICATION_ID}_2000-01-01_00-0$minute.tachibk"
+                name to valid.copyOf().also { bytes -> File(directory, name).writeBytes(bytes) }
+            }
+            val creator = fixture.creator(
+                isAutoBackup = true,
+                autoBackupFilename = { "${BuildConfig.APPLICATION_ID}_2000-01-02_03-04.tachibk" },
+            )
+            val first = creator.backup(Uri.fromFile(directory), BackupOptions(privateSettings = true))
+            assertEquals(4, directory.listFiles()!!.size)
+            val second = creator.backup(Uri.fromFile(directory), BackupOptions(privateSettings = true))
+            assertFalse("two same-minute successes must own distinct backup files", first == second)
+            assertTrue(File(checkNotNull(Uri.parse(first).path)).isFile)
+            assertTrue(File(checkNotNull(Uri.parse(second).path)).isFile)
+            val remaining = directory.listFiles()!!.toList()
+            assertEquals(4, remaining.size)
+            previous.filterKeys { name -> remaining.any { it.name == name } }
+                .forEach { (name, bytes) -> assertArrayEquals(bytes, File(directory, name).readBytes()) }
+            remaining.forEach { file ->
+                val result = fixture.validator.validate(Uri.fromFile(file))
+                assertTrue(result.missingSources.isEmpty())
+                assertTrue(result.missingTrackers.isEmpty())
+            }
+            assertTrue(BackupPreferences(fixture.source.store).lastAutoBackupTimestamp.get() > 0L)
+        }
+    }
+
     private fun assertSuccessful(callbacks: RecordingCallbacks) {
         assertEquals(1, callbacks.completions.size)
         assertEquals(0, callbacks.completions.single())
@@ -711,36 +879,54 @@ class BackupRoundTripIntegrationTest {
 
         suspend fun createBackup(): File {
             val file = File(root, "actual-roundtrip.tachibk").apply { check(createNewFile()) }
-            val creator = BackupCreator(
-                context = source.context,
-                isAutoBackup = false,
-                parser = parser,
-                getFavorites = GetFavorites(source.mangaRepository),
-                backupPreferences = BackupPreferences(source.store),
-                mangaRepository = source.mangaRepository,
-                categoriesBackupCreator = CategoriesBackupCreator(source.getCategories),
-                mangaBackupCreator = MangaBackupCreator(
-                    source.database,
-                    source.getCategories,
-                    GetHistory(source.historyRepository),
-                ),
-                preferenceBackupCreator = PreferenceBackupCreator(registry, source.store) { key ->
-                    check(key == SOURCE_KEY)
-                    source.sourcePreferences
-                },
-                extensionStoresBackupCreator = ExtensionStoresBackupCreator(
-                    GetExtensionStores(source.extensionRepository),
-                ),
-                sourcesBackupCreator = SourcesBackupCreator(registry),
-                backupFileValidator = validator,
-            )
             assertEquals(
                 Uri.fromFile(file).toString(),
-                creator.backup(Uri.fromFile(file), BackupOptions(privateSettings = true)),
+                creator().backup(Uri.fromFile(file), BackupOptions(privateSettings = true)),
             )
             assertEquals(listOf(TRACKER_ID), trackerLookups.toList())
             return file
         }
+
+        fun creator(
+            isAutoBackup: Boolean = false,
+            validator: BackupFileValidator = this.validator,
+            autoBackupFilename: () -> String = { BackupCreator.getFilename() },
+        ): BackupCreator = BackupCreator(
+            context = source.context,
+            isAutoBackup = isAutoBackup,
+            parser = parser,
+            getFavorites = GetFavorites(source.mangaRepository),
+            backupPreferences = BackupPreferences(source.store),
+            mangaRepository = source.mangaRepository,
+            categoriesBackupCreator = CategoriesBackupCreator(source.getCategories),
+            mangaBackupCreator = MangaBackupCreator(
+                source.database,
+                source.getCategories,
+                GetHistory(source.historyRepository),
+            ),
+            preferenceBackupCreator = PreferenceBackupCreator(registry, source.store) { key ->
+                check(key == SOURCE_KEY)
+                source.sourcePreferences
+            },
+            extensionStoresBackupCreator = ExtensionStoresBackupCreator(
+                GetExtensionStores(source.extensionRepository),
+            ),
+            sourcesBackupCreator = SourcesBackupCreator(registry),
+            backupFileValidator = validator,
+            autoBackupFilename = autoBackupFilename,
+        )
+
+        fun observedValidator(onTrackerLookup: (Long) -> Unit) = BackupFileValidator(
+            context = source.context,
+            sourceManager = registry,
+            trackerLookup = {
+                check(it == TRACKER_ID)
+                trackerLookups += it
+                onTrackerLookup(it)
+                null
+            },
+            decoder = decoder,
+        )
 
         fun verifyFile(file: File): Backup {
             val raw = file.readBytes()
@@ -1053,7 +1239,16 @@ class BackupRoundTripIntegrationTest {
                 { network.client.connectionPool.evictAll() },
                 { network.client.cache?.close() },
                 { driver.close() },
-                { check(context.deleteDatabase(databaseName)) },
+                {
+                    val databaseFile = context.getDatabasePath(databaseName)
+                    // The driver opens lazily, so an unused destination may never have a file.
+                    // Inspect our UUID database and SQLite sidecars instead of relying on the
+                    // deletion return value; existing files must still be completely removed.
+                    context.deleteDatabase(databaseName)
+                    check(listOf("", "-journal", "-wal", "-shm").none { File(databaseFile.path + it).exists() }) {
+                        "Isolated database cleanup left a database or SQLite sidecar"
+                    }
+                },
                 { check(context.deleteSharedPreferences(appName)) },
                 { check(context.deleteSharedPreferences(sourceName)) },
                 { check(!cache.exists() || cache.deleteRecursively()) },
