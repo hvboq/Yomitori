@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyGridScope
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
@@ -46,6 +47,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import androidx.compose.ui.unit.dp
@@ -155,6 +157,7 @@ fun CheckboxItem(label: String, checked: Boolean, onClick: () -> Unit) {
             )
         },
         onClick = onClick,
+        checked = checked,
     )
 }
 
@@ -457,10 +460,19 @@ private fun BaseSettingsItem(
     label: String,
     widget: @Composable RowScope.() -> Unit,
     onClick: () -> Unit,
+    checked: Boolean? = null,
 ) {
+    val interactionModifier = if (checked == null) {
+        Modifier.clickable(onClick = onClick)
+    } else {
+        Modifier.toggleable(
+            value = checked,
+            role = Role.Checkbox,
+            onValueChange = { onClick() },
+        )
+    }
     Row(
-        modifier = Modifier
-            .clickable(onClick = onClick)
+        modifier = interactionModifier
             .fillMaxWidth()
             .padding(
                 horizontal = SettingsItemsPaddings.Horizontal,

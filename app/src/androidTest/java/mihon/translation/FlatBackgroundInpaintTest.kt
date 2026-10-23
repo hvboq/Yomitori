@@ -6,6 +6,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.os.Build
+import android.os.Process
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
@@ -28,6 +30,8 @@ import org.junit.runner.RunWith
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
+import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Actual DBNet/AOT models and removal pixels; no translation server or source artwork. */
@@ -104,6 +108,100 @@ class FlatBackgroundInpaintTest {
             }
         } finally {
             page.recycle()
+        }
+    }
+
+    @Test
+    fun horizontalGlyphsWithPaddedBoundsAtPageEdgeUseTheirSupportedWhiteBackground() = runBlocking<Unit> {
+        check(context.packageName == "app.yomitori.yakuyomi.audit")
+        check(Process.is64Bit() && "arm64-v8a" in Build.SUPPORTED_ABIS)
+        Injekt.get<TranslationEngineService>().shutdown()
+        val page = neutralAsset("flat-near-left-source.png", SOURCE_SHA)
+        var segmentationToRecycle: Bitmap? = null
+        try {
+            val segmentation = neutralAsset("flat-near-left-segmentation.png", SEGMENTATION_SHA).also {
+                segmentationToRecycle = it
+            }
+            val output = File(context.getExternalFilesDir(null), "flat-inpaint-left-margin-${UUID.randomUUID()}")
+            check(output.mkdir())
+            println("FLAT_LEFT_MARGIN_REPORT=${File(output, "result.json").absolutePath}")
+            assertEquals(1000, page.width)
+            assertEquals(160, page.height)
+            assertEquals(page.width, segmentation.width)
+            assertEquals(page.height, segmentation.height)
+            val before = page.pixels()
+            val tightBefore = segmentation.pixels()
+            // Every frozen seg pixel is inside the original bbox+16 allow rectangle. A direct
+            // radius12 square expansion is therefore an independent oracle for the public mask.
+            val expectedMask = referenceDilation(tightBefore, page.width, page.height, 12)
+            val active = expectedMask.indices.filter { (expectedMask[it] and 255) > 127 }
+            assertArrayEquals(
+                intArrayOf(9, 50, 486, 128),
+                intArrayOf(
+                    active.minOf { it % page.width },
+                    active.minOf { it / page.width },
+                    active.maxOf { it % page.width } + 1,
+                    active.maxOf { it / page.width } + 1,
+                ),
+            )
+            val firstRegion = frozenHorizontalRegion()
+            Inpainter(model("mit_aot_fixed512"), InpainterConfig(method = "aot")).use { inpainter ->
+                val removal = inpainter.buildMask(page, listOf(firstRegion), segmentation)
+                try {
+                    assertArrayEquals(
+                        "The existing dilation/allow contract must not change",
+                        expectedMask,
+                        removal.pixels(),
+                    )
+                    val (cleaned, calls) = traceInpaint { inpainter.inpaint(page, listOf(firstRegion), segmentation) }
+                    try {
+                        save(page, File(output, "source.png"))
+                        save(removal, File(output, "removal.png"))
+                        save(cleaned, File(output, "cleaned.png"))
+                        val savedSeg = File(output, "segmentation.png")
+                        save(segmentation, savedSeg)
+                        val persisted = checkNotNull(BitmapFactory.decodeFile(savedSeg.path))
+                        try {
+                            assertArrayEquals(tightBefore, persisted.pixels())
+                            val savedRegion = frozenHorizontalRegion() // Saved onArt=true is only a stale hint.
+                            val (again, repeatCalls) = traceInpaint {
+                                inpainter.inpaint(page, listOf(savedRegion), persisted)
+                            }
+                            try {
+                                save(again, File(output, "saved-seg-cleaned.png"))
+                                File(output, "result.json").writeText(
+                                    JSONObject().put("sourceSha256", SOURCE_SHA)
+                                        .put("segmentationSha256", SEGMENTATION_SHA)
+                                        .put("aotCalls", calls).put("repeatAotCalls", repeatCalls)
+                                        .put("onArt", firstRegion.onArt).put("repeatOnArt", savedRegion.onArt)
+                                        .put("expectedRemovalPixels", active.size).toString(2),
+                                )
+                                assertArrayEquals("Original pixels are borrowed", before, page.pixels())
+                                assertArrayEquals("Segmentation is borrowed", tightBefore, segmentation.pixels())
+                                assertArrayEquals("Saved segmentation is borrowed", tightBefore, persisted.pixels())
+                                assertEquals("Supported white source must avoid reconstruction", 0, calls)
+                                assertEquals("Saved segmentation must use the same flat route", 0, repeatCalls)
+                                assertFalse(firstRegion.onArt)
+                                assertFalse(savedRegion.onArt)
+                                assertWhiteRemovalAndUntouchedContext(before, expectedMask, cleaned)
+                                assertArrayEquals("Saved-seg re-render must match", cleaned.pixels(), again.pixels())
+                                assertEquals(0, chroma(cleaned))
+                            } finally {
+                                again.recycle()
+                            }
+                        } finally {
+                            persisted.recycle()
+                        }
+                    } finally {
+                        cleaned.recycle()
+                    }
+                } finally {
+                    removal.recycle()
+                }
+            }
+        } finally {
+            page.recycle()
+            segmentationToRecycle?.recycle()
         }
     }
 
@@ -242,6 +340,55 @@ class FlatBackgroundInpaintTest {
         }
     }
 
+    private fun neutralAsset(name: String, sha256: String): Bitmap {
+        val bytes = InstrumentationRegistry.getInstrumentation().context.assets
+            .open("native-quality/$name").use { it.readBytes() }
+        val actual = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        assertEquals("Frozen neutral asset changed", sha256, actual)
+        return checkNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+    }
+
+    private fun referenceDilation(segmentation: IntArray, width: Int, height: Int, radius: Int): IntArray {
+        val expected = IntArray(segmentation.size) { Color.BLACK }
+        for (index in segmentation.indices) {
+            if ((segmentation[index] and 255) <= 127) continue
+            val x = index % width
+            val y = index / width
+            for (yy in maxOf(0, y - radius)..minOf(height - 1, y + radius)) {
+                for (xx in maxOf(0, x - radius)..minOf(width - 1, x + radius)) {
+                    expected[yy * width + xx] = Color.WHITE
+                }
+            }
+        }
+        return expected
+    }
+
+    private fun frozenHorizontalRegion() = TextRegion(
+        listOf(
+            TextLine(
+                listOf(
+                    Pt(19.086676f, 61.9297f),
+                    Pt(470.29443f, 63.02486f),
+                    Pt(470.17395f, 112.65691f),
+                    Pt(18.96621f, 111.56175f),
+                ),
+                1f,
+            ).apply {
+                direction = "h"
+                text = "私はここにいます"
+            },
+        ),
+        "h",
+        0f,
+        244.63031f,
+        87.293304f,
+        451.32822f,
+        50.727215f,
+    ).apply {
+        translatedText = "저는 여기 있어요"
+        onArt = true
+    }
+
     private fun assertWhiteRemovalAndUntouchedContext(before: IntArray, mask: IntArray, cleaned: Bitmap) {
         val expected = before.clone()
         var replaced = 0
@@ -290,5 +437,10 @@ class FlatBackgroundInpaintTest {
         bubble(70f, 850f, 1130f, 1450f)
         canvas.drawText("明日の会議は午後三時です。", 180f, 1080f, paint)
         canvas.drawText("少し待ってください。", 240f, 1210f, paint)
+    }
+
+    private companion object {
+        const val SOURCE_SHA = "00a1c4e367d9ca33e50944bbefaa039dd1ab39ffd3b9460c944d262cbed05e2d"
+        const val SEGMENTATION_SHA = "c7e1a07b0c1a7eda47a904ab77f7b480f42fb96efc8854b97aa7aaba27759b24"
     }
 }
