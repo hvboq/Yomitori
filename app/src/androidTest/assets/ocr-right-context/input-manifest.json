@@ -1,0 +1,1250 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Pinned neutral OCR holdout inputs; no images or API credentials are sent to a server. Host prepares exactly these 40 files in an audit-owned UUID input directory.",
+  "frozenSourceReportSha256": "3c9d1ae5dba1b5c9ca43c709946250bed2727c8e85567f8a3a33401ff96860ef",
+  "groundTruth": "Original OcrPunctuationTest rendering strings and saved neutral page truth; never copied from recognized OCR output.",
+  "files": [
+    {
+      "name": "sample-000-source.png",
+      "bytes": 7865,
+      "sha256": "c923234f8d85e49c527b2513e9f7a907bd7ff271241aa77439e7d2071767da37"
+    },
+    {
+      "name": "sample-001-source.png",
+      "bytes": 11414,
+      "sha256": "b4b821ddc04d5060ce47bce9d898e06a0f27c637aa0bd134eb548644d2353eab"
+    },
+    {
+      "name": "sample-002-source.png",
+      "bytes": 9537,
+      "sha256": "18c06b37f85f7f0f25ed6b3085268d156d00204523213fbb90e71374b877c03f"
+    },
+    {
+      "name": "sample-003-source.png",
+      "bytes": 4291,
+      "sha256": "ef1f07fd5c4b53da6a17c1de5a5e82ec8fa4d48b520ed3dbbfe67e7e51a20e6e"
+    },
+    {
+      "name": "sample-004-source.png",
+      "bytes": 4138,
+      "sha256": "1d59f07516bef17a52f5e8d52806a05bd88abb6e0477f19c7bba3b5bc6c0a5a9"
+    },
+    {
+      "name": "sample-005-source.png",
+      "bytes": 4493,
+      "sha256": "5190a13981d9da5fa9c02101a1f303482474a974a414edf09e67ca3201ab04ef"
+    },
+    {
+      "name": "sample-006-source.png",
+      "bytes": 4534,
+      "sha256": "b4112f81756b8767490aa0a52c03de24207da2081e8eefbd1f92c7bc7ccac22d"
+    },
+    {
+      "name": "sample-007-source.png",
+      "bytes": 4850,
+      "sha256": "5152a5bfa53fa09833ae528379f24d18089befeca758ef471b2cc5e4c2771984"
+    },
+    {
+      "name": "sample-008-source.png",
+      "bytes": 5782,
+      "sha256": "44aa3899e538145572daddbe6d3dea2cc5cf7b8da050e1ee461dec080af9cc82"
+    },
+    {
+      "name": "sample-009-source.png",
+      "bytes": 10891,
+      "sha256": "d9ed126c978abbc3ad2478c0e1192426effd39f4c9f757f439a0c15f1123b3be"
+    },
+    {
+      "name": "sample-010-source.png",
+      "bytes": 6594,
+      "sha256": "fec8bbf90c604ddf4a84d85e14b0bff9476ab75ca2194914cb6e6851aecd586e"
+    },
+    {
+      "name": "sample-011-source.png",
+      "bytes": 6226,
+      "sha256": "39aad3d9d9779dd6cdb690de434fda49517da8fec17a399ff6486dcf93be4dda"
+    },
+    {
+      "name": "sample-012-source.png",
+      "bytes": 6492,
+      "sha256": "a2f025039024257ba52ccb2ca71db5e7ef5f42ce7e985536bfd5a7223f5cc68b"
+    },
+    {
+      "name": "sample-013-source.png",
+      "bytes": 6730,
+      "sha256": "de7f893c9f7bb4c6e281c5c732e49eefa80f768f382a5d2750df618d89ae838a"
+    },
+    {
+      "name": "sample-014-source.png",
+      "bytes": 5642,
+      "sha256": "4f48747221475dd5f140757384290e767877f61cf859566146c324babc2a34ee"
+    },
+    {
+      "name": "sample-015-source.png",
+      "bytes": 4178,
+      "sha256": "b217e369811b923033ef9fe0b37881711dc81669cbda5ff43a2c6191b866fa40"
+    },
+    {
+      "name": "sample-016-source.png",
+      "bytes": 4530,
+      "sha256": "cfe0dec676481b9cea558950f9df2e6f198d348d9f7678c5dd0011f791d125c7"
+    },
+    {
+      "name": "sample-017-source.png",
+      "bytes": 4802,
+      "sha256": "a191458a94b585b308117fcb2678a58fc93469afc75271fe8323c9c54955e38b"
+    },
+    {
+      "name": "sample-018-source.png",
+      "bytes": 11884,
+      "sha256": "00a1c4e367d9ca33e50944bbefaa039dd1ab39ffd3b9460c944d262cbed05e2d"
+    },
+    {
+      "name": "sample-019-source.png",
+      "bytes": 17726,
+      "sha256": "8e7b2dfd39fe9f433e1cea6c65b6bcefc93b7145d4e24f6880d3609a2e76fd0b"
+    },
+    {
+      "name": "sample-020-source.png",
+      "bytes": 14894,
+      "sha256": "76b05dc643a047afb0987f26ab00e04219252e3bd3090a349dcd0bc0439a600a"
+    },
+    {
+      "name": "sample-021-source.png",
+      "bytes": 6159,
+      "sha256": "c294a15d692ac7c99a2adbba48d518a4fe292e84e2d48c6bbc3ed193c4f35400"
+    },
+    {
+      "name": "sample-022-source.png",
+      "bytes": 6147,
+      "sha256": "0f96d3807b05af53e346e0c7180a02d9dd82190a05428764a71a3fbdac44be63"
+    },
+    {
+      "name": "sample-023-source.png",
+      "bytes": 6773,
+      "sha256": "34f46c6294b4d47a8eb4ced217375763e83e7bfb71a6c50bbadf1e594c4ea147"
+    },
+    {
+      "name": "sample-024-source.png",
+      "bytes": 6735,
+      "sha256": "4d635ab66dd002773ac59d8867ffdc2349586c5235325cfef23deeeaa4e6bda6"
+    },
+    {
+      "name": "sample-025-source.png",
+      "bytes": 7357,
+      "sha256": "914f080adf0d15815f39dfd42be887ca5a0ba8cc63a36da00a021474b581b006"
+    },
+    {
+      "name": "sample-026-source.png",
+      "bytes": 8615,
+      "sha256": "5e2c6b442c9858c00ad72bc1cecb30596bc83da55d5c05f246177267c55f1771"
+    },
+    {
+      "name": "sample-027-source.png",
+      "bytes": 17143,
+      "sha256": "03b3ce3c9adcdf7190db517f3a613138865bff200fbd97068e0f6f462fab65c2"
+    },
+    {
+      "name": "sample-028-source.png",
+      "bytes": 9724,
+      "sha256": "8655a5e5ce466434cf6e34364f9b659021dc3f4f8e285271dadc74ad7f21ceb0"
+    },
+    {
+      "name": "sample-029-source.png",
+      "bytes": 9020,
+      "sha256": "e782ed4a126a18ec116833b09bbca130eea2d8312fb76643192e021a455926c4"
+    },
+    {
+      "name": "sample-030-source.png",
+      "bytes": 9426,
+      "sha256": "6a914dfc66e259fc7165a2e4f25d2296ffbb408e612f29180e6665b86d98a253"
+    },
+    {
+      "name": "sample-031-source.png",
+      "bytes": 10147,
+      "sha256": "3cb291b68f66a37b0403ac256e6fc6b29b9fd51c0261e48034e3ce5bb9bb7afe"
+    },
+    {
+      "name": "sample-032-source.png",
+      "bytes": 8361,
+      "sha256": "7b0ec33a815b17f5d99c1fb586b12e4e7472a71928715e471d1a370a86166984"
+    },
+    {
+      "name": "sample-033-source.png",
+      "bytes": 6293,
+      "sha256": "6a29afa22ffc9b93b25c8c8aaa86844602c01d8850c5a97e7f50404fa749c79c"
+    },
+    {
+      "name": "sample-034-source.png",
+      "bytes": 6512,
+      "sha256": "859665175edf62184e8a8f8f1bbeeccd4ebf7aeda1df7ca59db8900e831b30a2"
+    },
+    {
+      "name": "sample-035-source.png",
+      "bytes": 7107,
+      "sha256": "fd5cff6fb207df99ab1224eadc3f10b3882bf93bbf06c6cd5c03801b1a8b3c9a"
+    },
+    {
+      "name": "001.orig.png",
+      "bytes": 81955,
+      "sha256": "5cdb5512795c39a27dcb169340b2b5dd8af5aecd88e93295e524d108cbdc290b"
+    },
+    {
+      "name": "001.json",
+      "bytes": 1370,
+      "sha256": "41738931d61be163fabb920848afd27ca890ab1d26827e53056d45cc6306f1f0"
+    },
+    {
+      "name": "003.orig.png",
+      "bytes": 99696,
+      "sha256": "2324c73221ff35de2912a491024e46c946be5c6a7d0b424ab969b2fad0bd8d18"
+    },
+    {
+      "name": "003.json",
+      "bytes": 3872,
+      "sha256": "c2c765d96754263a1c0047f70f80e0c26fc75b27c939c5931143d8aabf0f8995"
+    }
+  ],
+  "frozenSamples": [
+    {
+      "id": "frozen-000",
+      "sampleIndex": 0,
+      "file": "sample-000-source.png",
+      "expected": "私はここにいます",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          21,
+          81
+        ],
+        [
+          290,
+          81
+        ],
+        [
+          290,
+          113
+        ],
+        [
+          21,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-001",
+      "sampleIndex": 1,
+      "file": "sample-001-source.png",
+      "expected": "ばらの花が咲きました",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          23,
+          81
+        ],
+        [
+          358,
+          81
+        ],
+        [
+          358,
+          113
+        ],
+        [
+          23,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-002",
+      "sampleIndex": 2,
+      "file": "sample-002-source.png",
+      "expected": "ぱんを食べました",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          23,
+          81
+        ],
+        [
+          290,
+          81
+        ],
+        [
+          290,
+          113
+        ],
+        [
+          23,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-003",
+      "sampleIndex": 3,
+      "file": "sample-003-source.png",
+      "expected": "これは",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          82
+        ],
+        [
+          121,
+          82
+        ],
+        [
+          121,
+          112
+        ],
+        [
+          25,
+          112
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-004",
+      "sampleIndex": 4,
+      "file": "sample-004-source.png",
+      "expected": "ことば",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          81
+        ],
+        [
+          122,
+          81
+        ],
+        [
+          122,
+          112
+        ],
+        [
+          25,
+          112
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-005",
+      "sampleIndex": 5,
+      "file": "sample-005-source.png",
+      "expected": "らっぱ",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          26,
+          81
+        ],
+        [
+          122,
+          81
+        ],
+        [
+          122,
+          113
+        ],
+        [
+          26,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-006",
+      "sampleIndex": 6,
+      "file": "sample-006-source.png",
+      "expected": "ことば。",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          81
+        ],
+        [
+          134,
+          81
+        ],
+        [
+          134,
+          113
+        ],
+        [
+          25,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-007",
+      "sampleIndex": 7,
+      "file": "sample-007-source.png",
+      "expected": "らっぱ。",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          26,
+          81
+        ],
+        [
+          134,
+          81
+        ],
+        [
+          134,
+          113
+        ],
+        [
+          26,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-008",
+      "sampleIndex": 8,
+      "file": "sample-008-source.png",
+      "expected": "少し待って、",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          21,
+          81
+        ],
+        [
+          199,
+          81
+        ],
+        [
+          199,
+          113
+        ],
+        [
+          21,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-009",
+      "sampleIndex": 9,
+      "file": "sample-009-source.png",
+      "expected": "ありがとうございます、",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          23,
+          80
+        ],
+        [
+          370,
+          80
+        ],
+        [
+          370,
+          112
+        ],
+        [
+          23,
+          112
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-010",
+      "sampleIndex": 10,
+      "file": "sample-010-source.png",
+      "expected": "うたいます♪",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          81
+        ],
+        [
+          216,
+          81
+        ],
+        [
+          216,
+          113
+        ],
+        [
+          25,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-011",
+      "sampleIndex": 11,
+      "file": "sample-011-source.png",
+      "expected": "音楽です♫",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          21,
+          81
+        ],
+        [
+          185,
+          81
+        ],
+        [
+          185,
+          114
+        ],
+        [
+          21,
+          114
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-012",
+      "sampleIndex": 12,
+      "file": "sample-012-source.png",
+      "expected": "輪の形はの",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          21,
+          81
+        ],
+        [
+          188,
+          81
+        ],
+        [
+          188,
+          113
+        ],
+        [
+          21,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-013",
+      "sampleIndex": 13,
+      "file": "sample-013-source.png",
+      "expected": "あいうえお",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          23,
+          82
+        ],
+        [
+          189,
+          82
+        ],
+        [
+          189,
+          112
+        ],
+        [
+          23,
+          112
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-014",
+      "sampleIndex": 14,
+      "file": "sample-014-source.png",
+      "expected": "これはぱ",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          81
+        ],
+        [
+          156,
+          81
+        ],
+        [
+          156,
+          112
+        ],
+        [
+          25,
+          112
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-015",
+      "sampleIndex": 15,
+      "file": "sample-015-source.png",
+      "expected": "ことばば",
+      "decoration": "none",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          81
+        ],
+        [
+          156,
+          81
+        ],
+        [
+          156,
+          112
+        ],
+        [
+          25,
+          112
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-016",
+      "sampleIndex": 16,
+      "file": "sample-016-source.png",
+      "expected": "ことば",
+      "decoration": "belowRing",
+      "fontSize": 36,
+      "quad": [
+        [
+          25,
+          81
+        ],
+        [
+          140,
+          81
+        ],
+        [
+          140,
+          137
+        ],
+        [
+          25,
+          137
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-017",
+      "sampleIndex": 17,
+      "file": "sample-017-source.png",
+      "expected": "らっぱ",
+      "decoration": "hollowNote",
+      "fontSize": 36,
+      "quad": [
+        [
+          26,
+          81
+        ],
+        [
+          140,
+          81
+        ],
+        [
+          140,
+          113
+        ],
+        [
+          26,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-018",
+      "sampleIndex": 18,
+      "file": "sample-018-source.png",
+      "expected": "私はここにいます",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          21,
+          62
+        ],
+        [
+          472,
+          62
+        ],
+        [
+          472,
+          115
+        ],
+        [
+          21,
+          115
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-019",
+      "sampleIndex": 19,
+      "file": "sample-019-source.png",
+      "expected": "ばらの花が咲きました",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          25,
+          61
+        ],
+        [
+          585,
+          61
+        ],
+        [
+          585,
+          115
+        ],
+        [
+          25,
+          115
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-020",
+      "sampleIndex": 20,
+      "file": "sample-020-source.png",
+      "expected": "ぱんを食べました",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          25,
+          62
+        ],
+        [
+          471,
+          62
+        ],
+        [
+          471,
+          115
+        ],
+        [
+          25,
+          115
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-021",
+      "sampleIndex": 21,
+      "file": "sample-021-source.png",
+      "expected": "これは",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          64
+        ],
+        [
+          189,
+          64
+        ],
+        [
+          189,
+          113
+        ],
+        [
+          29,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-022",
+      "sampleIndex": 22,
+      "file": "sample-022-source.png",
+      "expected": "ことば",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          63
+        ],
+        [
+          190,
+          63
+        ],
+        [
+          190,
+          113
+        ],
+        [
+          29,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-023",
+      "sampleIndex": 23,
+      "file": "sample-023-source.png",
+      "expected": "らっぱ",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          30,
+          62
+        ],
+        [
+          190,
+          62
+        ],
+        [
+          190,
+          114
+        ],
+        [
+          30,
+          114
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-024",
+      "sampleIndex": 24,
+      "file": "sample-024-source.png",
+      "expected": "ことば。",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          63
+        ],
+        [
+          211,
+          63
+        ],
+        [
+          211,
+          114
+        ],
+        [
+          29,
+          114
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-025",
+      "sampleIndex": 25,
+      "file": "sample-025-source.png",
+      "expected": "らっぱ。",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          30,
+          62
+        ],
+        [
+          211,
+          62
+        ],
+        [
+          211,
+          114
+        ],
+        [
+          30,
+          114
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-026",
+      "sampleIndex": 26,
+      "file": "sample-026-source.png",
+      "expected": "少し待って、",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          22,
+          62
+        ],
+        [
+          319,
+          62
+        ],
+        [
+          319,
+          115
+        ],
+        [
+          22,
+          115
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-027",
+      "sampleIndex": 27,
+      "file": "sample-027-source.png",
+      "expected": "ありがとうございます、",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          26,
+          60
+        ],
+        [
+          606,
+          60
+        ],
+        [
+          606,
+          114
+        ],
+        [
+          26,
+          114
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-028",
+      "sampleIndex": 28,
+      "file": "sample-028-source.png",
+      "expected": "うたいます♪",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          62
+        ],
+        [
+          349,
+          62
+        ],
+        [
+          349,
+          115
+        ],
+        [
+          29,
+          115
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-029",
+      "sampleIndex": 29,
+      "file": "sample-029-source.png",
+      "expected": "音楽です♫",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          23,
+          62
+        ],
+        [
+          297,
+          62
+        ],
+        [
+          297,
+          116
+        ],
+        [
+          23,
+          116
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-030",
+      "sampleIndex": 30,
+      "file": "sample-030-source.png",
+      "expected": "輪の形はの",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          22,
+          62
+        ],
+        [
+          300,
+          62
+        ],
+        [
+          300,
+          115
+        ],
+        [
+          22,
+          115
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-031",
+      "sampleIndex": 31,
+      "file": "sample-031-source.png",
+      "expected": "あいうえお",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          26,
+          64
+        ],
+        [
+          303,
+          64
+        ],
+        [
+          303,
+          113
+        ],
+        [
+          26,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-032",
+      "sampleIndex": 32,
+      "file": "sample-032-source.png",
+      "expected": "これはぱ",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          62
+        ],
+        [
+          247,
+          62
+        ],
+        [
+          247,
+          113
+        ],
+        [
+          29,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-033",
+      "sampleIndex": 33,
+      "file": "sample-033-source.png",
+      "expected": "ことばば",
+      "decoration": "none",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          63
+        ],
+        [
+          247,
+          63
+        ],
+        [
+          247,
+          113
+        ],
+        [
+          29,
+          113
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-034",
+      "sampleIndex": 34,
+      "file": "sample-034-source.png",
+      "expected": "ことば",
+      "decoration": "belowRing",
+      "fontSize": 60,
+      "quad": [
+        [
+          29,
+          63
+        ],
+        [
+          208,
+          63
+        ],
+        [
+          208,
+          138
+        ],
+        [
+          29,
+          138
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    },
+    {
+      "id": "frozen-035",
+      "sampleIndex": 35,
+      "file": "sample-035-source.png",
+      "expected": "らっぱ",
+      "decoration": "hollowNote",
+      "fontSize": 60,
+      "quad": [
+        [
+          30,
+          62
+        ],
+        [
+          208,
+          62
+        ],
+        [
+          208,
+          114
+        ],
+        [
+          30,
+          114
+        ]
+      ],
+      "width": 1000,
+      "height": 160
+    }
+  ],
+  "savedPages": [
+    {
+      "page": "001",
+      "image": "001.orig.png",
+      "geometry": "001.json",
+      "expected": [
+        "こんにちは。",
+        "今日もよろしくお願いします。",
+        "明日の会議は午後三時です。",
+        "少し待ってください。"
+      ]
+    },
+    {
+      "page": "003",
+      "image": "003.orig.png",
+      "geometry": "003.json",
+      "expected": [
+        "今日はいい天気ですね。",
+        "一緒に出かけませんか。",
+        "分かりました。",
+        "分かりました。",
+        "まだ準備ができません。",
+        "少し待ってください。",
+        "分かりました。",
+        "分かりました。",
+        "ありがとうございます。",
+        "もうすぐ終わります。",
+        "分かりました。",
+        "分かりました。"
+      ]
+    }
+  ]
+}
