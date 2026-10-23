@@ -400,6 +400,85 @@ class PartialPageStoreTest {
     }
 
     @Test
+    fun `multi page done overlay preserves valid completion order and ignores short or foreign record names`() {
+        val completed = Fixture("complete.png").apply { commit("complete", complete = true) }
+        val pending = Fixture("pending.png").apply { commit("partial") }
+        val laterCompleted = Fixture("later.png").apply { commit("later complete", complete = true) }
+        val broken = Fixture("broken.png").apply {
+            commit("broken complete", complete = true)
+            io.materials[io.materials.keys.single { it.endsWith(".record") }] = byteArrayOf(1)
+        }
+        val foreign = Fixture("source.png").apply { commit("foreign complete", complete = true) }
+        val io = MemoryIo()
+        for (fixture in listOf(completed, pending, laterCompleted, broken)) {
+            io.materials.putAll(fixture.io.materials)
+        }
+        val sourcePrefix = "partial-${PartialPageStore.sha256("source.png".toByteArray())}-"
+        val foreignPrefix = "partial-${PartialPageStore.sha256("foreign.png".toByteArray())}-"
+        foreign.io.materials.filterKeys { it.startsWith(sourcePrefix) }.forEach { (name, bytes) ->
+            io.materials[name.replace(sourcePrefix, foreignPrefix)] = bytes.copyOf()
+        }
+        val ignoredNames = listOf("x.record", "partial-x.record", "foreign.record", "${foreignPrefix}short.record")
+        ignoredNames.forEach { io.materials[it] = byteArrayOf(1) }
+        val before = io.materials.mapValues { it.value.copyOf() }
+        val reads = mutableListOf<String>()
+        val store = PartialPageStore(object : PartialPageStore.Io by io {
+            override fun readMaterial(name: String, maxBytes: Int): ByteArray? {
+                reads.add(name)
+                return io.readMaterial(name, maxBytes)
+            }
+        })
+
+        val result = store.applyDoneOverlay(linkedSetOf("pending.png", "broken.png", "foreign.png", "legacy.png"))
+
+        result.toList() shouldBe listOf("legacy.png", "complete.png", "later.png")
+        ignoredNames.none { it in reads } shouldBe true
+        io.replacementCount shouldBe 0
+        io.materials.keys shouldBe before.keys
+        before.forEach { (name, bytes) -> io.materials.getValue(name).contentEquals(bytes) shouldBe true }
+    }
+
+    @Test
+    fun `each overlay page freshly observes a new wip or changed journal after the initial listing`() {
+        val first = Fixture("first.png")
+        val firstComplete = first.commit("first complete", complete = true)
+        val firstBefore = first.io.materials.mapValues { it.value.copyOf() }
+        first.io.afterCreate = { name -> if (name.endsWith(".wip")) throw ProcessDeath() }
+        shouldThrow<ProcessDeath> { first.commit("new pending", base = firstComplete.revision) }
+        val newPending = first.io.materials.filterKeys { it !in firstBefore }
+        newPending.keys.any { it.endsWith(".wip") } shouldBe true
+        val second = Fixture("second.png").apply { commit("second complete", complete = true) }
+        val secondRecord = second.io.materials.keys.single { it.endsWith(".record") }
+        val io = MemoryIo().apply {
+            materials.putAll(firstBefore)
+            materials.putAll(second.io.materials)
+        }
+        var listings = 0
+        val reads = mutableListOf<String>()
+        val store = PartialPageStore(object : PartialPageStore.Io by io {
+            override fun materialNames(): Set<String> {
+                listings++
+                if (listings == 2) io.materials.putAll(newPending)
+                if (listings == 3) io.materials[secondRecord] = byteArrayOf(1)
+                return io.materialNames()
+            }
+
+            override fun readMaterial(name: String, maxBytes: Int): ByteArray? {
+                reads.add(name)
+                return io.readMaterial(name, maxBytes)
+            }
+        })
+
+        store.applyDoneOverlay(linkedSetOf("first.png", "second.png", "legacy.png")) shouldBe setOf("legacy.png")
+
+        listings shouldBe 3
+        (newPending.keys.single { it.endsWith(".wip") } in reads) shouldBe true
+        io.materials.getValue(secondRecord).contentEquals(byteArrayOf(1)) shouldBe true
+        io.replacementCount shouldBe 0
+        io.page.decodeToString() shouldBe "exact original bytes"
+    }
+
+    @Test
     fun `first partial separates its OCR original from the preceding completed output baseline`() {
         val fixture = Fixture()
         fixture.io.page = "previous completed translation".toByteArray()
@@ -682,13 +761,17 @@ class PartialPageStoreTest {
 
     private class ProcessDeath : Error("simulated process termination without catch/finally")
 
-    private class Fixture {
+    private class Fixture(private val defaultPage: String = PAGE) {
         val io = MemoryIo()
-        val original = PartialPageStore.Original(ORIGINAL, PartialPageStore.sha256(io.page), io.page.size.toLong())
+        val original = PartialPageStore.Original(
+            "${defaultPage.substringBeforeLast('.')}.orig.${defaultPage.substringAfterLast('.')}",
+            PartialPageStore.sha256(io.page),
+            io.page.size.toLong(),
+        )
         val store = PartialPageStore(io)
 
         init {
-            io.materials[ORIGINAL] = io.page.copyOf()
+            io.materials[original.name] = io.page.copyOf()
         }
 
         fun commit(
@@ -696,7 +779,7 @@ class PartialPageStoreTest {
             base: String? = null,
             complete: Boolean = false,
             cancel: () -> Unit = {},
-            page: String = PAGE,
+            page: String = defaultPage,
             original: PartialPageStore.Original = this.original,
             width: Int = 4,
             payload: String = "{\"recognized\":[\"successful group\"],\"retry\":[\"failed group\"]}",

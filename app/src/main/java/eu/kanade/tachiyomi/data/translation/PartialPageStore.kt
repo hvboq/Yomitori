@@ -178,13 +178,16 @@ internal class PartialPageStore(private val io: Io) {
         val all = io.materialNames().filter { JOURNAL_NAME.matches(it) }
         val groups = all.filter { it.endsWith(".commit") || it.endsWith(".wip") }
             .groupBy { it.substring(0, PREFIX.length + 64) }
+        if (groups.isEmpty()) return result
+        val recordsByPrefix = all.filter { it.endsWith(".record") }.groupBy { it.take(PREFIX.length + 64) }
+        val doneByPrefix = done.groupBy(::prefix)
         for ((pagePrefix, _) in groups) {
-            val pages = all.filter { it.startsWith("$pagePrefix-") && it.endsWith(".record") }.mapNotNull { file ->
+            val pages = recordsByPrefix[pagePrefix].orEmpty().mapNotNull { file ->
                 runCatching { decodeState(io.readMaterial(file, MAX_RECORD_BYTES) ?: return@runCatching null) }
                     .getOrNull()?.pageName?.takeIf { prefix(it) == pagePrefix }
             }.toSet()
             // A broken record can still be associated with a manifest page by its hashed filename.
-            val associated = pages + done.filter { prefix(it) == pagePrefix }
+            val associated = pages + doneByPrefix[pagePrefix].orEmpty()
             for (page in associated) {
                 val metadata = runCatching { scan(page) }.getOrNull()
                 val pending = metadata == null || metadata.invalidWips.isNotEmpty() ||
