@@ -50,6 +50,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
 import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -116,6 +117,8 @@ import java.io.File
 import java.util.Date
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
@@ -416,6 +419,96 @@ class BackupRoundTripIntegrationTest {
             assertEquals(0, destination.reschedules.get())
             // Source preferences/extension stores are independent stages and may finish before
             // cancellation. Their persistence is deliberately not treated as atomic rollback.
+        }
+    }
+
+    @Test
+    fun cancellingDuringDownloadCacheInvalidationSuppressesNormalCompletion() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            fixture.seedDestination()
+            val file = fixture.createBackup()
+            val destination = fixture.destination
+            val entered = CompletableDeferred<Unit>()
+            val release = CountDownLatch(1)
+            val callbacks = RecordingCallbacks()
+            coroutineScope {
+                val operation = async(Dispatchers.IO) {
+                    destination.restorer(
+                        callbacks,
+                        invalidateDownloadCache = {
+                            destination.invalidations.incrementAndGet()
+                            entered.complete(Unit)
+                            check(release.await(20, TimeUnit.SECONDS)) { "cache invalidation gate was not released" }
+                        },
+                    ).restore(Uri.fromFile(file), RestoreOptions())
+                }
+                try {
+                    withTimeout(10_000) { entered.await() }
+                    assertFalse("restore is held in synchronous post-processing", operation.isCompleted)
+                    // Cancellation is delivered by the controlling coroutine while the actual
+                    // restorer is blocked after all section jobs have returned. Releasing a JVM
+                    // latch does not itself introduce a cancellable suspension in that restorer.
+                    operation.cancel()
+                    assertTrue(operation.isCancelled)
+                    release.countDown()
+                    withTimeout(20_000) { operation.join() }
+                    assertTrue(operation.isCompleted)
+                    assertTrue(
+                        "a cancelled restore must not publish normal completion",
+                        callbacks.completions.isEmpty(),
+                    )
+                } finally {
+                    // Release before joining, even if the controlling wait or assertion failed.
+                    // Otherwise cancellation cannot unblock the non-suspending fixture callback.
+                    release.countDown()
+                    withContext(NonCancellable) {
+                        withTimeout(20_000) { operation.cancelAndJoin() }
+                    }
+                }
+            }
+            assertEquals(1, destination.invalidations.get())
+            assertEquals(1, destination.reschedules.get())
+            // Sections already completed before cancellation. Their persistence is expected and
+            // is deliberately not presented as atomic rollback of a cancelled restore.
+            fixture.assertDestination()
+        }
+    }
+
+    @Test
+    fun cancellationExceptionFromDownloadCacheInvalidationPropagatesWithoutNormalCompletion() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.seedSource()
+            fixture.seedDestination()
+            val file = fixture.createBackup()
+            val destination = fixture.destination
+            val callbacks = RecordingCallbacks()
+            val cancellation = CancellationException("isolated cache invalidation cancellation")
+            val failure = runCatching {
+                withContext(Dispatchers.IO) {
+                    destination.restorer(
+                        callbacks,
+                        invalidateDownloadCache = {
+                            destination.invalidations.incrementAndGet()
+                            throw cancellation
+                        },
+                    ).restore(Uri.fromFile(file), RestoreOptions())
+                }
+            }.exceptionOrNull()
+            assertTrue(
+                "cache cancellation must propagate rather than be logged as a recoverable error",
+                failure is CancellationException,
+            )
+            assertEquals(cancellation.message, failure?.message)
+            assertTrue(
+                "propagated cancellation must retain the injected exception, including stacktrace recovery copies",
+                generateSequence(failure) { it.cause }.take(8).any { it === cancellation },
+            )
+            assertTrue("cache cancellation must not publish normal completion", callbacks.completions.isEmpty())
+            assertEquals(1, destination.invalidations.get())
+            assertEquals(1, destination.reschedules.get())
+            // This tests cancellation propagation after sections finished, not rollback.
+            fixture.assertDestination()
         }
     }
 
@@ -877,6 +970,7 @@ class BackupRoundTripIntegrationTest {
             callbacks: RecordingCallbacks,
             categoryCreation: GetCategories = getCategories,
             dependentCategories: GetCategories = getCategories,
+            invalidateDownloadCache: () -> Unit = { invalidations.incrementAndGet() },
         ): BackupRestorer {
             val chapters = GetChaptersByMangaId(chapterRepository)
             val fetch = FetchInterval(chapters)
@@ -907,7 +1001,7 @@ class BackupRoundTripIntegrationTest {
                     InsertTrack(trackRepository),
                     fetch,
                 ),
-                invalidateDownloadCache = { invalidations.incrementAndGet() },
+                invalidateDownloadCache = invalidateDownloadCache,
                 decoder = BackupDecoder(context, ProtoBuf),
             )
         }

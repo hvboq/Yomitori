@@ -59,6 +59,7 @@ internal class HitomiSocksProxy(
     private val returns = pool("hitomi-return", maxConnections)
     private val listener = ServerSocket().apply {
         bind(InetSocketAddress(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0), maxConnections)
+        soTimeout = minOf(idleTimeoutMillis, READ_TICK_MS)
     }
     val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", listener.localPort))
     internal val activeConnectionCount: Int get() = connections.size
@@ -72,9 +73,14 @@ internal class HitomiSocksProxy(
         while (!closed.get()) {
             val client = try {
                 listener.accept()
+            } catch (_: SocketTimeoutException) {
+                expireIdleConnections()
+                continue
             } catch (_: IOException) {
                 break
             }
+            // Incoming connections must not prevent expiry, including when every permit is occupied.
+            expireIdleConnections()
             if (!admission.tryAcquire()) {
                 client.close()
                 continue
@@ -144,14 +150,18 @@ internal class HitomiSocksProxy(
             )
             val fragments = fragmenter(firstFlight)
             val upstream = remote.getOutputStream()
+            connection.beginRelay()
             if (fragments == null) {
                 upstream.write(firstFlight)
+                connection.touch()
                 upstream.flush()
             } else {
                 upstream.write(fragments.first)
+                connection.touch()
                 upstream.flush()
                 if (splitDelayMillis > 0) Thread.sleep(splitDelayMillis)
                 upstream.write(fragments.second)
+                connection.touch()
                 upstream.flush()
                 fragmentationCount.incrementAndGet()
             }
@@ -243,6 +253,14 @@ internal class HitomiSocksProxy(
         admission.release()
     }
 
+    /** Socket read timeouts cannot interrupt a stalled write after the other direction has clean EOF. */
+    private fun expireIdleConnections() {
+        val idleLimit = TimeUnit.MILLISECONDS.toNanos(idleTimeoutMillis.toLong())
+        connections.forEach { connection ->
+            if (connection.isRelayIdle(idleLimit)) finish(connection)
+        }
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         listener.close()
@@ -286,6 +304,7 @@ internal class HitomiSocksProxy(
         private var closed = false
         private val finished = AtomicBoolean(false)
         private val completedDirections = AtomicInteger()
+        private val relayStarted = AtomicBoolean()
         private val lastActivity = AtomicLong(System.nanoTime())
 
         fun claimCompletion(): Boolean = finished.compareAndSet(false, true)
@@ -294,6 +313,11 @@ internal class HitomiSocksProxy(
             lastActivity.set(System.nanoTime())
         }
         fun idleNanos(): Long = System.nanoTime() - lastActivity.get()
+        fun beginRelay() {
+            touch()
+            relayStarted.set(true)
+        }
+        fun isRelayIdle(idleLimit: Long): Boolean = relayStarted.get() && idleNanos() >= idleLimit
 
         @Synchronized fun attach(socket: Socket): Boolean {
             if (closed) {

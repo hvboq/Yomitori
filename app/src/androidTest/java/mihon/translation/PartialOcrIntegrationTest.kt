@@ -86,6 +86,148 @@ class PartialOcrIntegrationTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
     @Test
+    fun nativeFreshFormatOnlyTargetFailsTranslationAndPreservesOriginalPixels() = runBlocking<Unit> {
+        requireNonRenderableNativeAudit()
+        val requests = mutableListOf<List<String>>()
+        val invalidTranslator = object : Translator {
+            override suspend fun translate(queries: List<String>): List<String> {
+                requests += queries.toList()
+                return queries.mapIndexed { index, _ ->
+                    if (index == queries.lastIndex) "\u200B\uFEFF\u200D\u202E\u0007" else "안녕하세요."
+                }
+            }
+        }
+        nativePipeline(force = Force.NONE, translator = invalidTranslator) { pipeline, ocr ->
+            val original = fixture()
+            val originalHash = digest(original)
+            var result: PageResult? = null
+            try {
+                result = pipeline.translatePage(original)
+                assertTrue(result.toString(), result is PageResult.Failed)
+                val failed = result as PageResult.Failed
+                assertTrue(failed.reason, failed.reason.startsWith("translate:"))
+                assertTrue(failed.reason, failed.reason.contains("Incomplete translation:"))
+                assertEquals(1, ocr.calls)
+                assertEquals(1, requests.size)
+                assertTrue("Real OCR must produce separate translation regions", requests.single().size >= 2)
+                assertTrue(requests.single().all { it.isNotBlank() })
+                assertFalse(original.isRecycled)
+                assertEquals("An unusable target must not overwrite the input pixels", originalHash, digest(original))
+            } finally {
+                release(result)
+                original.recycle()
+            }
+        }
+    }
+
+    @Test
+    fun nativeFormatOnlyResumeAndCorruptSavedTargetRetainSuccessfulProgressAndBorrowedPixels() = runBlocking<Unit> {
+        requireNonRenderableNativeAudit()
+        val requests = mutableListOf<List<String>>()
+        var invalid = false
+        val translator = object : Translator {
+            override suspend fun translate(queries: List<String>): List<String> {
+                requests += queries.toList()
+                return queries.map { if (invalid) " \u200B\uFEFF\u200D\u202E\u0001" else "안녕하세요. 오늘도 잘 부탁드립니다." }
+            }
+        }
+        nativePipeline(translator = translator) { pipeline, ocr ->
+            val original = fixture()
+            val originalHash = digest(original)
+            var first: PageResult.Partial? = null
+            var failedResume: PageResult? = null
+            var corruptResume: PageResult? = null
+            var borrowedMask: Bitmap? = null
+            try {
+                val partial = partial(pipeline.translatePage(original))
+                first = partial
+                val before = requireNotNull(partial.analysis.progress)
+                val completed = before.regions.filter { it.state == RegionState.TRANSLATED }
+                val pending = before.regions.single { it.state == RegionState.OCR_PENDING }
+                assertTrue("Fixture must preserve an earlier successful translation", completed.isNotEmpty())
+                assertEquals(completed.map(::source), requests.single())
+                val payload = OcrProgressCodec.encode(before)
+                val originalMaskHash = digest(partial.analysis.mask)
+                val mask = requireNotNull(partial.analysis.mask.copy(Bitmap.Config.ARGB_8888, false))
+                borrowedMask = mask
+                val borrowedMaskHash = digest(mask)
+                val analysis = PageAnalysis(mask, before.toTextRegions(), before)
+                fun liveProgress() = OcrProgressCodec.encode(
+                    PageProgress.capture(
+                        original.width,
+                        original.height,
+                        analysis.regions,
+                        before.regions.map { it.state },
+                    ),
+                )
+                val liveBefore = liveProgress()
+                invalid = true
+                failedResume = pipeline.resumePage(original, analysis)
+                assertTrue(failedResume.toString(), failedResume is PageResult.Failed)
+                val failed = failedResume as PageResult.Failed
+                assertTrue(failed.reason, failed.reason.startsWith("translate:"))
+                assertTrue(failed.reason, failed.reason.contains("Incomplete translation:"))
+                assertEquals(2, ocr.calls)
+                assertEquals(listOf(pending.lines.single { it.text.isBlank() }.quad), ocr.lastInputQuads)
+                assertEquals(2, requests.size)
+                assertEquals(1, requests.last().size)
+                assertTrue(
+                    "Previously successful groups must not re-enter translation",
+                    requests.last().none { it in completed.map(::source) },
+                )
+                assertEquals(payload, OcrProgressCodec.encode(before))
+                assertEquals(payload, OcrProgressCodec.encode(requireNotNull(partial.analysis.progress)))
+                assertEquals(liveBefore, liveProgress())
+                assertTrue(before.hasPending)
+                assertEquals(completed, before.regions.filter { it.state == RegionState.TRANSLATED })
+                assertEquals(originalHash, digest(original))
+                assertEquals(originalMaskHash, digest(partial.analysis.mask))
+                assertEquals(borrowedMaskHash, digest(mask))
+                assertFalse(mask.isRecycled)
+
+                // A persisted unusable success must fail before OCR, translation, or borrowed-mask copying.
+                val corrupt = before.copy(
+                    regions = before.regions.map { saved ->
+                        if (saved.id == completed.first().id) saved.copy(translatedText = "\uFEFF\u200B") else saved
+                    },
+                )
+                corruptResume = pipeline.resumePage(original, PageAnalysis(mask, analysis.regions, corrupt))
+                assertTrue(corruptResume.toString(), corruptResume is PageResult.Failed)
+                val corruptFailure = corruptResume as PageResult.Failed
+                assertTrue(corruptFailure.reason, corruptFailure.reason.startsWith("resume:"))
+                assertTrue(
+                    corruptFailure.reason,
+                    corruptFailure.reason.contains("Translated OCR progress contains unresolved or excluded text"),
+                )
+                assertEquals("Corrupt saved state must fail before recognition", 2, ocr.calls)
+                assertEquals("Corrupt saved state must fail before translation", 2, requests.size)
+                assertEquals(payload, OcrProgressCodec.encode(before))
+                assertEquals(liveBefore, liveProgress())
+                assertEquals(originalHash, digest(original))
+                assertEquals(originalMaskHash, digest(partial.analysis.mask))
+                assertEquals(borrowedMaskHash, digest(mask))
+                assertFalse(mask.isRecycled)
+            } finally {
+                release(first)
+                release(failedResume)
+                release(corruptResume)
+                borrowedMask?.recycle()
+                original.recycle()
+            }
+        }
+    }
+
+    private fun requireNonRenderableNativeAudit() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        check(instrumentation.targetContext.packageName == "app.yomitori.yakuyomi.audit") {
+            "Non-renderable native regression requires the isolated audit installation"
+        }
+        check(InstrumentationRegistry.getArguments().getString("nonRenderableNativeAudit") == "true") {
+            "Explicit nonRenderableNativeAudit=true is required before native models are accessed"
+        }
+    }
+
+    @Test
     fun nativeResumeReadsOnlyMissingLineAndPreservesSuccessfulTargetsGeometryAndRawMask() = runBlocking<Unit> {
         FixtureTranslationServer().use { server ->
             nativePipeline(server = server) { pipeline, ocr ->
@@ -1122,7 +1264,7 @@ class PartialOcrIntegrationTest {
         }
     }
 
-    private enum class Force { ONE_LINE, ALL }
+    private enum class Force { NONE, ONE_LINE, ALL }
 
     /** Deliberately controls only OCR availability; all recognized text comes from the real model. */
     private class ForcedFirstOcr(private val native: Ocr, private val force: Force) : OcrRecognizer {
@@ -1143,7 +1285,7 @@ class PartialOcrIntegrationTest {
             if (calls == 1) {
                 if (force == Force.ALL) {
                     lines.forEach { it.text = "" }
-                } else {
+                } else if (force == Force.ONE_LINE) {
                     val groups = Grouping.group(lines)
                     check(groups.size >= 2) { "Fixture must have separate balloons" }
                     val group = groups.firstOrNull { it.lines.size >= 2 }

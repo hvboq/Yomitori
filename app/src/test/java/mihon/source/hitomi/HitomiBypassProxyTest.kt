@@ -3,8 +3,11 @@ package mihon.source.hitomi
 import io.kotest.matchers.shouldBe
 import okhttp3.Dns
 import org.junit.jupiter.api.Test
+import java.io.ByteArrayInputStream
 import java.io.DataInputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -14,6 +17,7 @@ import java.net.SocketException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -97,6 +101,92 @@ class HitomiBypassProxyTest {
             // Closing with unread trickled bytes may send RST instead of EOF on some platforms.
             // SocketTimeoutException is deliberately not accepted as proof of closure.
         }
+    }
+
+    private class BlockedWriteSocket(private val allowedWrites: Int) : Socket() {
+        val writeBlocked = CountDownLatch(1)
+        val socketClosed = CountDownLatch(1)
+        private val releaseWrite = CountDownLatch(1)
+        private val fixtureClosed = AtomicBoolean()
+        private val writes = AtomicInteger()
+        private val input = ByteArrayInputStream(byteArrayOf())
+        private val output = object : OutputStream() {
+            override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
+
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                if (writes.incrementAndGet() <= allowedWrites) return
+                writeBlocked.countDown()
+                try {
+                    releaseWrite.await()
+                } catch (error: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw IOException("Fixture write interrupted", error)
+                }
+                throw IOException("Fixture socket closed")
+            }
+        }
+
+        override fun getInputStream(): InputStream = input
+        override fun getOutputStream(): OutputStream = output
+        override fun setTcpNoDelay(on: Boolean) = Unit
+        override fun setSoTimeout(timeout: Int) = Unit
+        override fun shutdownOutput() = Unit
+        override fun close() {
+            if (!fixtureClosed.compareAndSet(false, true)) return
+            socketClosed.countDown()
+            releaseWrite.countDown()
+        }
+    }
+
+    private fun assertBlockedWriteExpires(allowFirstTlsWrite: Boolean) {
+        val remote = BlockedWriteSocket(if (allowFirstTlsWrite) 1 else 0)
+        try {
+            relay({ _, _ -> remote }, capacity = 1, idleTimeoutMillis = 300).use { proxy ->
+                client(proxy).use { socket ->
+                    connect(socket) shouldBe 0
+                    socket.getOutputStream().apply {
+                        write(if (allowFirstTlsWrite) record + byteArrayOf(9, 8, 7) else record)
+                        flush()
+                    }
+                    remote.writeBlocked.await(3, TimeUnit.SECONDS) shouldBe true
+                    if (allowFirstTlsWrite) {
+                        // The return pump has clean EOF, so no input timeout remains to close the stalled upload.
+                        socket.getInputStream().read() shouldBe -1
+                    }
+                    remote.socketClosed.await(3, TimeUnit.SECONDS) shouldBe true
+                    eventually { proxy.activeConnectionCount == 0 }
+                    val replacementDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+                    while (true) {
+                        try {
+                            client(proxy).use { replacement -> connect(replacement, port = 80) shouldBe 2 }
+                            break
+                        } catch (error: IOException) {
+                            // Admission can be released just before the sole synchronous worker finishes unwinding.
+                            if (System.nanoTime() >= replacementDeadline) {
+                                throw AssertionError(
+                                    "Replacement SOCKS request did not acquire the released permit",
+                                    error,
+                                )
+                            }
+                            Thread.sleep(10)
+                        }
+                    }
+                }
+            }
+        } finally {
+            // A red baseline must still unblock the fake write and release its daemon worker.
+            remote.close()
+        }
+    }
+
+    @Test
+    fun `blocked upload after clean return EOF expires and its sole permit can serve another request`() {
+        assertBlockedWriteExpires(allowFirstTlsWrite = true)
+    }
+
+    @Test
+    fun `blocked first TLS write expires and its sole permit can serve another request`() {
+        assertBlockedWriteExpires(allowFirstTlsWrite = false)
     }
 
     @Test
