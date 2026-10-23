@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.data.translation
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContainAll
 import io.kotest.matchers.shouldBe
+import li.joye.yakuyomi.engine.HorizontalOcrContextPolicy
 import li.joye.yakuyomi.engine.InpainterConfig
 import li.joye.yakuyomi.engine.RenderConfig
 import li.joye.yakuyomi.engine.TextOrientation
@@ -24,6 +25,15 @@ class EngineConfigMappingTest {
 
     /** 佇列／reader 會傳進來的去字法原始字串（含退役的 auto_tile 與空字串，映射一律當 aot）。 */
     private val methods = listOf("auto_whole", "boxfill", "auto_tile", "")
+
+    @Test
+    fun `reader and queue mappings enable the validated horizontal OCR context policy`() {
+        val preferences = prefs()
+        for (method in methods) {
+            EngineConfigMapping.buildEngineConfig(preferences, method).ocr.horizontalContextPolicy shouldBe
+                HorizontalOcrContextPolicy.GUARDED_32
+        }
+    }
 
     @Test
     fun `預設值：重繪拿到的就是引擎預設（768、24、16、縱中橫開）`() {

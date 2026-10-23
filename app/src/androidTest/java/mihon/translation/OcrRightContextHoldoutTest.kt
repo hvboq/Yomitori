@@ -72,10 +72,13 @@ class OcrRightContextHoldoutTest {
         check(16 in margins && 32 in margins) { "The raw baseline and 32-column observation must both be present" }
         val shared = Injekt.get<TranslationEngineService>()
         requireSharedIdle(shared)
-        val baselineConfig = OcrConfig()
+        val baselineConfig = OcrConfig(horizontalContextPolicy = HorizontalOcrContextPolicy.LEGACY_16)
         check(baselineConfig.horizontalContextPolicy == HorizontalOcrContextPolicy.LEGACY_16)
         check(baselineConfig.stripPad == 4 && baselineConfig.textHeight == 48 && baselineConfig.ignoreBubble == 0)
-        val candidateConfig = baselineConfig.copy(horizontalContextPolicy = HorizontalOcrContextPolicy.GUARDED_32)
+        val candidateConfig = OcrConfig()
+        check(candidateConfig.horizontalContextPolicy == HorizontalOcrContextPolicy.GUARDED_32) {
+            "The public product default must use the validated guarded32 policy"
+        }
         val cases = input.fixedCases() + rightContextGeneratedCases()
         check(cases.size == 120 && cases.map { it.id }.distinct().size == 120)
         val output = File(

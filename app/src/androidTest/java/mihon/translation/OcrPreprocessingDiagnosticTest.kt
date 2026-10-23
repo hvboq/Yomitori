@@ -13,6 +13,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import li.joye.yakuyomi.engine.HorizontalOcrContextPolicy
 import li.joye.yakuyomi.engine.InternalEngineApi
 import li.joye.yakuyomi.engine.NcnnBackend
 import li.joye.yakuyomi.engine.Ocr
@@ -62,8 +63,9 @@ class OcrPreprocessingDiagnosticTest {
         check(Process.is64Bit() && "arm64-v8a" in Build.SUPPORTED_ABIS) { "Actual ARM64 process is required" }
         val shared = Injekt.get<TranslationEngineService>()
         requireSharedIdle(shared)
-        val cfg = OcrConfig()
-        val productionScope = "Public recognize includes circle/filter/blank recovery"
+        // Keep the recorded 16-column reference fixed as the product default evolves.
+        val cfg = OcrConfig(horizontalContextPolicy = HorizontalOcrContextPolicy.LEGACY_16)
+        val productionScope = "Legacy16 public recognize includes circle/filter/blank recovery"
         check(cfg.textHeight == 48 && cfg.stripPad == 4 && cfg.useBicubic && cfg.ocrUnsharp && cfg.ignoreBubble == 0) {
             "Production defaults changed; update this explicitly controlled diagnostic before running"
         }

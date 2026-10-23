@@ -10,6 +10,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
 import kotlinx.coroutines.runBlocking
+import li.joye.yakuyomi.engine.HorizontalOcrContextPolicy
 import li.joye.yakuyomi.engine.InternalEngineApi
 import li.joye.yakuyomi.engine.NcnnBackend
 import li.joye.yakuyomi.engine.Ocr
@@ -46,7 +47,10 @@ class OcrPunctuationTest {
         val terminalKanaCoverage = mutableMapOf('は' to 0, 'ば' to 0, 'ぱ' to 0)
         val preservationFailures = mutableListOf<String>()
         try {
-            Ocr(File(context.filesDir, "models/ocr_48px_ctc.ncnn.param").path, dictionary).use { ocr ->
+            // This historical circle-correction test compares against raw16, including its errors.
+            // The product default is checked against independent truth by OcrRightContextHoldoutTest.
+            val legacy = OcrConfig(horizontalContextPolicy = HorizontalOcrContextPolicy.LEGACY_16)
+            Ocr(File(context.filesDir, "models/ocr_48px_ctc.ncnn.param").path, dictionary, legacy).use { ocr ->
                 val expectedPages = mapOf(
                     "001" to listOf("こんにちは。", "今日もよろしくお願いします。", "明日の会議は午後三時です。", "少し待ってください。"),
                     "003" to listOf(
@@ -224,7 +228,7 @@ class OcrPunctuationTest {
         val rows = JSONArray()
         try {
             for (pad in listOf(4, 0, 2, 6, 8)) {
-                val cfg = OcrConfig(stripPad = pad)
+                val cfg = OcrConfig(stripPad = pad, horizontalContextPolicy = HorizontalOcrContextPolicy.LEGACY_16)
                 Ocr(File(context.filesDir, "models/ocr_48px_ctc.ncnn.param").path, dictionary, cfg).use { ocr ->
                     for (name in listOf("001", "003")) {
                         val page = checkNotNull(BitmapFactory.decodeFile(File(input, "$name.orig.png").path))

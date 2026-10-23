@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
+import li.joye.yakuyomi.engine.HorizontalOcrContextPolicy
+import li.joye.yakuyomi.engine.OcrConfig
 import li.joye.yakuyomi.engine.OcrLineProgress
 import li.joye.yakuyomi.engine.PageAnalysis
 import li.joye.yakuyomi.engine.PageProgress
@@ -28,6 +30,7 @@ import li.joye.yakuyomi.engine.TranslationContext
 import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.TranslatorConfig
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -115,6 +118,73 @@ class ResumeContextServiceTest {
                 assertSame(previous, analysis.progress)
                 assertEquals(Color.WHITE, source.getPixel(0, 0))
                 assertFalse(analysis.mask.isRecycled)
+            } finally {
+                service.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun defaultOcrPolicyRestartsLegacyProgressWithoutReusingItsSuccessfulTarget() = runBlocking {
+        withInput { source, analysis ->
+            val ocr = OcrConfig()
+            assertEquals(HorizontalOcrContextPolicy.GUARDED_32, ocr.horizontalContextPolicy)
+            val translator = TranslationContext.fromTranslator(TranslatorConfig(toLangName = "Korean"))
+            fun policyContext(policy: HorizontalOcrContextPolicy) = requireNotNull(
+                TranslationContext.forPipeline(
+                    translator,
+                    TranslationContext.forOcrPolicy(ocr.ignoreBubble, policy),
+                    null,
+                ),
+            )
+            val legacy = policyContext(HorizontalOcrContextPolicy.LEGACY_16)
+            val current = policyContext(ocr.horizontalContextPolicy)
+            assertFalse(legacy == current)
+            val pending = requireNotNull(analysis.progress).regions.single()
+            val previousTarget = "이전 정책에서 성공한 번역"
+            val progress = PageProgress(
+                source.width,
+                source.height,
+                listOf(
+                    pending.copy(
+                        state = RegionState.TRANSLATED,
+                        lines = pending.lines.map { it.copy(text = "以前の本文") },
+                        translatedText = previousTarget,
+                    ),
+                    pending.copy(id = 1),
+                ),
+            )
+            progress.validateFor(source.width, source.height)
+            val savedAnalysis = PageAnalysis(analysis.mask, progress.toTextRegions(), progress)
+            val before = IntArray(source.width * source.height).also {
+                source.getPixels(it, 0, source.width, 0, 0, source.width, source.height)
+            }
+            val fake = CountingEngine(current)
+            val service = isolatedService(fake, preferences("Korean"))
+            try {
+                val result = service.translateStoredPage(
+                    source,
+                    savedAnalysis,
+                    StoredTranslationContext.encode(legacy),
+                    "boxfill",
+                )
+                assertTrue(result.restarted)
+                assertTrue(result.result is PageResult.Skipped)
+                assertEquals(current, StoredTranslationContext.decode(requireNotNull(result.contextPayload)))
+                assertEquals(1, fake.full.get())
+                assertEquals(0, fake.resumed.get())
+                assertSame(source, fake.lastOriginal)
+                assertNull("Fresh inference must not receive old regions or targets", fake.lastAnalysis)
+                assertSame(progress, savedAnalysis.progress)
+                assertEquals(previousTarget, progress.regions[0].translatedText)
+                assertEquals(previousTarget, savedAnalysis.regions[0].translatedText)
+                assertEquals(listOf(1), progress.pendingRegionIds)
+                assertFalse(source.isRecycled)
+                assertFalse(analysis.mask.isRecycled)
+                val after = IntArray(before.size).also {
+                    source.getPixels(it, 0, source.width, 0, 0, source.width, source.height)
+                }
+                assertArrayEquals("Protected original must survive the policy restart", before, after)
             } finally {
                 service.shutdown()
             }
