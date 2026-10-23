@@ -854,7 +854,8 @@ class PageTranslator(private val context: Context) {
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
         shouldStop: () -> Boolean = { false },
     ): Int {
-        // 原圖：用素材的原圖還原整章，不需 lama → 早於 lama 載入處理。工作清單同去字路徑（有素材 json 的頁）。
+        // Original restoration needs only a saved source. Each page validates that source;
+        // optional OCR JSON/masks remain requirements of the text-removal path below.
         if (newMethod == ORIGINAL_METHOD) {
             val matDir = chapterDir.findFile(MATERIALS_DIR) ?: run {
                 onProgress(0, 0)
@@ -864,9 +865,8 @@ class PageTranslator(private val context: Context) {
                 ?.filter { f -> f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in IMAGE_EXT }
                 ?.sortedBy { it.name.orEmpty() }
                 ?.filter { img ->
-                    // 完整素材 json（[NightTextBoxes.materialsJsonName]）；只有遮罩／夜讀文字框的頁不算
                     val name = img.name ?: return@filter false
-                    hasReRenderMaterials(chapterDir, name)
+                    findOriginalMaterial(matDir, name) != null
                 }
                 ?: return 0
             onProgress(0, workList.size)
