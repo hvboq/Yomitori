@@ -747,41 +747,73 @@ internal fun EngineStatusPanel(onOpenModelSettings: () -> Unit, modifier: Modifi
     }
     val outdated = modelState?.second ?: false
     val needsModels = modelState?.let { !it.first } ?: false // 查完且不可用 → 顯示更新/下載引導（查完前不顯示、避免一閃）
-    Row(
+    EngineStatusPanelContent(
+        loading = loading,
+        warm = warm,
+        needsModels = needsModels,
+        outdated = outdated,
+        onUnload = { engineService.shutdownAsync() },
+        onPreload = { engineService.warmUpAsync() },
+        onOpenModelSettings = onOpenModelSettings,
+        modifier = modifier,
+    )
+}
+
+/** State-only presentation, shared by the live queue and focused layout/accessibility tests. */
+@Composable
+internal fun EngineStatusPanelContent(
+    loading: Boolean,
+    warm: Boolean,
+    needsModels: Boolean,
+    outdated: Boolean,
+    onUnload: () -> Unit,
+    onPreload: () -> Unit,
+    onOpenModelSettings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
         modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(
-            imageVector = if (loading) Icons.Outlined.Sync else Icons.Outlined.Translate,
-            contentDescription = null,
-            tint = when {
-                warm -> MaterialTheme.colorScheme.primary
-                needsModels -> MaterialTheme.colorScheme.error // 模型不可用 → 醒目 error 色
-                else -> LocalContentColor.current.copy(alpha = 0.5f)
-            },
-        )
-        Text(
-            text = when {
-                loading -> stringResource(MR.strings.engine_status_loading)
-                warm -> stringResource(MR.strings.engine_status_warm)
-                needsModels && outdated -> stringResource(MR.strings.engine_status_models_outdated)
-                needsModels -> stringResource(MR.strings.engine_status_models_missing)
-                else -> stringResource(MR.strings.engine_status_cold)
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 12.dp),
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = if (loading) Icons.Outlined.Sync else Icons.Outlined.Translate,
+                contentDescription = null,
+                tint = when {
+                    warm -> MaterialTheme.colorScheme.primary
+                    needsModels -> MaterialTheme.colorScheme.error // 模型不可用 → 醒目 error 色
+                    else -> LocalContentColor.current.copy(alpha = 0.5f)
+                },
+            )
+            Text(
+                text = when {
+                    loading -> stringResource(MR.strings.engine_status_loading)
+                    warm -> stringResource(MR.strings.engine_status_warm)
+                    needsModels && outdated -> stringResource(MR.strings.engine_status_models_outdated)
+                    needsModels -> stringResource(MR.strings.engine_status_models_missing)
+                    else -> stringResource(MR.strings.engine_status_cold)
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 12.dp),
+            )
+            if (loading) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            }
+        }
+        // Long localized actions need their own width so the status cannot collapse to zero.
         when {
-            loading -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            warm -> TextButton(onClick = { engineService.shutdownAsync() }) {
+            loading -> Unit
+            warm -> TextButton(onClick = onUnload, modifier = Modifier.align(Alignment.End)) {
                 Text(stringResource(MR.strings.engine_unload))
             }
             // 模型不可用 → 別讓「預載引擎」空轉（resolveModelSet 回 null、停在未預載）→ 導去設定更新/下載模型。
-            needsModels -> TextButton(onClick = onOpenModelSettings) {
+            needsModels -> TextButton(onClick = onOpenModelSettings, modifier = Modifier.align(Alignment.End)) {
                 val label = if (outdated) {
                     MR.strings.pref_translation_update_models
                 } else {
@@ -789,7 +821,7 @@ internal fun EngineStatusPanel(onOpenModelSettings: () -> Unit, modifier: Modifi
                 }
                 Text(stringResource(label))
             }
-            else -> TextButton(onClick = { engineService.warmUpAsync() }) {
+            else -> TextButton(onClick = onPreload, modifier = Modifier.align(Alignment.End)) {
                 Text(stringResource(MR.strings.engine_preload_action))
             }
         }

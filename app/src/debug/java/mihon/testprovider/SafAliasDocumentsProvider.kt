@@ -16,6 +16,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * UID-guarded, debug-only real DocumentsProvider for UUID-owned cache fixtures.
@@ -67,7 +68,14 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         if (!file.isFile) throw FileNotFoundException("Fixture document is not a file")
         if ('w' in mode) {
             session.writeModes.add(documentId to mode)
-            if (file == session.page && session.failNextPageWrite.compareAndSet(true, false)) {
+            val pendingWriteFailure = session.failNextWriteDocumentId.get()
+            // Provider arguments may be equal strings carried across Binder, not the same object.
+            val failSelectedWrite = pendingWriteFailure == documentId &&
+                session.failNextWriteDocumentId.compareAndSet(pendingWriteFailure, null)
+            if (
+                (file == session.page && session.failNextPageWrite.compareAndSet(true, false)) ||
+                failSelectedWrite
+            ) {
                 // Exercise replacement rollback after an actual provider-side truncate.
                 file.writeBytes(byteArrayOf(1, 2, 3))
                 throw FileNotFoundException("Intentional owned-fixture replacement failure")
@@ -82,6 +90,7 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         val (session, parent) = resolve(parentDocumentId)
         check(parent.isDirectory)
         requireName(displayName)
+        session.createRequests.add(mimeType to displayName)
         val child = session.checked(File(parent, displayName))
         check(!child.exists()) { "Fixture entry already exists" }
         check(if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) child.mkdir() else child.createNewFile())
@@ -163,7 +172,9 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         val chapter = checked(File(directory, "chapter")).apply { check(mkdir()) }
         val page = checked(File(chapter, "target.png"))
         val failNextPageWrite = AtomicBoolean(false)
+        val failNextWriteDocumentId = AtomicReference<String?>(null)
         val writeModes = CopyOnWriteArrayList<Pair<String, String>>()
+        val createRequests = CopyOnWriteArrayList<Pair<String, String>>()
         val reads = CopyOnWriteArrayList<String>()
 
         fun documentId(file: File): String = "$id|${checked(file).relativeTo(directory).invariantSeparatorsPath}"

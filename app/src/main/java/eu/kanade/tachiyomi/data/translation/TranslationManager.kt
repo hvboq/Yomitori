@@ -2096,7 +2096,21 @@ class TranslationManager(private val context: Context) {
                 // original next to it even when the SAF provider cannot roll back a failed write.
                 val backupName = "$cbzName.yomitori-original-${java.util.UUID.randomUUID()}.bak"
                 check(parent.findFile(backupName) == null) { "Archive backup path already exists" }
-                val backup = checkNotNull(parent.createFile(backupName)) { "Cannot create original archive backup" }
+                // UniFile infers a MIME type from .bak and strips that suffix before creating a
+                // tree document. Providers can then choose a different extension (for example ~).
+                // Keep this opaque recovery filename intact and verify the provider's actual name.
+                val backup = checkNotNull(
+                    if (parent.uri.scheme == "content") {
+                        android.provider.DocumentsContract.createDocument(
+                            context.contentResolver,
+                            parent.uri,
+                            "application/octet-stream",
+                            backupName,
+                        )?.let { UniFile.fromUri(context, it) }
+                    } else {
+                        parent.createFile(backupName)
+                    },
+                ) { "Cannot create original archive backup" }
                 check(backup.uri != cbz.uri && backup.name == backupName && backup.isFile) {
                     "Archive provider did not create a distinct backup file"
                 }
