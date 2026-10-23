@@ -52,10 +52,20 @@ abstract class WebViewInterceptor(
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val response = chain.proceed(request)
-        val needsInterception = try {
-            shouldIntercept(response)
+        try {
+            if (!shouldIntercept(response)) {
+                return response
+            }
+
+            if (!WebViewUtil.supportsWebView(context)) {
+                launchUI {
+                    context.toast(MR.strings.information_webview_required, Toast.LENGTH_LONG)
+                }
+                return response
+            }
+            initWebView
         } catch (failure: Throwable) {
-            // A failed probe cannot hand its response back to the caller.
+            // A failed probe or preparation cannot hand its response back to the caller.
             try {
                 response.close()
             } catch (closeFailure: Throwable) {
@@ -63,18 +73,6 @@ abstract class WebViewInterceptor(
             }
             throw failure
         }
-        if (!needsInterception) {
-            return response
-        }
-
-        if (!WebViewUtil.supportsWebView(context)) {
-            launchUI {
-                context.toast(MR.strings.information_webview_required, Toast.LENGTH_LONG)
-            }
-            return response
-        }
-        initWebView
-
         return intercept(chain, request, response)
     }
 

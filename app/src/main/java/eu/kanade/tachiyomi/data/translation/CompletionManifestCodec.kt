@@ -28,6 +28,16 @@ internal object CompletionManifestCodec {
         }
     }
 
+    /** A valid empty snapshot is usable; unversioned primary/previous files retain legacy semantics. */
+    fun hasUsableSnapshot(files: Map<String, ByteArray>): Boolean = files.any { (name, bytes) ->
+        bytes.size <= MAX_BYTES && when {
+            name == PRIMARY || name == PREVIOUS ->
+                decode(bytes) != null || !bytes.toString(Charsets.UTF_8).startsWith("YOMITORI-")
+            isCheckpoint(name) -> decode(bytes) != null
+            else -> false
+        }
+    }
+
     fun resolve(files: Map<String, ByteArray>): Set<String> {
         val checkpoints = files.filterKeys(::isCheckpoint).values.mapNotNull(::decode)
         val primary = files[PRIMARY]

@@ -731,9 +731,10 @@ class PageTranslator(private val context: Context) {
             findOriginalMaterial(matDir, pageFileName) != null
     }.getOrDefault(false)
 
-    /** 該頁是否已翻（manifest 命中）：即時翻 loader 用來判斷「直接服務已覆蓋的譯圖」還是「進引擎翻」。 */
-    fun isPageTranslated(chapterDir: UniFile, pageName: String): Boolean =
+    /** Display-only completion status. Processing uses the authoritative [readDonePages] directly. */
+    fun isPageTranslated(chapterDir: UniFile, pageName: String): Boolean = runCatching {
         pageName in readDonePages(chapterDir)
+    }.getOrDefault(false)
 
     /** UI-only metadata status: partial output can be visible without completing every OCR group. */
     fun hasDisplayableTranslation(chapterDir: UniFile, pageName: String): Boolean = runCatching {
@@ -2190,17 +2191,17 @@ class PageTranslator(private val context: Context) {
     }
 
     /** 該章是否已翻：manifest 涵蓋所有現有圖頁（chapterDir＝鬆散資料夾或 CBZ 解壓後暫存夾）。 */
-    fun isChapterTranslated(chapterDir: UniFile): Boolean {
+    fun isChapterTranslated(chapterDir: UniFile): Boolean = runCatching {
         val images = chapterDir.listFiles()
             ?.filter { f -> f.isFile && (f.name?.substringAfterLast('.', "")?.lowercase() ?: "") in IMAGE_EXT }
-            ?.mapNotNull { it.name } ?: return false
-        if (images.isEmpty()) return false
+            ?.mapNotNull { it.name } ?: return@runCatching false
+        if (images.isEmpty()) return@runCatching false
         val done = readDonePages(chapterDir)
-        if (!images.all { it in done }) return false
-        return images.all { name ->
+        if (!images.all { it in done }) return@runCatching false
+        images.all { name ->
             runCatching { loadJournal(chapterDir, name, recover = false)?.complete != false }.getOrDefault(false)
         }
-    }
+    }.getOrDefault(false)
 
     /** ZIP/CBZ uses the same verified manifest and complete page coverage as loose chapters. */
     fun isArchiveTranslated(archive: UniFile): Boolean = runCatching {
@@ -2218,27 +2219,34 @@ class PageTranslator(private val context: Context) {
         }
     }.getOrDefault(false)
 
-    /** 讀 manifest（已處理頁名集合）。 */
+    /** Authoritative processing state: unreadable storage cannot authorize inference or replacement. */
     private fun readDonePages(chapterDir: UniFile): Set<String> {
         val legacy = CompletionManifestCodec.resolve(readManifestFiles(chapterDir))
-        return runCatching { partialStore(chapterDir)?.applyDoneOverlay(legacy) ?: legacy }.getOrDefault(emptySet())
+        return partialStore(chapterDir)?.applyDoneOverlay(legacy) ?: legacy
     }
 
     private fun readManifestFiles(chapterDir: UniFile): Map<String, ByteArray> {
-        val files = chapterDir.listFiles().orEmpty().filter {
+        val files = (chapterDir.listFiles() ?: throw java.io.IOException("Cannot list translation manifests")).filter {
             it.isFile && it.name?.let { name ->
                 name == MARKER || name == CompletionManifestCodec.PREVIOUS || CompletionManifestCodec.isCheckpoint(name)
             } == true
         }
-        return files.mapNotNull { file ->
+        val readable = files.mapNotNull { file ->
             readManifestBytes(file)?.let { file.name!! to it }
         }.toMap()
+        if (files.isNotEmpty() && !CompletionManifestCodec.hasUsableSnapshot(readable)) {
+            throw java.io.IOException("No usable translation completion snapshot")
+        }
+        return readable
     }
 
-    private fun readManifestBytes(file: UniFile): ByteArray? = runCatching {
-        if (!file.isFile) return@runCatching null
-        context.contentResolver.openInputStream(file.uri)?.use(CompletionManifestCodec::read)
-    }.getOrNull()
+    private fun readManifestBytes(file: UniFile): ByteArray? {
+        if (!file.isFile) throw java.io.IOException("Translation manifest is no longer a file")
+        val input = context.contentResolver.openInputStream(file.uri)
+            ?: throw java.io.IOException("Cannot open translation manifest")
+        // Oversized/corrupt bytes remain codec failures; an I/O failure must not look like absence.
+        return input.use(CompletionManifestCodec::read)
+    }
 
     /** 覆寫 manifest（每頁成功後叫一次；小檔、相對翻譯耗時可忽略，給中斷後 resume）。只給 [commitManifest] 用。 */
     private fun writeManifest(chapterDir: UniFile, done: Set<String>) {
@@ -2253,7 +2261,8 @@ class PageTranslator(private val context: Context) {
      * manifest 的「讀-改-寫」：磁碟上現有的 ∪ [known]，寫回，回傳合併後的集合。經 [manifestMutex]（行程內所有
      * [PageTranslator] 共用一把）序列化——佇列（[translateChapter]）與 reader 單頁翻（[persistLivePage]）是不同的
      * 實例，各寫各的會互相洗掉對方剛加的頁名（被洗掉的頁之後會被當成沒翻過、拿譯圖再翻一次）。
-     * [known] 帶呼叫端手上知道的全部頁名：萬一這次讀檔失敗（回空集合），也不會把它們寫丟。
+     * [known] contains the pages completed by this caller, not a complete chapter snapshot.
+     * Authoritative reads must succeed before replacement; unreadable storage is never an empty set.
      */
     private suspend fun commitManifest(chapterDir: UniFile, known: Set<String>): Set<String> =
         manifestMutex.withLock {

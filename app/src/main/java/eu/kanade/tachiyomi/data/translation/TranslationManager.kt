@@ -1418,15 +1418,16 @@ class TranslationManager(private val context: Context) {
         releasePendingNight(masterOn = false)
     }
 
-    /** 翻譯總開關開啟：若有排隊的翻譯／重繪章且未（使用者）暫停 → 續跑翻譯那條（drain 的 master gate 此時已放行）。 */
+    /** Resume queued work and restore its worker even while an earlier stop is still joining native work. */
     fun resumeForMasterOn() {
-        val hasQueued = synchronized(lock) {
+        val hasRunnable = synchronized(lock) {
             entries.any {
-                it.status == TranslationItem.Status.QUEUE && !it.nightRender &&
+                (it.status == TranslationItem.Status.QUEUE || it.status == TranslationItem.Status.TRANSLATING) &&
+                    !it.nightRender &&
                     it.poolKey !in pausedMangaKeys && !it.paused
             }
         }
-        if (hasQueued && !_isTranslatePaused.value) {
+        if (hasRunnable && !_isTranslatePaused.value) {
             ensureTranslateDrain()
             TranslationJob.start(context)
         }
@@ -1460,13 +1461,14 @@ class TranslationManager(private val context: Context) {
      */
     fun onNightEnabledChanged(enabled: Boolean) {
         if (enabled) {
-            val hasQueued = synchronized(lock) {
+            val hasRunnable = synchronized(lock) {
                 entries.any {
-                    it.status == TranslationItem.Status.QUEUE && it.nightRender &&
+                    (it.status == TranslationItem.Status.QUEUE || it.status == TranslationItem.Status.TRANSLATING) &&
+                        it.nightRender &&
                         it.poolKey !in pausedMangaKeys && !it.paused
                 }
             }
-            if (hasQueued && !_isNightPaused.value) {
+            if (hasRunnable && !_isNightPaused.value) {
                 ensureNightDrain()
                 TranslationJob.start(context)
             }
