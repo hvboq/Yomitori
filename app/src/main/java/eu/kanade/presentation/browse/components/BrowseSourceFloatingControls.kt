@@ -307,7 +307,7 @@ fun BrowseSourceFloatingBall(
                             cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                             keyboardActions = KeyboardActions(
-                                onSearch = { searchQuery?.takeIf { it.isNotBlank() }?.let(onSubmitSearch) },
+                                onSearch = { editingValue.text.takeIf { it.isNotBlank() }?.let(onSubmitSearch) },
                             ),
                             decorationBox = { inner ->
                                 Box(contentAlignment = Alignment.CenterStart) {

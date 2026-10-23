@@ -51,6 +51,7 @@ import java.util.concurrent.atomic.AtomicReference
  * not coverage of BrowseSourceScreen's debounce, remote suggestions, or navigation.
  * Intercepting the platform session isolates synthetic composing commands from the host IME.
  * This verifies widget composition state, not Samsung/Gboard keyboard behavior.
+ * The final commit and search action share one main-thread turn to detect stale query submission.
  */
 @Suppress("DEPRECATION")
 @RunWith(AndroidJUnit4::class)
@@ -146,9 +147,25 @@ class HitomiSearchSelectionTest {
                     failure,
                 )
             }
-            onMain { assertTrue(input.finishComposingText()) }
             assertEditable("artist:かな type:manga", TextRange("artist:かな".length))
-            assertEquals("artist:かな type:manga", onMain { state.query })
+            val committedQuery = "artist:かな漢 type:manga"
+            // An IME may commit its final candidate and immediately submit before Compose
+            // recomposes. Keep both input commands and their assertions in this same turn.
+            onMain {
+                assertEquals(emptyList<String>(), state.submissions)
+                assertTrue("The final candidate must commit through InputConnection", input.commitText("かな漢", 1))
+                assertEquals("The text callback must observe the final commit immediately", committedQuery, state.query)
+                assertTrue(
+                    "The editor must accept the search action",
+                    input.performEditorAction(EditorInfo.IME_ACTION_SEARCH),
+                )
+                assertEquals(
+                    "Search must submit the just-committed query exactly once",
+                    listOf(committedQuery),
+                    state.submissions,
+                )
+            }
+            assertEditable(committedQuery, TextRange("artist:かな漢".length))
         } finally {
             onMain { input.closeConnection() }
         }
@@ -366,6 +383,7 @@ class HitomiSearchSelectionTest {
         var textChanges = 0
         var selectionChanges = 0
         var choices = 0
+        val submissions = mutableListOf<String>()
         val input = AtomicReference<InputConnection?>()
 
         fun token() = HitomiSearchQuery.activeToken(query, selection.start, selection.end)
@@ -378,6 +396,10 @@ class HitomiSearchSelectionTest {
         fun changeSelection(value: TextRange) {
             selection = value
             selectionChanges++
+        }
+
+        fun submit(value: String) {
+            submissions += value
         }
 
         fun choose() {
@@ -413,7 +435,7 @@ class HitomiSearchSelectionTest {
                                 focusRequester = remember { FocusRequester() },
                                 searchQuery = state.query,
                                 onSearchQueryChange = state::changeText,
-                                onSubmitSearch = {},
+                                onSubmitSearch = state::submit,
                                 onClearSearch = {},
                                 hasActiveFilters = false,
                                 onClickFilter = {},
@@ -431,6 +453,7 @@ class HitomiSearchSelectionTest {
                             SearchToolbar(
                                 searchQuery = state.query,
                                 onChangeSearchQuery = state::changeText,
+                                onSearch = state::submit,
                                 searchSelection = state.selection,
                                 onSearchSelectionChange = state::changeSelection,
                             )

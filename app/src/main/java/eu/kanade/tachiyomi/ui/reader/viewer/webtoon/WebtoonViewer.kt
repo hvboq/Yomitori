@@ -355,10 +355,11 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
     private fun refreshAdapter() {
         val position = layoutManager.findLastEndVisibleItemPosition()
         adapter.refresh()
-        adapter.notifyItemRangeChanged(
-            max(0, position - 3),
-            min(position + 3, adapter.itemCount - 1),
-        )
+        val start = max(0, position - 3)
+        val end = min(position + 3, adapter.itemCount - 1)
+        if (end >= start) {
+            adapter.notifyItemRangeChanged(start, end - start + 1)
+        }
     }
 }
 
