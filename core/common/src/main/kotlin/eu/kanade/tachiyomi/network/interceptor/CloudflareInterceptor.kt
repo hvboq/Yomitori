@@ -34,7 +34,7 @@ class CloudflareInterceptor(
         // Check if Cloudflare anti-bot is on
         return if (response.code in ERROR_CODES && response.header("Server") in SERVER_CHECK) {
             val document = Jsoup.parse(
-                response.peekBody(Long.MAX_VALUE).string(),
+                response.peekBody(MAX_CHALLENGE_BODY_BYTES).string(),
                 response.request.url.toString(),
             )
 
@@ -151,6 +151,9 @@ class CloudflareInterceptor(
     }
 }
 
+// Bound buffering and parsing of untrusted error HTML, including unknown-length responses.
+// Challenge markers beyond this prefix leave the original response for normal error handling.
+private const val MAX_CHALLENGE_BODY_BYTES = 256L * 1024L
 private val ERROR_CODES = listOf(403, 503)
 private val SERVER_CHECK = arrayOf("cloudflare-nginx", "cloudflare")
 private val COOKIE_NAMES = listOf("cf_clearance")

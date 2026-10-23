@@ -346,7 +346,8 @@ internal class PartialPageStore(private val io: Io) {
     }
 
     private fun scan(pageName: String): Scan {
-        val all = io.materialNames().filter { it.startsWith(prefix(pageName) + "-") && JOURNAL_NAME.matches(it) }
+        val pagePrefix = prefix(pageName) + "-"
+        val all = io.materialNames().filter { it.startsWith(pagePrefix) && JOURNAL_NAME.matches(it) }
         if (all.size > MAX_JOURNAL_FILES) fail("Too many partial page journal files")
         val wipNames = all.filter { it.endsWith(".wip") }
         val invalidWips = mutableListOf<String>()
@@ -420,8 +421,9 @@ internal class PartialPageStore(private val io: Io) {
 
     /** Losing both final markers must not revive a stale legacy done checkpoint for partial pixels. */
     private fun rejectOrphanOutput(pageName: String) {
+        val pagePrefix = prefix(pageName) + "-"
         val records = io.materialNames().filter {
-            it.startsWith(prefix(pageName) + "-") && JOURNAL_NAME.matches(it) && it.endsWith(".record")
+            it.startsWith(pagePrefix) && JOURNAL_NAME.matches(it) && it.endsWith(".record")
         }
         if (records.isEmpty()) return
         val current = io.readPage(pageName, MAX_IMAGE_BYTES) ?: fail("Cannot read current page")

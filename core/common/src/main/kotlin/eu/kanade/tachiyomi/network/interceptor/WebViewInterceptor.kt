@@ -52,7 +52,18 @@ abstract class WebViewInterceptor(
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val response = chain.proceed(request)
-        if (!shouldIntercept(response)) {
+        val needsInterception = try {
+            shouldIntercept(response)
+        } catch (failure: Throwable) {
+            // A failed probe cannot hand its response back to the caller.
+            try {
+                response.close()
+            } catch (closeFailure: Throwable) {
+                if (closeFailure !== failure) failure.addSuppressed(closeFailure)
+            }
+            throw failure
+        }
+        if (!needsInterception) {
             return response
         }
 

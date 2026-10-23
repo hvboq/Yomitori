@@ -13,8 +13,9 @@ internal object CompletionManifestCodec {
     const val PRIMARY = ".yakuyomi_translated"
     const val PREVIOUS = "$PRIMARY.previous"
     const val CHECKPOINT_PREFIX = "$PRIMARY.checkpoint-"
+    private val CHECKPOINT_NAME = Regex("${Regex.escape(CHECKPOINT_PREFIX)}[a-f0-9-]{36}")
 
-    fun isCheckpoint(name: String): Boolean = name.matches(Regex("${Regex.escape(CHECKPOINT_PREFIX)}[a-f0-9-]{36}"))
+    fun isCheckpoint(name: String): Boolean = name.matches(CHECKPOINT_NAME)
 
     fun read(input: InputStream): ByteArray? {
         val output = ByteArrayOutputStream()
