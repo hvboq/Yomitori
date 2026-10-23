@@ -2,6 +2,7 @@ package mihon.source.hitomi
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.source.model.Page
@@ -15,6 +16,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -22,6 +24,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONArray
@@ -35,7 +38,9 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.Proxy
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -44,6 +49,295 @@ import java.util.concurrent.TimeUnit
  */
 @RunWith(AndroidJUnit4::class)
 class HitomiConnectivityDiagnosticTest {
+    @Test
+    fun compareDirectAndBypassForOneWorkWithoutRetainingContent() = runBlocking<Unit> {
+        val arguments = InstrumentationRegistry.getArguments()
+        assumeTrue(arguments.getString("liveHitomiDpiCompare") == "true")
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        check(context.packageName == "app.yomitori.yakuyomi.audit") { "Isolated audit installation is mandatory" }
+        var selectedId = arguments.getString("liveHitomiDpiGalleryId")?.let { raw ->
+            requireNotNull(raw.toLongOrNull()?.takeIf { it > 0 }) { "Invalid liveHitomiDpiGalleryId" }
+        }
+        val network = Injekt.get<NetworkHelper>()
+        val globalClient = network.client
+        val source = HitomiSource(network)
+        val preferences = source.getSourcePreferences()
+        val wasSet = preferences.contains(HitomiSource.PREF_DPI_BYPASS)
+        val previous = source.dpiBypassEnabled
+        val output = File(context.getExternalFilesDir(null), "hitomi-dpi-compare-${UUID.randomUUID()}")
+        check(output.mkdir())
+        val modes = JSONArray()
+        val report = JSONObject().put("passed", false).put("modes", modes)
+            .put("callerSelectedWork", selectedId != null).put("selectedWorkKeptOnlyInMemory", true)
+            .put("imageBytesRetained", false).put("metadataBodyRetained", false).put("fullUrlsRetained", false)
+            .put("rawErrorsRetained", false).put("nativeOcrOrInpaintInvoked", false)
+            .put("nativeStaticImageDecodingEnabled", true).put("llmCalls", false).put("signedRelease", false)
+            .put("sourceImageApiInvoked", false).put("publicSourcePageListInvoked", false)
+            .put("apiScope", "Selected source client HTTP body, parsed by production HitomiProtocol")
+            .put("modeOrder", JSONArray(listOf("bypass", "direct")))
+            .put("directFailureIsProductFailure", false)
+            .put("requestScope", "One metadata body, one cover and first page per mode; no gallery traversal")
+            .put(
+                "routingScope",
+                "The same source shares gg.js caches across modes; routing/retry requests may be additional",
+            )
+            .put("counterScope", "Process-wide new fragmented TLS connections, not HTTP request count")
+            .put("cacheControl", "Evict idle mode connections; API/cover no-cache,no-store; reader cacheless API")
+            .put("cleanupScope", "Only this UUID directory contains result.json; host exports and removes it")
+        val started = System.nanoTime()
+        val fragmentedBefore = HitomiBypassProxy.fragmentedConnections
+        val clients = mutableListOf<OkHttpClient>()
+        var failure: Throwable? = null
+        fun writeReport() = File(output, "result.json").writeText(report.toString(2))
+        suspend fun <T> observe(
+            parent: JSONObject,
+            name: String,
+            client: OkHttpClient,
+            block: suspend (JSONObject, Long) -> T,
+        ): T? {
+            val row = JSONObject().put("stage", name).put("responseReceived", false)
+            parent.getJSONArray("stages").put(row)
+            val stageStart = System.nanoTime()
+            val fragments = HitomiBypassProxy.fragmentedConnections
+            return try {
+                check(source.client === client) { "Source selected another client" }
+                client.connectionPool.evictAll()
+                withTimeout(DPI_STAGE_TIMEOUT_MS) {
+                    block(row, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DPI_STAGE_TIMEOUT_MS))
+                }.also { row.put("status", "passed") }
+            } catch (error: TimeoutCancellationException) {
+                currentCoroutineContext().ensureActive()
+                row.put("status", "timedOut").put("errorType", error.javaClass.simpleName)
+                null
+            } catch (error: CancellationException) {
+                row.put("status", "cancelled").put("errorType", error.javaClass.simpleName)
+                throw error
+            } catch (error: Exception) {
+                row.put("status", "failed").put("errorType", error.javaClass.simpleName)
+                if (error is HttpException) row.put("httpStatus", error.code)
+                null
+            } catch (error: AssertionError) {
+                row.put("status", "failed").put("errorType", error.javaClass.simpleName)
+                null
+            } finally {
+                row.put("durationMs", (System.nanoTime() - stageStart) / 1_000_000)
+                    .put("tlsFragmentedConnections", HitomiBypassProxy.fragmentedConnections - fragments)
+                writeReport()
+            }
+        }
+        try {
+            check(preferences.edit().putBoolean(HitomiSource.PREF_DPI_BYPASS, true).commit())
+            val bypass = source.client.also { clients += it }
+            check(bypass.proxy == HitomiBypassProxy.proxy && bypass.proxy?.type() == Proxy.Type.SOCKS)
+            check(preferences.edit().putBoolean(HitomiSource.PREF_DPI_BYPASS, false).commit())
+            val direct = source.client.also { clients += it }
+            check(direct !== bypass && direct.proxy == globalClient.proxy)
+            check(direct.dns === bypass.dns)
+            check(direct.sslSocketFactory === globalClient.sslSocketFactory)
+            check(bypass.sslSocketFactory === globalClient.sslSocketFactory)
+            check(direct.hostnameVerifier === globalClient.hostnameVerifier)
+            check(bypass.hostnameVerifier === globalClient.hostnameVerifier)
+            check(
+                direct.interceptors.filterIsInstance<HitomiImageInterceptor>().single() ===
+                    bypass.interceptors.filterIsInstance<HitomiImageInterceptor>().single(),
+            )
+            report.put("distinctModeClients", true).put("sharedImageRoutingInterceptor", true)
+                .put("sharedScopedDoh", true).put("tlsConfigurationUnmodified", true)
+            var fixed: DpiFirstPage? = null
+            for ((enabled, client) in listOf(true to bypass, false to direct)) {
+                check(preferences.edit().putBoolean(HitomiSource.PREF_DPI_BYPASS, enabled).commit())
+                check(source.dpiBypassEnabled == enabled && source.client === client)
+                val mode = JSONObject().put("mode", if (enabled) "bypass" else "direct")
+                    .put("enabled", enabled).put("stages", JSONArray()).put("selectedClientIdentityVerified", true)
+                modes.put(mode)
+                val modeFragments = HitomiBypassProxy.fragmentedConnections
+                if (selectedId == null) {
+                    val ids = observe(mode, "selectOneFromLatestIndex", client) { row, _ ->
+                        HitomiClient(client) { source.headers }.page("index-all.nozomi", 1).first.also {
+                            row.put("resultCount", it.size)
+                            check(it.isNotEmpty()) { "Latest index is empty" }
+                        }
+                    }
+                    selectedId = ids?.firstOrNull()
+                    check(selectedId != null) { "Cannot select one work for the paired comparison" }
+                }
+                val id = requireNotNull(selectedId)
+                val found = observe(mode, "api", client) { row, deadline ->
+                    val request = Request.Builder().url("${HitomiClient.INDEX}/galleries/$id.js")
+                        .headers(source.headers).header("Cache-Control", "no-cache, no-store").build()
+                    withContext(Dispatchers.IO) {
+                        client.newCall(request).await().use { response ->
+                            dpiFirstPage(response, row, deadline)
+                        }
+                    }
+                }
+                if (enabled) fixed = requireNotNull(found) { "Bypass metadata stage did not succeed" }
+                val selected = requireNotNull(fixed)
+                val descriptorMatches = found?.let { it == selected }
+                val descriptorMismatch = descriptorMatches == false
+                mode.put("metadataFirstPageMatchesSelection", descriptorMatches ?: JSONObject.NULL)
+                    .put(
+                        "metadataComparisonStatus",
+                        when (descriptorMatches) {
+                            true -> "matched"
+                            false -> "mismatch"
+                            null -> "unavailable"
+                        },
+                    )
+                if (descriptorMismatch) {
+                    // HTTP/JSON success is insufficient for a paired result if the selected page
+                    // changed. The images below still use the original RAM descriptor.
+                    val apiStages = mode.getJSONArray("stages")
+                    apiStages.getJSONObject(apiStages.length() - 1)
+                        .put("status", "inconclusive").put("reason", "firstPageDescriptorMismatch")
+                        .put("httpAndMetadataParseSucceeded", true)
+                }
+                observe(mode, "cover", client) { row, deadline ->
+                    val hash = selected.hash
+                    val url = "https://atn.gold-usergeneratedcontent.net/avifbigtn/" +
+                        "${hash.takeLast(1)}/${hash.takeLast(3).take(2)}/$hash.avif"
+                    val request = Request.Builder().url(url).headers(source.headers)
+                        .header("Cache-Control", "no-cache, no-store").build()
+                    row.put("requestedHost", request.url.host)
+                    withContext(Dispatchers.IO) {
+                        client.newCall(request).await().use { response ->
+                            row.put("responseReceived", true)
+                                .put("cacheResponsePresent", response.cacheResponse != null)
+                                .put("networkResponsePresent", response.networkResponse != null)
+                            decode(response, row, deadline)
+                        }
+                    }
+                }
+                observe(mode, "firstPage", client) { row, deadline ->
+                    val page = Page(0, "${selected.hash}.${selected.extension}")
+                    page.imageUrl = source.getImageUrl(page)
+                    val requested = requireNotNull(page.imageUrl).toHttpUrl()
+                    check(requested.isHttps && requested.port == 443 && HitomiDohDns.allows(requested.host))
+                    row.put("requestedHost", requested.host)
+                    withContext(Dispatchers.IO) {
+                        report.put("sourceImageApiInvoked", true)
+                        source.getImage(page).use { response ->
+                            row.put("responseReceived", true)
+                                .put("cacheResponsePresent", response.cacheResponse != null)
+                                .put("networkResponsePresent", response.networkResponse != null)
+                            decode(response, row, deadline)
+                        }
+                    }
+                }
+                val stages = mode.getJSONArray("stages")
+                val allPassed = descriptorMatches == true && (0 until stages.length()).all {
+                    stages.getJSONObject(it).getString("status") == "passed"
+                }
+                mode.put("allStagesPassed", allPassed)
+                    .put(
+                        "outcome",
+                        if (descriptorMismatch) {
+                            "inconclusive"
+                        } else if (allPassed) {
+                            "passed"
+                        } else {
+                            "failed"
+                        },
+                    )
+                    .put("tlsFragmentedConnections", HitomiBypassProxy.fragmentedConnections - modeFragments)
+                if (enabled) {
+                    check(allPassed) { "Bypass comparison stages did not all succeed" }
+                    check(HitomiBypassProxy.fragmentedConnections > modeFragments) {
+                        "Bypass TLS split was not observed"
+                    }
+                }
+            }
+            check(network.client === globalClient) { "Global source client changed" }
+            report.put("completed", true).put("passed", true)
+        } catch (error: Throwable) {
+            failure = error
+            report.put("errorType", error.javaClass.simpleName)
+        } finally {
+            try {
+                check(
+                    preferences.edit().apply {
+                        if (wasSet) {
+                            putBoolean(HitomiSource.PREF_DPI_BYPASS, previous)
+                        } else {
+                            remove(HitomiSource.PREF_DPI_BYPASS)
+                        }
+                    }.commit(),
+                )
+                check(
+                    source.dpiBypassEnabled == previous && preferences.contains(HitomiSource.PREF_DPI_BYPASS) == wasSet,
+                )
+                report.put("bypassPreferenceRestored", true)
+            } catch (cleanupError: Throwable) {
+                report.put("bypassPreferenceRestored", false).put("cleanupErrorType", cleanupError.javaClass.simpleName)
+                if (failure == null) failure = cleanupError
+            }
+            try {
+                clients.forEach { it.connectionPool.evictAll() }
+                report.put("idleModePoolsEvicted", true)
+            } catch (cleanupError: Throwable) {
+                report.put("idleModePoolsEvicted", false).put("poolCleanupErrorType", cleanupError.javaClass.simpleName)
+                if (failure == null) failure = cleanupError
+            }
+            report.put("passed", failure == null).put("durationMs", (System.nanoTime() - started) / 1_000_000)
+                .put("tlsFragmentedConnections", HitomiBypassProxy.fragmentedConnections - fragmentedBefore)
+                .put("globalClientUnchanged", network.client === globalClient)
+            writeReport()
+            println("HITOMI_DPI_COMPARE_REPORT=${File(output, "result.json").absolutePath}")
+        }
+        failure?.let { error ->
+            if (error is CancellationException) throw error
+            throw AssertionError("Hitomi DPI comparison failed; inspect the sanitized UUID report")
+        }
+    }
+
+    private data class DpiFirstPage(val hash: String, val extension: String)
+
+    private suspend fun dpiFirstPage(response: Response, row: JSONObject, deadline: Long): DpiFirstPage {
+        check(response.request.url.isHttps && response.request.url.port == 443)
+        check(HitomiDohDns.allows(response.request.url.host))
+        row.put("responseReceived", true).put("host", response.request.url.host).put("httpStatus", response.code)
+            .put("cacheResponsePresent", response.cacheResponse != null)
+            .put("networkResponsePresent", response.networkResponse != null)
+        require(response.body.contentLength() <= DPI_MAX_API_BYTES) { "Metadata body exceeds the comparison limit" }
+        val bytes = response.body.source().use { input ->
+            input.timeout().deadlineNanoTime(minOf(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(30)))
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8_192)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(output.size().toLong() + count <= DPI_MAX_API_BYTES) {
+                    "Metadata body exceeds the comparison limit"
+                }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        }
+        try {
+            row.put("bodyBytes", bytes.size).put(
+                "bodySha256",
+                MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) },
+            )
+            check(response.isSuccessful) { "Metadata response is not successful" }
+            val gallery = Json.parseToJsonElement(HitomiProtocol.galleryJson(bytes.decodeToString())).jsonObject
+            val file = gallery.getValue("files").jsonArray.first().jsonObject
+            val hash = file.getValue("hash").jsonPrimitive.content
+            check(hash.matches(Regex("[a-fA-F0-9]{3,128}"))) { "Invalid first image descriptor" }
+            val extension = if (file["haswebp"]?.jsonPrimitive?.content == "1" &&
+                file["hasavif"]?.jsonPrimitive?.content != "1"
+            ) {
+                "webp"
+            } else {
+                "avif"
+            }
+            row.put("firstPageDescriptorValid", true)
+            return DpiFirstPage(hash, extension)
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
     @Test
     fun suggestionsCoversAndReaderImagesUseProductionTransport() = runBlocking<Unit> {
         val arguments = InstrumentationRegistry.getArguments()
@@ -598,6 +892,8 @@ class HitomiConnectivityDiagnosticTest {
     }
 
     private companion object {
+        const val DPI_STAGE_TIMEOUT_MS = 45_000L
+        const val DPI_MAX_API_BYTES = 2 * 1_024 * 1_024L
         const val MAX_IMAGE_BYTES = 32 * 1_024 * 1_024
         const val MAX_STATIC_DECODE_PIXELS = 4_000_000L
     }
