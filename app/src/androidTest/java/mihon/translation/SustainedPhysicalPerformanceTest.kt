@@ -175,6 +175,7 @@ class SustainedPhysicalPerformanceTest {
             .put("stageClock", "PageStats uses currentTimeMillis; all outer/accounting clocks are monotonic")
             .put("initializationScope", "Factory/warmup after hash preflight; file cache may be warm; not app launch")
             .put("memoryScope", "Process PSS/ART/native heap/FD/thread observations; not per-engine leak proof")
+            .put("memoryObservationAffectsProcessingPass", false).put("memoryBreakdownComplete", false)
             .put("nativeHandlesCompletelyReleasedClaimed", false).put("testRequestsGc", false)
             .put("testSleepsDuringActiveLoop", false).put("automaticPageOrRunRetries", 0)
             .put("activeDefinition", "Verified successful translatePage + persistLivePage monotonic durations only")
@@ -182,7 +183,7 @@ class SustainedPhysicalPerformanceTest {
             .put("storageScope", "One growing chapter; every source is a fresh uniquely named pinned PNG copy")
             .put("readerScope", "Actual ReaderPage.displayStream bytes/pixels; no Activity or touch claim")
             .put("reportGrowth", "Append-only BEGIN/END JSONL; small summary, no growing in-memory page list")
-            .put("memoryBefore", memory())
+            .put("memoryBefore", memory(detailed = true))
         var engine: TranslationEngine? = null
         var fatal: Throwable? = null
         var attempted = 0
@@ -282,7 +283,10 @@ class SustainedPhysicalPerformanceTest {
             val mainWallNanos = if (runStart == 0L) 0L else now() - runStart
             report.put("runWallMs", ms(mainWallNanos)).put("pageCapReached", attempted >= args.pageCap)
                 .put("mainWallLimitExceeded", mainWallNanos > args.wallLimitSeconds * NANOS_PER_SECOND)
-            report.put("memoryBeforeEngineClose", memory()).put("engineCloseAttempts", if (engine == null) 0 else 1)
+            report.put("memoryBeforeEngineClose", memory(detailed = true))
+                .put("engineCloseAttempts", if (engine == null) 0 else 1)
+            val handlesBefore = nativeHandles(engine)
+            report.put("nativeHandlesBeforeEngineClose", handlesBefore)
             val closeStart = now()
             try {
                 engine?.close()
@@ -294,6 +298,16 @@ class SustainedPhysicalPerformanceTest {
             try {
                 withTimeout(150_000L) {
                     val closedAt = now()
+                    val handlesAfter = nativeHandles(engine)
+                    report.put("nativeHandlesAfterEngineClose", handlesAfter)
+                        .put(
+                            "nativeHandleTransitionObserved",
+                            if (handlesBefore.optBoolean("available") && handlesAfter.optBoolean("available")) {
+                                handlesBefore.getBoolean("allNonZero") && handlesAfter.getBoolean("allZero")
+                            } else {
+                                JSONObject.NULL
+                            },
+                        )
                     val samples = JSONArray().put(postCloseSample(closedAt, 0))
                     report.put("postClose", samples)
                     recorder.checkpoint(report)
@@ -304,6 +318,14 @@ class SustainedPhysicalPerformanceTest {
                     status(report, output, "POST_CLOSE_30")
                     awaitOffset(closedAt, 120_000L)
                     samples.put(postCloseSample(closedAt, 120))
+                    val detailed = listOf(
+                        report.getJSONObject("memoryBefore"),
+                        report.getJSONObject("memoryBeforeEngineClose"),
+                    ) + (0 until samples.length()).map { samples.getJSONObject(it).getJSONObject("memory") }
+                    report.put(
+                        "memoryBreakdownComplete",
+                        detailed.all { it.getJSONObject("selfSmaps").getBoolean("complete") },
+                    )
                     recorder.checkpoint(report)
                     status(report, output, "POST_CLOSE_120")
                     inputs.verifyUnchanged()
@@ -903,22 +925,161 @@ class SustainedPhysicalPerformanceTest {
 
     private fun requireIdentity(expected: JSONObject) = check(identity().toString() == expected.toString())
 
-    private fun memory(): JSONObject {
+    private fun memory(detailed: Boolean = false): JSONObject {
+        val started = now()
         val info = Debug.MemoryInfo().also(Debug::getMemoryInfo)
         val runtime = Runtime.getRuntime()
-        return JSONObject().put("elapsedRealtimeMs", SystemClock.elapsedRealtime())
+        val result = JSONObject().put("elapsedRealtimeMs", SystemClock.elapsedRealtime())
             .put("pssKiB", info.totalPss).put("javaPssKiB", info.dalvikPss).put("nativePssKiB", info.nativePss)
             .put("privateDirtyKiB", info.totalPrivateDirty)
             .put("javaHeapUsedBytes", runtime.totalMemory() - runtime.freeMemory())
             .put("javaHeapCommittedBytes", runtime.totalMemory()).put("javaHeapMaxBytes", runtime.maxMemory())
             .put("nativeHeapAllocatedBytes", Debug.getNativeHeapAllocatedSize())
+            .put("nativeHeapSizeBytes", Debug.getNativeHeapSize())
+            .put("nativeHeapFreeBytes", Debug.getNativeHeapFreeSize())
             .put("fdCount", File("/proc/self/fd").list()?.size ?: -1)
             .put("threadCount", File("/proc/self/task").list()?.size ?: -1)
+        if (detailed) result.put("selfSmaps", selfSmaps())
+        return observationTiming(result, started)
     }
 
     private fun postCloseSample(origin: Long, requestedSeconds: Int): JSONObject = JSONObject()
         .put("requestedOffsetSeconds", requestedSeconds).put("actualOffsetMs", ms(now() - origin))
-        .put("memory", memory())
+        .put("memory", memory(detailed = true))
+
+    private fun observationTiming(result: JSONObject, started: Long): JSONObject {
+        val finished = now()
+        return result.put("observationStartElapsedRealtimeNanos", started)
+            .put("observationEndElapsedRealtimeNanos", finished).put("observationMs", ms(finished - started))
+    }
+
+    /** Field state only: no pointer values, extra JNI calls, field writes or extra closes. */
+    private fun nativeHandles(engine: TranslationEngine?): JSONObject {
+        val started = now()
+        val result = JSONObject().put("available", false).put("componentsNonZero", JSONObject.NULL)
+            .put("allNonZero", JSONObject.NULL).put("allZero", JSONObject.NULL)
+        try {
+            check(engine is Pipeline)
+            val states = listOf("detector", "ocr", "inpainter").associateWith { name ->
+                val component = checkNotNull(
+                    Pipeline::class.java.getDeclaredField(name).apply { isAccessible = true }.get(engine),
+                )
+                component.javaClass.getDeclaredField("ncnnHandle").apply { isAccessible = true }
+                    .getLong(component) != 0L
+            }
+            result.put("available", true).put("componentsNonZero", JSONObject(states))
+                .put("allNonZero", states.values.all { it }).put("allZero", states.values.none { it })
+        } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            result.put("unavailableClass", error.javaClass.simpleName)
+        }
+        return observationTiming(result, started)
+    }
+
+    private class SmapsObservationException(val reason: String) : Exception()
+
+    /** Bounded self-only stream. Mapping names select buckets but never leave this method. */
+    private fun selfSmaps(): JSONObject {
+        val started = now()
+        val result = JSONObject().put("available", false).put("complete", false)
+            .put("buckets", JSONObject.NULL).put("totalsKiB", JSONObject.NULL)
+            .put("categoriesDescribeMappingNamesNotOwnership", true)
+            .put("byteLimit", 8 * 1024 * 1024).put("lineByteLimit", 8192).put("mapLimit", 32_768)
+            .put("timeLimitMsCheckedBetweenLines", 2000)
+        var bytesRead = 0
+        var maps = 0
+        var opened = false
+        val totals = SMAPS_BUCKETS.associateWith { LongArray(SMAPS_METRICS.size) }
+        val counts = SMAPS_BUCKETS.associateWith { 0 }.toMutableMap()
+        var bucket: String? = null
+        var current = LongArray(SMAPS_METRICS.size) { -1L }
+        fun finishMap() {
+            val name = bucket ?: return
+            if (current.any { it < 0 }) throw SmapsObservationException("missing-required-metric")
+            current.forEachIndexed { index, value ->
+                totals.getValue(name)[index] = Math.addExact(totals.getValue(name)[index], value)
+            }
+            counts[name] = counts.getValue(name) + 1
+        }
+        fun line(value: String) {
+            if (now() - started > 2 * NANOS_PER_SECOND) throw SmapsObservationException("time-limit")
+            val header = SMAPS_HEADER.matchEntire(value)
+            if (header != null) {
+                finishMap()
+                if (++maps > 32_768) throw SmapsObservationException("map-limit")
+                bucket = smapsBucket(header.groupValues[1])
+                current = LongArray(SMAPS_METRICS.size) { -1L }
+            } else {
+                val index = SMAPS_METRICS.indexOf(value.substringBefore(':'))
+                if (index >= 0) {
+                    if (bucket == null || current[index] >= 0L) throw SmapsObservationException("malformed-map")
+                    val fields = value.substringAfter(':').trim().split(Regex("\\s+"))
+                    val number = fields.firstOrNull()?.toLongOrNull()
+                    if (fields.size != 2 || fields[1] != "kB" || number == null || number < 0L) {
+                        throw SmapsObservationException("malformed-metric")
+                    }
+                    current[index] = number
+                } else if (bucket == null && value.isNotBlank()) {
+                    throw SmapsObservationException("missing-header")
+                }
+            }
+        }
+        try {
+            File("/proc/self/smaps").inputStream().buffered().use { input ->
+                opened = true
+                val buffer = ByteArray(8192)
+                var length = 0
+                while (true) {
+                    val byte = input.read()
+                    if (byte < 0) break
+                    if (++bytesRead > 8 * 1024 * 1024) throw SmapsObservationException("byte-limit")
+                    if (byte == 10) {
+                        line(String(buffer, 0, length, Charsets.UTF_8))
+                        length = 0
+                    } else {
+                        if (length == buffer.size) throw SmapsObservationException("line-limit")
+                        buffer[length++] = byte.toByte()
+                    }
+                }
+                if (length != 0 || maps == 0) throw SmapsObservationException("incomplete-stream")
+                finishMap()
+            }
+            val buckets = JSONObject()
+            val all = LongArray(SMAPS_METRICS.size)
+            for (name in SMAPS_BUCKETS) {
+                val values = JSONObject().put("maps", counts.getValue(name))
+                SMAPS_METRICS.forEachIndexed { index, metric ->
+                    values.put(metric, totals.getValue(name)[index])
+                    all[index] = Math.addExact(all[index], totals.getValue(name)[index])
+                }
+                buckets.put(name, values)
+            }
+            val combined = JSONObject()
+            SMAPS_METRICS.forEachIndexed { index, metric -> combined.put(metric, all[index]) }
+            result.put("complete", true).put("buckets", buckets).put("totalsKiB", combined)
+        } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            result.put("unavailableClass", error.javaClass.simpleName)
+            if (error is SmapsObservationException) result.put("incompleteReason", error.reason)
+        }
+        result.put("available", opened).put("bytesRead", bytesRead).put("mapsRead", maps)
+        return observationTiming(result, started)
+    }
+
+    private fun smapsBucket(raw: String): String {
+        val name = raw.removeSuffix(" (deleted)")
+        return when {
+            name.isEmpty() -> "unnamedAnonymous"
+            name == "[heap]" || name.startsWith("[anon:libc_malloc") || name.startsWith("[anon:scudo") ->
+                "allocatorNamed"
+            name.startsWith("[anon:dalvik") -> "artNamed"
+            name.startsWith("[stack") || name.startsWith("[anon:stack_and_tls") -> "stackNamed"
+            name.startsWith("[anon:") -> "otherNamedAnonymous"
+            name.startsWith('/') && MODEL_PINS.any { it.first == name.substringAfterLast('/') } -> "modelNamedFile"
+            name.startsWith('/') -> "otherFileNamed"
+            else -> "unknown"
+        }
+    }
 
     private suspend fun awaitOffset(origin: Long, milliseconds: Long) {
         while (true) {
@@ -1099,6 +1260,20 @@ class SustainedPhysicalPerformanceTest {
         val PAGE_NAME = Regex("[0-9]{5}\\.png")
         val FIXTURE_NAMES = listOf("horizontal", "vertical", "dense")
         val HANGUL = Regex("[가-힣]")
+        val SMAPS_METRICS = listOf("Size", "Rss", "Pss", "Private_Clean", "Private_Dirty", "Anonymous", "SwapPss")
+        val SMAPS_BUCKETS = listOf(
+            "allocatorNamed",
+            "artNamed",
+            "stackNamed",
+            "unnamedAnonymous",
+            "otherNamedAnonymous",
+            "modelNamedFile",
+            "otherFileNamed",
+            "unknown",
+        )
+        val SMAPS_HEADER = Regex(
+            "[0-9a-f]+-[0-9a-f]+\\s+[rwxps-]{4}\\s+[0-9a-f]+\\s+[0-9a-f]+:[0-9a-f]+\\s+\\d+(?:\\s+(.*))?",
+        )
         const val METHOD = "auto_whole"
         const val DICTIONARY_SHA = "c1295ae1962e69e35b5b225a0405d1f3432e368c9941d23bfd3acda12654da33"
         const val NANOS_PER_SECOND = 1_000_000_000L
