@@ -2492,9 +2492,9 @@ class PageTranslator(private val context: Context) {
 
     private fun readManifestFiles(chapterDir: UniFile): Map<String, ByteArray> = synchronized(manifestSnapshotLock) {
         val files = (chapterDir.listFiles() ?: throw java.io.IOException("Cannot list translation manifests")).filter {
-            it.isFile && it.name?.let { name ->
+            it.name?.let { name ->
                 name == MARKER || name == CompletionManifestCodec.PREVIOUS || CompletionManifestCodec.isCheckpoint(name)
-            } == true
+            } == true && it.isFile
         }
         val readable = files.mapNotNull { file ->
             readManifestBytes(file)?.let { file.name!! to it }
