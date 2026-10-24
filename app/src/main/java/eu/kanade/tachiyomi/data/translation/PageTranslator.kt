@@ -3209,7 +3209,7 @@ class PageTranslator(private val context: Context) {
         // 章內 manifest：已處理頁名（每行一個）＝page-level resume + 「已翻」標記。
         // 放章節內（隨 CBZ/資料夾走）：reader 依副檔名濾掉、也不會灌爆 mihon 的下載計數。
         private const val MARKER = ".yakuyomi_translated"
-        private val IMAGE_EXT = setOf("jpg", "jpeg", "png", "webp")
+        private val IMAGE_EXT = setOf("jpg", "jpeg", "png", "webp", "avif")
 
         // 重繪素材子夾（章內）：放原圖 + 遮罩/文字區 json。reader 列頁只看頂層圖檔 → 忽略此子夾。
         private const val MATERIALS_DIR = ".yakuyomi"
