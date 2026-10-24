@@ -261,6 +261,8 @@ fun AppBarActions(
  * @param searchEnabled Set to false if you don't want to show search action.
  * @param searchQuery If null, use normal toolbar.
  * @param placeholderText If null, [MR.strings.action_search_hint] is used.
+ * @param getCurrentQuery Optional synchronous owner state for edits made before recomposition.
+ * A supplied getter returning null or blank suppresses submission; absent getters use local IME state.
  */
 @Composable
 fun SearchToolbar(
@@ -279,6 +281,7 @@ fun SearchToolbar(
     interactionSource: MutableInteractionSource = remember { MutableInteractionSource() },
     searchSelection: TextRange? = null,
     onSearchSelectionChange: (TextRange) -> Unit = {},
+    getCurrentQuery: (() -> String?)? = null,
 ) {
     val focusRequester = remember { FocusRequester() }
 
@@ -306,7 +309,11 @@ fun SearchToolbar(
             }
 
             val searchAndClearFocus: () -> Unit = f@{
-                val query = editingValue.text
+                val query = if (getCurrentQuery == null) {
+                    editingValue.text
+                } else {
+                    getCurrentQuery() ?: return@f
+                }
                 if (query.isBlank()) return@f
                 onSearch(query)
                 focusManager.clearFocus()

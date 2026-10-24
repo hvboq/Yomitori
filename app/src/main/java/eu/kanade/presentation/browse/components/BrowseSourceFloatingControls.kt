@@ -226,6 +226,7 @@ fun BrowseSourceFloatingBall(
     modifier: Modifier = Modifier,
     searchSelection: TextRange? = null,
     onSearchSelectionChange: (TextRange) -> Unit = {},
+    getCurrentQuery: (() -> String?)? = null,
 ) {
     AnimatedContent(
         targetState = expanded,
@@ -307,7 +308,14 @@ fun BrowseSourceFloatingBall(
                             cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                             keyboardActions = KeyboardActions(
-                                onSearch = { editingValue.text.takeIf { it.isNotBlank() }?.let(onSubmitSearch) },
+                                onSearch = f@{
+                                    val query = if (getCurrentQuery == null) {
+                                        editingValue.text
+                                    } else {
+                                        getCurrentQuery() ?: return@f
+                                    }
+                                    if (query.isNotBlank()) onSubmitSearch(query)
+                                },
                             ),
                             decorationBox = { inner ->
                                 Box(contentAlignment = Alignment.CenterStart) {

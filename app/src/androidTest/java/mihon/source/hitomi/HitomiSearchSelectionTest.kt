@@ -52,6 +52,7 @@ import java.util.concurrent.atomic.AtomicReference
  * Intercepting the platform session isolates synthetic composing commands from the host IME.
  * This verifies widget composition state, not Samsung/Gboard keyboard behavior.
  * The final commit and search action share one main-thread turn to detect stale query submission.
+ * Separate regressions submit in the same turn as the synthetic external suggestion callback.
  */
 @Suppress("DEPRECATION")
 @RunWith(AndroidJUnit4::class)
@@ -65,7 +66,29 @@ class HitomiSearchSelectionTest {
     @Test
     fun floatingSearchPreservesCaretSelectionSuffixAndUnicodeComposition() = verifyWidget(floating = true)
 
-    private fun verifyWidget(floating: Boolean) {
+    @Test
+    fun toolbarOwnerQueryPreservesCaretSelectionSuffixAndUnicodeComposition() =
+        verifyWidget(floating = false, useOwnerQuery = true)
+
+    @Test
+    fun floatingOwnerQueryPreservesCaretSelectionSuffixAndUnicodeComposition() =
+        verifyWidget(floating = true, useOwnerQuery = true)
+
+    @Test
+    fun toolbarSuggestionThenImeSearchInSameTurnUsesReplacement() =
+        verifySuggestionThenSearchInSameTurn(floating = false)
+
+    @Test
+    fun floatingSuggestionThenImeSearchInSameTurnUsesReplacement() =
+        verifySuggestionThenSearchInSameTurn(floating = true)
+
+    @Test
+    fun toolbarClearedOrClosedQueryDoesNotSubmitPreviousPrefix() = verifyClearedOrClosedQuery(floating = false)
+
+    @Test
+    fun floatingClearedOrClosedQueryDoesNotSubmitPreviousPrefix() = verifyClearedOrClosedQuery(floating = true)
+
+    private fun verifyClearedOrClosedQuery(floating: Boolean) {
         val state = FixtureState()
         val automation = instrumentation.uiAutomation
         val originalFlags = automation.serviceInfo.flags
@@ -78,7 +101,122 @@ class HitomiSearchSelectionTest {
             ActivityScenario.launch<MainActivity>(intent).use { scenario ->
                 scenario.onActivity { activity ->
                     activity.ready = true
-                    activity.setContent { Fixture(state, floating) }
+                    activity.setContent { Fixture(state, floating, useOwnerQuery = true) }
+                }
+                assertEditable("fixture", TextRange(2))
+                val original = "jap type:manga"
+                setText(state, original)
+                withNode({ it.isEditable }) {
+                    assertTrue(
+                        "Click must focus the real text editor",
+                        it.performAction(AccessibilityNodeInfo.ACTION_CLICK),
+                    )
+                }
+                instrumentation.waitForIdleSync()
+                select(state, TextRange(3))
+                assertEditable(original, TextRange(3))
+                waitUntil("The focused widget did not request a platform InputConnection") { state.input.get() != null }
+                val input = checkNotNull(state.input.get())
+                try {
+                    onMain {
+                        assertEquals(emptyList<String>(), state.submissions)
+                        // Both owner changes precede recomposition, so the local editor still has the prefix.
+                        state.query = ""
+                        assertTrue(input.performEditorAction(EditorInfo.IME_ACTION_SEARCH))
+                        assertEquals(
+                            "An externally cleared query must not submit the old prefix",
+                            0,
+                            state.submissions.size,
+                        )
+                        state.query = original
+                        state.queryClosed = true
+                        assertNull(state.currentQuery())
+                        assertTrue(input.performEditorAction(EditorInfo.IME_ACTION_SEARCH))
+                        assertEquals("A closed query must not fall back to the old prefix", 0, state.submissions.size)
+                    }
+                } finally {
+                    onMain { input.closeConnection() }
+                }
+            }
+        } finally {
+            automation.serviceInfo = automation.serviceInfo.apply { flags = originalFlags }
+        }
+    }
+
+    private fun verifySuggestionThenSearchInSameTurn(floating: Boolean) {
+        val state = FixtureState()
+        val automation = instrumentation.uiAutomation
+        val originalFlags = automation.serviceInfo.flags
+        automation.serviceInfo = automation.serviceInfo.apply {
+            flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        }
+        val intent = Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        try {
+            ActivityScenario.launch<MainActivity>(intent).use { scenario ->
+                scenario.onActivity { activity ->
+                    activity.ready = true
+                    activity.setContent { Fixture(state, floating, useOwnerQuery = true) }
+                }
+                assertEditable("fixture", TextRange(2))
+                val original = "jap type:manga"
+                val replacement = "language:japanese type:manga"
+                setText(state, original)
+                withNode({ it.isEditable }) {
+                    assertTrue(
+                        "Click must focus the real text editor",
+                        it.performAction(AccessibilityNodeInfo.ACTION_CLICK),
+                    )
+                }
+                instrumentation.waitForIdleSync()
+                select(state, TextRange(3))
+                assertEditable(original, TextRange(3))
+                waitUntil("The focused widget did not request a platform InputConnection") { state.input.get() != null }
+                val input = checkNotNull(state.input.get())
+                try {
+                    onMain {
+                        assertEquals(emptyList<String>(), state.submissions)
+                        assertEquals(original, state.query)
+                        assertEquals(0, state.choices)
+                        // This is the fixture's external suggestion callback, not an IME commit.
+                        // Do not wait for recomposition between this replacement and Search.
+                        state.choose()
+                        assertEquals("The owner must receive the replacement synchronously", replacement, state.query)
+                        assertEquals(TextRange("language:japanese ".length), state.selection)
+                        assertEquals("The suggestion must be selected exactly once", 1, state.choices)
+                        assertTrue(
+                            "The focused widget must accept the immediate Search action",
+                            input.performEditorAction(EditorInfo.IME_ACTION_SEARCH),
+                        )
+                        assertEquals(
+                            "Search must submit the external suggestion replacement before recomposition",
+                            listOf(replacement),
+                            state.submissions,
+                        )
+                    }
+                } finally {
+                    onMain { input.closeConnection() }
+                }
+            }
+        } finally {
+            automation.serviceInfo = automation.serviceInfo.apply { flags = originalFlags }
+        }
+    }
+
+    private fun verifyWidget(floating: Boolean, useOwnerQuery: Boolean = false) {
+        val state = FixtureState()
+        val automation = instrumentation.uiAutomation
+        val originalFlags = automation.serviceInfo.flags
+        automation.serviceInfo = automation.serviceInfo.apply {
+            flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        }
+        val intent = Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        try {
+            ActivityScenario.launch<MainActivity>(intent).use { scenario ->
+                scenario.onActivity { activity ->
+                    activity.ready = true
+                    activity.setContent { Fixture(state, floating, useOwnerQuery = useOwnerQuery) }
                 }
                 assertEditable("fixture", TextRange(2))
 
@@ -372,19 +510,22 @@ class HitomiSearchSelectionTest {
     }
 
     private fun <T> onMain(block: () -> T): T {
-        val result = AtomicReference<T>()
-        instrumentation.runOnMainSync { result.set(block()) }
-        return result.get()
+        val result = AtomicReference<Result<T>>()
+        instrumentation.runOnMainSync { result.set(runCatching(block)) }
+        return result.get().getOrThrow()
     }
 
     private class FixtureState {
         var query by mutableStateOf("fixture")
+        var queryClosed by mutableStateOf(false)
         var selection by mutableStateOf(TextRange(2))
         var textChanges = 0
         var selectionChanges = 0
         var choices = 0
         val submissions = mutableListOf<String>()
         val input = AtomicReference<InputConnection?>()
+
+        fun currentQuery(): String? = if (queryClosed) null else query
 
         fun token() = HitomiSearchQuery.activeToken(query, selection.start, selection.end)
 
@@ -412,7 +553,7 @@ class HitomiSearchSelectionTest {
     }
 
     @Composable
-    private fun Fixture(state: FixtureState, floating: Boolean) {
+    private fun Fixture(state: FixtureState, floating: Boolean, useOwnerQuery: Boolean = false) {
         InterceptPlatformTextInput(
             interceptor = { request, _ ->
                 val connection = request.createInputConnection(EditorInfo())
@@ -433,8 +574,9 @@ class HitomiSearchSelectionTest {
                                 expanded = true,
                                 onBallClick = {},
                                 focusRequester = remember { FocusRequester() },
-                                searchQuery = state.query,
+                                searchQuery = state.currentQuery(),
                                 onSearchQueryChange = state::changeText,
+                                getCurrentQuery = if (useOwnerQuery) state::currentQuery else null,
                                 onSubmitSearch = state::submit,
                                 onClearSearch = {},
                                 hasActiveFilters = false,
@@ -451,8 +593,9 @@ class HitomiSearchSelectionTest {
                             )
                         } else {
                             SearchToolbar(
-                                searchQuery = state.query,
+                                searchQuery = state.currentQuery(),
                                 onChangeSearchQuery = state::changeText,
+                                getCurrentQuery = if (useOwnerQuery) state::currentQuery else null,
                                 onSearch = state::submit,
                                 searchSelection = state.selection,
                                 onSearchSelectionChange = state::changeSelection,

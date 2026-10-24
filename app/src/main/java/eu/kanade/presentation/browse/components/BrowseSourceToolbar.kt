@@ -53,6 +53,7 @@ fun BrowseSourceToolbar(
     onScrollToAnchor: (() -> Unit)? = null,
     searchSelection: TextRange? = null,
     onSearchSelectionChange: (TextRange) -> Unit = {},
+    getCurrentQuery: (() -> String?)? = null,
 ) {
     // Avoid capturing unstable source in actions lambda
     val title = source?.name
@@ -68,6 +69,7 @@ fun BrowseSourceToolbar(
         onChangeSearchQuery = onSearchQueryChange,
         searchSelection = searchSelection,
         onSearchSelectionChange = onSearchSelectionChange,
+        getCurrentQuery = getCurrentQuery,
         onSearch = onSearch,
         onClickCloseSearch = navigateUp,
         actions = {

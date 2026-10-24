@@ -459,6 +459,7 @@ data class BrowseSourceScreen(
                         BrowseSourceToolbar(
                             searchQuery = state.toolbarQuery,
                             onSearchQueryChange = changeSearchQuery,
+                            getCurrentQuery = { viewModel.state.value.toolbarQuery },
                             searchSelection = hitomiSelection,
                             onSearchSelectionChange = changeSearchSelection,
                             source = viewModel.source,
@@ -738,6 +739,7 @@ data class BrowseSourceScreen(
                             focusRequester = ballFocusRequester,
                             searchQuery = state.toolbarQuery,
                             onSearchQueryChange = changeSearchQuery,
+                            getCurrentQuery = { viewModel.state.value.toolbarQuery },
                             searchSelection = hitomiSelection,
                             onSearchSelectionChange = changeSearchSelection,
                             onSubmitSearch = submitSearch,
