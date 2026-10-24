@@ -1944,20 +1944,10 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     /**
-     * 換 [method] 去字法重繪「當頁」（待重繪頁取自 [Dialog.ReRenderMethod]）：復用該章 `.yakuyomi/` 素材
-     * （原圖 + 遮罩 + 文字區），不重跑偵測/OCR/翻譯、無網路、只載 lama 一顆。重繪會就地覆蓋頁圖。
-     *
-     * 流程：
-     * 1. 先關對話框 → 立刻把該頁狀態設成 [Page.State.Queue]（holder 顯示 per-page 轉圈圈當「重繪中」指示）
-     *    + 送 [Event.ReRenderStarted]（toast「重繪中…」）。
-     * 2. [launchIO] 背景重繪（reader 保持可動；IO 約 2–8s，期間 Queue 必被 collect 到）。
-     * 3. **不論成功或失敗都** 回 UI thread 呼叫 [PageLoader.retryPage]（[DownloadPageLoader] 會驅動 `→ Ready`）
-     *    → holder `collectLatest { Ready -> setImage() }` 重 decode：成功＝讀到覆蓋後新圖、失敗＝讀回原圖
-     *    （未被改動），兩者都會把轉圈圈換回可看的圖、不會卡在 spinner（§11 不變式：絕不留比原圖更糟的狀態）。
-     * 4. 送 [Event.ReRenderResult] 給 UI 提示成敗。
-     *
-     * 全程 try/catch、絕不讓 reader crash。只對已下載章（[DownloadPageLoader]、頁圖在磁碟）有意義；
-     * 線上/封存頁無素材 → reRenderPage 回 false → 走「重新顯示原圖 + 提示失敗」路徑。
+     * Re-render the selected saved page using its original, mask and translated regions, without
+     * repeating detection, OCR or translation. Keep the current image visible during background work,
+     * then reload the saved file in place on either result: an interrupted write can restore the
+     * original image even when re-rendering reports failure.
      */
     fun reRenderPage(method: String) {
         val dialog = state.value.dialog as? Dialog.ReRenderMethod ?: return
@@ -1970,10 +1960,9 @@ class ReaderViewModel @JvmOverloads constructor(
         val chapter = page.chapter
 
         viewModelScope.launchIO {
-            // 收尾：成功 → page.reload() 驅動 holder **就地**重 decode 譯圖（與即時翻 swapToFile 同機制、保留縮放，
-            // 不走「轉圈→retry→重 fit」→ 避免上下黑邊閃動）；失敗/無素材 → 不動（頁面從未進載入態、維持原顯示）。
+            // A failed write can restore the original file, so the visible holder must reload it too.
             suspend fun finish(ok: Boolean) {
-                if (ok) withUIContext { page.reload() }
+                withUIContext { page.reload() }
                 eventChannel.send(Event.ReRenderResult(ok))
             }
 
