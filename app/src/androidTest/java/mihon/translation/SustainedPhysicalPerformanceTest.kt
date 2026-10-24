@@ -5,8 +5,10 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Shader
 import android.os.Build
 import android.os.Bundle
 import android.os.Debug
@@ -36,9 +38,12 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import li.joye.yakuyomi.engine.EngineConfig
+import li.joye.yakuyomi.engine.EngineTrace
 import li.joye.yakuyomi.engine.InternalEngineApi
 import li.joye.yakuyomi.engine.LlmProviders
 import li.joye.yakuyomi.engine.ModelSet
+import li.joye.yakuyomi.engine.NcnnBackend
+import li.joye.yakuyomi.engine.NcnnLoadDiagnosticApi
 import li.joye.yakuyomi.engine.Ocr
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.PageStats
@@ -68,12 +73,13 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /** Explicit, isolated, sequential native/HTTPS/storage diagnostic. It never retries a failed run. */
 @RunWith(AndroidJUnit4::class)
-@OptIn(InternalEngineApi::class)
+@OptIn(InternalEngineApi::class, NcnnLoadDiagnosticApi::class)
 class SustainedPhysicalPerformanceTest {
     @Test
     fun preparePinnedSyntheticInputs() {
         val args = InstrumentationRegistry.getArguments()
         check(args.getString("sustainedPhysicalPrepare") == "true") { "Explicit preparation opt-in required" }
+        val requireAot = requireAotArgument(args)
         val context = auditContext()
         val id = uuid(checkNotNull(args.getString("sustainedPhysicalInputId")))
         val parent = privateFiles(context)
@@ -82,7 +88,7 @@ class SustainedPhysicalPerformanceTest {
         requirePlain(directory, parent)
         val files = JSONArray()
         for ((index, name) in FIXTURE_NAMES.withIndex()) {
-            val bitmap = fixture(index)
+            val bitmap = fixture(index, requireAot)
             try {
                 val file = File(directory, "$name.png")
                 check(!file.exists())
@@ -106,6 +112,10 @@ class SustainedPhysicalPerformanceTest {
             .put("argbHashLayout", "Row-major bytes A,R,G,B").put("files", files)
             .put("nativeCalls", 0).put("nativeCallsScope", "Model inference only; Canvas/PNG internals not counted")
             .put("networkCalls", 0).put("preferencesChanged", false)
+        if (requireAot) {
+            manifest.put("sustainedRequireAot", true).put("fixtureDefinition", AOT_FIXTURE_DEFINITION)
+                .put("gradientRgbEndpoints", JSONArray(listOf(210, 250)))
+        }
         val manifestFile = File(directory, "manifest.json")
         atomicJson(manifestFile, manifest)
         check(directory.list()?.toSet() == FIXTURE_NAMES.map { "$it.png" }.toSet() + "manifest.json")
@@ -114,6 +124,7 @@ class SustainedPhysicalPerformanceTest {
             .put("manifestBytes", manifestFile.length()).put("manifestSha256", digest(manifestFile))
             .put("files", files).put("nativeCalls", 0).put("nativeCallsScope", "Model inference only")
             .put("networkCalls", 0)
+        if (requireAot) prepared.put("sustainedRequireAot", true)
         send("SUSTAINED_PHYSICAL_INPUT=", prepared)
     }
 
@@ -129,7 +140,7 @@ class SustainedPhysicalPerformanceTest {
         val args = RunArguments.read()
         val context = auditContext()
         val parent = privateFiles(context)
-        val inputs = Inputs(parent, args.input, args.manifestSha)
+        val inputs = Inputs(parent, args.input, args.manifestSha, args.requireAot)
         val identity = identity()
         val shared = Injekt.get<TranslationEngineService>()
         withTimeout(10_000) { Injekt.get<TranslationManager>().ensureRestored() }
@@ -183,7 +194,34 @@ class SustainedPhysicalPerformanceTest {
             .put("storageScope", "One growing chapter; every source is a fresh uniquely named pinned PNG copy")
             .put("readerScope", "Actual ReaderPage.displayStream bytes/pixels; no Activity or touch claim")
             .put("reportGrowth", "Append-only BEGIN/END JSONL; small summary, no growing in-memory page list")
+            .put("sustainedRequireAot", args.requireAot)
+            .put("perPageAotTraceRequired", args.requireAot)
+            .put(
+                "aotTraceScope",
+                if (args.requireAot) {
+                    "Exactly one ncnn.inpaint enter/call/exit s=768, rc=0 per page"
+                } else {
+                    "Not observed"
+                },
+            )
+            .put(
+                "aotTraceTiming",
+                if (args.requireAot) {
+                    "Observer setup, chaining, counts, validation and restoration " +
+                        "are inside engineCallMs and active time"
+                } else {
+                    "No observer installed"
+                },
+            )
+            .put("aotTraceWarmUpExcluded", true)
             .put("memoryBefore", memory(detailed = true))
+        if (args.requireAot) {
+            report.put("aotValidatedSuccessfulPages", 0)
+                .put(
+                    "aotSuccessfulPageCounterScope",
+                    "Translated and persisted pages only; failed page trace is separate",
+                )
+        }
         var engine: TranslationEngine? = null
         var fatal: Throwable? = null
         var attempted = 0
@@ -208,6 +246,10 @@ class SustainedPhysicalPerformanceTest {
                 .getInt(actualOcr)
             report.put("actualEngineClass", activeEngine.javaClass.name).put("actualOcrBackend", actualOcr.backend)
                 .put("actualOcrNativeThreads", nativeThreads).put("cpuSupportsFp16", Yakuyomi.ncnnCpuSupportsFp16())
+            if (args.requireAot) {
+                report.put("actualAotOptionsBeforeWarmUp", requireAotOptions(activeEngine))
+                    .put("aotOptionsInspectionIncludedInInitializationMs", true)
+            }
             start = now()
             report.put("explicitWarmUpCalls", 1)
             withTimeout(240_000L) { activeEngine.warmUp() }
@@ -237,6 +279,7 @@ class SustainedPhysicalPerformanceTest {
                     withTimeout(minOf(240_000L, (remaining / 1_000_000L).coerceAtLeast(1L))) {
                         processPage(
                             activeEngine, pageTranslator, inputs, entry, chapterFile, chapter, name, attempted - 1, row,
+                            args.requireAot,
                         ) { stage ->
                             row.put("activeStage", stage)
                             report.put("currentPage", row)
@@ -262,6 +305,9 @@ class SustainedPhysicalPerformanceTest {
                     .put("estimatedOwnedPageDataBytes", ownedDataBytes).put("lastPage", name)
                     .put("byFixture", JSONObject(buckets.mapValues { it.value.json() }))
                     .put("reportIoMs", recorder.ioMs())
+                if (args.requireAot) {
+                    report.put("aotValidatedSuccessfulPages", successful)
+                }
                 recorder.checkpoint(report)
                 status(report, output, "PROCESSING")
                 check(now() - runStart <= args.wallLimitSeconds * NANOS_PER_SECOND) { "Wall deadline exceeded" }
@@ -373,6 +419,7 @@ class SustainedPhysicalPerformanceTest {
         name: String,
         readerIndex: Int,
         row: JSONObject,
+        requireAot: Boolean,
         progress: (String) -> Unit,
     ): PageMeasurement {
         val start = now()
@@ -392,7 +439,14 @@ class SustainedPhysicalPerformanceTest {
                 .put("sourcePinsVerified", true).put("memoryBeforeEngine", memory())
             progress("ENGINE")
             stage = now()
-            result = engine.translatePage(source)
+            result = if (requireAot) {
+                observedAotPage(row) {
+                    // Adopt the result before trace assertions so the outer finally also owns failures.
+                    engine.translatePage(source).also { result = it }
+                }
+            } else {
+                engine.translatePage(source)
+            }
             val engineNanos = now() - stage
             row.put("engineCallMs", ms(engineNanos)).put("memoryAfterEngine", memory())
             val translated = result as? PageResult.Translated ?: error("Every performance page must fully translate")
@@ -479,6 +533,109 @@ class SustainedPhysicalPerformanceTest {
         }
     }
 
+    /** Constant-size counters only; neither native messages nor OCR/translation text are retained. */
+    private suspend fun observedAotPage(row: JSONObject, block: suspend () -> PageResult): PageResult {
+        val previous = EngineTrace.sink
+        val lock = Any()
+        var enters = 0
+        var calls = 0
+        var exits = 0
+        var events = 0
+        var actualRc: Int? = null
+        var dimensionsMatch = true
+        var sequenceMatches = true
+        var unexpectedEvent = false
+        var primaryFailure: Throwable? = null
+        var publicCallReturned = false
+        var completed = false
+        val own: (String) -> Unit = { message ->
+            if (message.startsWith("ncnn.inpaint.")) {
+                synchronized(lock) {
+                    when {
+                        message.startsWith("ncnn.inpaint.enter ") -> {
+                            enters = minOf(4, enters + 1)
+                            dimensionsMatch = dimensionsMatch && message == "ncnn.inpaint.enter s=768"
+                            sequenceMatches = sequenceMatches && events == 0
+                        }
+                        message.startsWith("ncnn.inpaint.call ") -> {
+                            calls = minOf(4, calls + 1)
+                            dimensionsMatch = dimensionsMatch && message == "ncnn.inpaint.call s=768"
+                            sequenceMatches = sequenceMatches && events == 1
+                        }
+                        message.startsWith("ncnn.inpaint.exit rc=") -> {
+                            exits = minOf(4, exits + 1)
+                            actualRc = message.substringAfter("rc=").toIntOrNull()
+                            sequenceMatches = sequenceMatches && events == 2
+                        }
+                        else -> unexpectedEvent = true
+                    }
+                    events = minOf(4, events + 1)
+                }
+            }
+            previous?.invoke(message)
+        }
+        fun exactForward(): Boolean = synchronized(lock) {
+            enters == 1 && calls == 1 && exits == 1 && events == 3 && actualRc == 0 &&
+                dimensionsMatch && sequenceMatches && !unexpectedEvent
+        }
+        EngineTrace.sink = own
+        return try {
+            val value = block()
+            publicCallReturned = true
+            check(exactForward()) { "Every required-AOT page must execute one successful native AOT768 forward" }
+            completed = true
+            value
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            val ownershipIntact = EngineTrace.sink === own
+            if (ownershipIntact) EngineTrace.sink = previous
+            row.put(
+                "nativeAotTrace",
+                synchronized(lock) {
+                    JSONObject().put("kind", "inpaint").put("side", 768)
+                        .put("enter", enters).put("call", calls).put("exit", exits)
+                        .put("rc", actualRc ?: JSONObject.NULL)
+                        .put("events", events).put("counterSaturationAt", 4)
+                        .put("dimensionsMatch", dimensionsMatch).put("sequenceMatches", sequenceMatches)
+                        .put("unexpectedEvent", unexpectedEvent)
+                        .put("publicCallReturnedBeforeValidation", publicCallReturned)
+                        .put("nativeForwardValidationPassed", completed)
+                        .put("observerOwnershipIntact", ownershipIntact).put("previousSinkRestored", ownershipIntact)
+                        .put("previousSinkPresent", previous != null).put("messagesRetained", 0)
+                        .put("observerIncludedInEngineCallMs", true)
+                        .put("passed", completed && ownershipIntact && exactForward())
+                },
+            )
+            if (!ownershipIntact) {
+                val error = IllegalStateException("Engine trace ownership changed during required-AOT page")
+                val original = primaryFailure
+                if (original == null) throw error else original.addSuppressed(error)
+            }
+        }
+    }
+
+    /** The private engine remains the sole owner; inspect its live handle before warm-up or close. */
+    private fun requireAotOptions(engine: Pipeline): JSONObject {
+        val component = checkNotNull(
+            Pipeline::class.java.getDeclaredField("inpainter").apply { isAccessible = true }.get(engine),
+        )
+        val handle = component.javaClass.getDeclaredField("ncnnHandle").apply { isAccessible = true }
+            .getLong(component)
+        check(handle != 0L)
+        val options = NcnnBackend.readNetOptionsDiagnostic(handle)
+        check(options.numThreads == 1 && options.useFp16Storage && options.useFp16Arithmetic) {
+            "Required-AOT run expects the single-thread FP16 Inpainter policy"
+        }
+        return JSONObject().put("numThreads", options.numThreads)
+            .put("useFp16Storage", options.useFp16Storage).put("useFp16Arithmetic", options.useFp16Arithmetic)
+            .put("useWinogradConvolution", options.useWinogradConvolution)
+            .put("useVulkanCompute", options.useVulkanCompute)
+            .put("observedOptionSubsetOnly", true).put("beforeWarmUp", true)
+            .put("handleBorrowedOnlyWhilePrivateEngineAlive", true).put("nativePointerExported", false)
+    }
+
     private fun verifyCompletion(directory: File, count: Int, page: String): JSONObject {
         // One top-level listing is shared by count/checkpoint verification; verification time is separate.
         val files = checkNotNull(directory.listFiles())
@@ -547,6 +704,7 @@ class SustainedPhysicalPerformanceTest {
         val manifestSha: String,
         val base: String,
         val model: String,
+        val requireAot: Boolean,
     ) {
         val wallLimitSeconds: Long get() = if (smoke) 360 else 3600
 
@@ -578,7 +736,7 @@ class SustainedPhysicalPerformanceTest {
                 check(url.query == null && url.fragment == null)
                 val model = checkNotNull(args.getString("liveTranslationModel"))
                 check(model.isNotBlank() && model.length <= 160 && model.none { it.isISOControl() })
-                return RunArguments(id, smoke, duration, cap, input, manifestSha, base, model)
+                return RunArguments(id, smoke, duration, cap, input, manifestSha, base, model, requireAotArgument(args))
             }
         }
     }
@@ -593,7 +751,7 @@ class SustainedPhysicalPerformanceTest {
         val height: Int,
     )
 
-    private inner class Inputs(parent: File, name: String, private val manifestSha: String) {
+    private inner class Inputs(parent: File, name: String, private val manifestSha: String, requireAot: Boolean) {
         val directory = File(parent, name)
         val manifest: JSONObject
         val entries: List<InputEntry>
@@ -609,6 +767,14 @@ class SustainedPhysicalPerformanceTest {
             check(manifest.getInt("schemaVersion") == 1 && manifest.getBoolean("neutralSyntheticOnly"))
             check(manifest.getString("inputBasename") == name)
             check(manifest.getString("inputId") == name.removePrefix("sustained-physical-input-"))
+            val preparedRequireAot = if (manifest.has("sustainedRequireAot")) {
+                check(manifest.get("sustainedRequireAot") is Boolean)
+                manifest.getBoolean("sustainedRequireAot")
+            } else {
+                false
+            }
+            check(preparedRequireAot == requireAot) { "Prepared inputs and requested AOT mode must match" }
+            if (requireAot) check(manifest.getString("fixtureDefinition") == AOT_FIXTURE_DEFINITION)
             val files = manifest.getJSONArray("files")
             check(files.length() == 3)
             entries = (0 until files.length()).map { index ->
@@ -1201,7 +1367,7 @@ class SustainedPhysicalPerformanceTest {
 
     private fun now(): Long = SystemClock.elapsedRealtimeNanos()
     private fun ms(nanos: Long): Double = nanos / 1_000_000.0
-    private fun fixture(type: Int): Bitmap {
+    private fun fixture(type: Int, requireAot: Boolean): Bitmap {
         val bitmap = Bitmap.createBitmap(1200, 1600, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         canvas.drawColor(Color.LTGRAY)
@@ -1210,7 +1376,19 @@ class SustainedPhysicalPerformanceTest {
             paint.color = Color.DKGRAY
             canvas.drawRect(left - 8, top - 8, right + 8, bottom + 8, paint)
             paint.color = Color.WHITE
+            if (requireAot) {
+                paint.shader = LinearGradient(
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    Color.rgb(210, 210, 210),
+                    Color.rgb(250, 250, 250),
+                    Shader.TileMode.CLAMP,
+                )
+            }
             canvas.drawRoundRect(RectF(left, top, right, bottom), 70f, 70f, paint)
+            paint.shader = null
             paint.color = Color.BLACK
         }
         when (type) {
@@ -1275,6 +1453,12 @@ class SustainedPhysicalPerformanceTest {
             "[0-9a-f]+-[0-9a-f]+\\s+[rwxps-]{4}\\s+[0-9a-f]+\\s+[0-9a-f]+:[0-9a-f]+\\s+\\d+(?:\\s+(.*))?",
         )
         const val METHOD = "auto_whole"
+        const val AOT_FIXTURE_DEFINITION = "Light grayscale diagonal gradient bubbles; actual AOT required per page"
+        fun requireAotArgument(args: Bundle): Boolean {
+            val text = args.getString("sustainedRequireAot") ?: "false"
+            check(text in setOf("true", "false")) { "sustainedRequireAot must be true or false" }
+            return text == "true"
+        }
         const val DICTIONARY_SHA = "c1295ae1962e69e35b5b225a0405d1f3432e368c9941d23bfd3acda12654da33"
         const val NANOS_PER_SECOND = 1_000_000_000L
         const val MAX_PAGE_BYTES = 24L * 1024 * 1024
