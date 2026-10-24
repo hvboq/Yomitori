@@ -358,7 +358,12 @@ class PageTranslator(private val context: Context) {
         val base = OriginalMaterial.base(pageName)
         val originalNames = listOf(OriginalMaterial.exactName(pageName), OriginalMaterial.legacyName(pageName))
             .flatMap { listOf(it, it + OriginalMaterial.TMP_SUFFIX, it + OriginalMaterial.INFLIGHT_SUFFIX) }
-        val exactNames = setOf("$base.json", "$base$MASK_SUFFIX", NightTextBoxes.fileName(pageName)) +
+        val exactNames = setOf(
+            "$base.json",
+            "$base$MASK_SUFFIX",
+            NightTextBoxes.fileName(pageName),
+            PageProcessingSummaryCodec.exactName(pageName),
+        ) +
             NightPages.artifactNames(pageName).flatMap { listOf(it, NightPages.tmpName(it)) }
         return names.filterTo(linkedSetOf()) { name ->
             name in exactNames || originalNames.any { it.equals(name, ignoreCase = true) } ||
@@ -500,6 +505,7 @@ class PageTranslator(private val context: Context) {
                         persistStoredResult(
                             chapterDir, pageFile, input, bitmap, checkNotNull(pageResult.analysis), pageResult.stats,
                             method, false, keepMaterials, nightOnly, inference.contextPayload,
+                            skipped = true,
                         )
                     } else if (previous != null && !previous.complete) {
                         PageAttempt(
@@ -514,6 +520,12 @@ class PageTranslator(private val context: Context) {
                                 input.preservedOriginal, input.decoded.sha256, AttemptKind.SKIPPED,
                                 pageResult.stats, null, !forceRetranslate, shouldStop,
                                 input.sourceToken,
+                                PageProcessingOutcome.fromProgress(
+                                    pageResult.analysis?.progress,
+                                    pageResult.stats.lines,
+                                    skipped = true,
+                                ),
+                                inference.contextPayload,
                             )
                         }
                     }
@@ -555,6 +567,8 @@ class PageTranslator(private val context: Context) {
         commitCompletion: Boolean,
         shouldStop: () -> Boolean,
         expectedSourceToken: SourceToken,
+        processingOutcome: PageProcessingOutcome? = null,
+        safeContextPayload: String? = null,
     ): PageAttempt {
         val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
         coroutineContext.ensureActive()
@@ -574,6 +588,18 @@ class PageTranslator(private val context: Context) {
         coroutineContext.ensureActive()
         if (shouldStop()) return PageAttempt(AttemptKind.STOPPED, stats)
         if (commitCompletion) commitManifest(chapterDir, setOf(name))
+        processingOutcome?.let {
+            saveProcessingSummaryLocked(
+                chapterDir,
+                name,
+                sourceSha256,
+                expectedPageSha256,
+                expectedSourceToken,
+                latest?.revision,
+                safeContextPayload,
+                it,
+            )
+        }
         return PageAttempt(kind, stats, error)
     }
 
@@ -589,6 +615,7 @@ class PageTranslator(private val context: Context) {
         keepMaterials: Boolean,
         nightOnly: Boolean,
         safeContextPayload: String? = null,
+        skipped: Boolean = false,
     ): PageAttempt {
         val name = pageFile.name ?: throw java.io.IOException("Missing page name")
         val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
@@ -624,6 +651,8 @@ class PageTranslator(private val context: Context) {
                 "Original changed during translation"
             }
             val journaled = partial || latest != null || (input.keepExistingOriginal && analysis?.progress != null)
+            var committedJournal: PartialPageStore.State? = null
+            val displaySha256: String
             if (journaled) {
                 val resumableAnalysis = checkNotNull(analysis) { "Missing resumable OCR analysis" }
                 val progress = checkNotNull(resumableAnalysis.progress) { "Missing resumable OCR progress" }
@@ -645,7 +674,7 @@ class PageTranslator(private val context: Context) {
                     },
                 )
                 val journalStore = store ?: PartialPageStore.forUniFile(context, chapterDir, materialDir)
-                journalStore.commit(
+                committedJournal = journalStore.commit(
                     name, descriptor, output.width, output.height, OcrProgressCodec.encode(progress),
                     encodedOutput, rawMask, input.journal?.revision, !partial,
                     initialBaseline = if (latest == null && input.expectedPageSha256 != input.decoded.sha256) {
@@ -656,9 +685,12 @@ class PageTranslator(private val context: Context) {
                     safeContextPayload = safeContextPayload,
                     checkCancellation = { coroutineContext.ensureActive() },
                 )
+                displaySha256 = committedJournal.outputSha256
             } else {
                 coroutineContext.ensureActive()
-                writeBackOrRestore(pageFile, output, saved, previousOutputBytes)
+                val encodedOutput = encodePage(name, output)
+                writeBackOrRestore(pageFile, output, saved, previousOutputBytes, encodedOutput)
+                displaySha256 = PartialPageStore.sha256(encodedOutput)
             }
             invalidateNightPage(materialDir, name)
             val materialsWarning = if ((keepMaterials || journaled) && analysis != null) {
@@ -696,8 +728,158 @@ class PageTranslator(private val context: Context) {
             } else {
                 clearCompletedPageErrorLocked(chapterDir, name)
             }
+            saveProcessingSummaryLocked(
+                chapterDir,
+                name,
+                input.decoded.sha256,
+                displaySha256,
+                input.sourceToken,
+                committedJournal?.revision,
+                safeContextPayload,
+                PageProcessingOutcome.fromProgress(analysis?.progress, stats.lines, skipped),
+            )
             PageAttempt(if (partial) AttemptKind.PARTIAL else AttemptKind.TRANSLATED, stats, error, warning, true)
         }
+    }
+
+    /** Optional observations never authorize completion or turn a committed page into a failure. */
+    private fun saveProcessingSummaryLocked(
+        chapterDir: UniFile,
+        name: String,
+        sourceSha256: String,
+        displaySha256: String,
+        token: SourceToken,
+        journalRevision: String?,
+        safeContextPayload: String?,
+        outcome: PageProcessingOutcome,
+    ) {
+        try {
+            val directory = materialsDir(chapterDir) ?: return
+            val store = processingSummaryStore(chapterDir, directory)
+            val binding = PageProcessingBinding(
+                pageNameSha256 = PartialPageStore.sha256(name.toByteArray(Charsets.UTF_8)),
+                sourceSha256 = sourceSha256,
+                displaySha256 = displaySha256,
+                sourceTokenSha256 = processingSourceDigest(token.epoch),
+                journalRevision = journalRevision,
+                contextSha256 = safeContextPayload?.let { StoredTranslationContext.decode(it).semanticFingerprint },
+            )
+            store.writeBestEffort(name, PageProcessingRecord(binding, outcome, System.currentTimeMillis()))
+        } catch (exception: Exception) {
+            if (exception is CancellationException) throw exception
+            // No recognized text, page path or server configuration is logged for this optional record.
+        }
+    }
+
+    private fun processingSummaryStore(chapterDir: UniFile, directory: UniFile): PageProcessingSummaryStore {
+        val io = CapturedSourceUniFileIo(context, chapterDir, directory)
+        return PageProcessingSummaryStore(
+            readBytes = { name -> io.readMaterial(name, PageProcessingSummaryCodec.MAX_BYTES) },
+            writeBytes = { name, bytes ->
+                check(io.replaceMaterial(name, bytes)) { "Cannot write processing summary" }
+            },
+            delete = { name -> check(io.deleteMaterial(name)) { "Cannot retire processing summary" } },
+        )
+    }
+
+    // Only the persistent epoch belongs in an on-disk identity. The process fence still guards
+    // inference commits, but resets on process restart and must not invalidate historical records.
+    private fun processingSourceDigest(epoch: String?): String =
+        PartialPageStore.sha256(("processing-source-v1:" + (epoch ?: "uncaptured")).toByteArray(Charsets.UTF_8))
+
+    /** Explicit, read-only Reader query. Never recover journals, load models or consult current settings. */
+    suspend fun getPageProcessingDetails(pageFile: UniFile): PageProcessingDetails? = withContext(Dispatchers.IO) {
+        try {
+            val chapter = pageFile.parentFile ?: pageFile.uri.takeIf { it.scheme == "file" }?.path
+                ?.let { java.io.File(it).parentFile }?.let(UniFile::fromFile) ?: return@withContext null
+            readPageProcessingDetails(chapter, pageFile)
+        } catch (exception: Exception) {
+            if (exception is CancellationException) throw exception
+            null
+        }
+    }
+
+    /** SAF pages are resolved from their loader-owned chapter, not an inferred document parent. */
+    suspend fun getPageProcessingDetails(chapterDir: UniFile, pageFileName: String): PageProcessingDetails? =
+        withContext(Dispatchers.IO) {
+            try {
+                val page = chapterDir.findFile(pageFileName)
+                    ?.takeIf { it.isFile && it.name == pageFileName } ?: return@withContext null
+                readPageProcessingDetails(chapterDir, page)
+            } catch (exception: Exception) {
+                if (exception is CancellationException) throw exception
+                null
+            }
+        }
+
+    private suspend fun readPageProcessingDetails(chapter: UniFile, pageFile: UniFile): PageProcessingDetails? {
+        return try {
+            pageLock(pageFile).withLock {
+                val name = pageFile.name ?: return@withLock null
+                val directory = chapter.findFile(MATERIALS_DIR)
+                    ?.takeIf { it.isDirectory && it.name == MATERIALS_DIR } ?: return@withLock null
+                val bytes = CapturedSourceUniFileIo(context, chapter, directory)
+                    .readMaterial(PageProcessingSummaryCodec.exactName(name), PageProcessingSummaryCodec.MAX_BYTES)
+                    ?: return@withLock null
+                val saved = PageProcessingSummaryCodec.decode(bytes) ?: return@withLock null
+                val epoch = capturedStore(chapter)?.sourceEpoch(name) // Pending capture is rejected, never recovered.
+                val journal = partialStore(chapter)?.currentStateInfo(name)
+                val original = if (journal != null) {
+                    directory.findFile(journal.original.name) ?: return@withLock null
+                } else {
+                    findOriginalMaterial(directory, name)?.first ?: pageFile
+                }
+                val sourceSha256 = processingFileSha256(original)
+                val displaySha256 = if (original.uri == pageFile.uri) {
+                    sourceSha256
+                } else {
+                    processingFileSha256(pageFile)
+                }
+                if (journal != null && journal.original.sha256 != sourceSha256) return@withLock null
+                val expected = PageProcessingBinding(
+                    pageNameSha256 = PartialPageStore.sha256(name.toByteArray(Charsets.UTF_8)),
+                    sourceSha256 = sourceSha256,
+                    displaySha256 = displaySha256,
+                    sourceTokenSha256 = processingSourceDigest(epoch),
+                    journalRevision = journal?.revision,
+                    // Fresh unchanged pages have no journal context authority. Their checked
+                    // historical context stays descriptive; it is never compared to preferences.
+                    contextSha256 = if (journal == null) {
+                        saved.binding.contextSha256
+                    } else {
+                        journal.safeContextPayload?.let { StoredTranslationContext.decode(it).semanticFingerprint }
+                    },
+                )
+                saved.takeIf { PageProcessingSummaryCodec.matchesPageName(name, expected) && it.binding == expected }
+                    ?.let { PageProcessingDetails(it.outcome, it.recordedAtEpochMs) }
+            }
+        } catch (exception: Exception) {
+            if (exception is CancellationException) throw exception
+            null
+        }
+    }
+
+    /** A Reader status query needs a bounded digest, never another full-page byte array or bitmap. */
+    private suspend fun processingFileSha256(file: UniFile): String {
+        check(file.isFile && file.length() <= MAX_PAGE_BYTES) { "Invalid processing summary image" }
+        val input = context.contentResolver.openInputStream(file.uri)
+            ?: throw java.io.IOException("Cannot verify processing summary image")
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val operationContext = kotlinx.coroutines.currentCoroutineContext()
+        var length = 0L
+        input.use { stream ->
+            val buffer = ByteArray(8192)
+            while (true) {
+                operationContext.ensureActive()
+                val count = stream.read(buffer)
+                if (count < 0) break
+                length += count
+                check(length <= MAX_PAGE_BYTES) { "Processing summary image exceeds storage bound" }
+                digest.update(buffer, 0, count)
+            }
+        }
+        check(length > 0) { "Empty processing summary image" }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun recyclePageResult(result: PageResult) {
@@ -2193,7 +2375,9 @@ class PageTranslator(private val context: Context) {
         val name = img.name ?: return false
         return pageLock(img).withLock {
             recoverCapturedSourceLocked(chapterDir, img, name)
-            reRenderOnePageLocked(chapterDir, matDir, img, name, newMethod, inpainter, renderCfg)
+            reRenderOnePageLocked(chapterDir, matDir, img, name, newMethod, inpainter, renderCfg).also { changed ->
+                if (changed) processingSummaryStore(chapterDir, matDir).invalidateBestEffort(name)
+            }
         }
     }
 

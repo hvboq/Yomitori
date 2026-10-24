@@ -26,6 +26,7 @@ import eu.kanade.tachiyomi.data.nightread.NightPages
 import eu.kanade.tachiyomi.data.saver.Image
 import eu.kanade.tachiyomi.data.saver.ImageSaver
 import eu.kanade.tachiyomi.data.saver.Location
+import eu.kanade.tachiyomi.data.translation.PageProcessingDetails
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
@@ -150,10 +151,7 @@ class ReaderViewModel @JvmOverloads constructor(
     private val eventChannel = Channel<Event>()
     val eventFlow = eventChannel.receiveAsFlow()
 
-    /**
-     * 重繪用的翻譯引擎入口（換去字法重繪當頁）。lazy：只有 reader 內按重繪才會建、不拖開啟 reader 的速度。
-     * 取 app context（同本檔其他 Injekt.get<Application>() 用法）。sourceManager/downloadProvider 已建構子注入。
-     */
+    /** Shared entry point for page actions and read-only saved processing records, created on demand. */
     private val pageTranslator by lazy { PageTranslator(Injekt.get<Application>()) }
 
     /** 翻譯偏好（即時翻譯開關 [TranslationPreferences.liveTranslate] 由設定面板切，切換後重載章節套用包裝）。 */
@@ -1468,6 +1466,37 @@ class ReaderViewModel @JvmOverloads constructor(
         refreshNightAvailability(page.chapter)
     }
 
+    /** Read the saved result without loading images, models or translation settings. */
+    fun openPageProcessingRecord() {
+        val selected = (state.value.dialog as? Dialog.PageActions)?.page ?: return
+        val page = (selected as? InsertPage)?.parent ?: selected
+        if (page.uri == null) return
+        when (page.chapter.pageLoader) {
+            is DownloadPageLoader, is TranslatingPageLoader, is DirectoryPageLoader -> Unit
+            else -> return
+        }
+        val request = Dialog.ProcessingSummary()
+        mutableState.update { it.copy(dialog = request) }
+        viewModelScope.launchIO {
+            val details = try {
+                resolveDownloadedPageFile(page)?.let { (directory, name) ->
+                    pageTranslator.getPageProcessingDetails(directory, name)
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                null
+            }
+            mutableState.update {
+                // A dismissed dialog or a later page action owns the slot once this request is gone.
+                if (it.dialog === request) {
+                    it.copy(dialog = Dialog.ProcessingSummary(details = details, isLoading = false))
+                } else {
+                    it
+                }
+            }
+        }
+    }
+
     /** Compare the saved original without rewriting the translated page or its completion state. */
     fun toggleOriginalPreview() {
         val selected = (state.value.dialog as? Dialog.PageActions)?.page ?: return
@@ -2332,6 +2361,11 @@ class ReaderViewModel @JvmOverloads constructor(
         data object ReadingModeSelect : Dialog
         data object OrientationModeSelect : Dialog
         data class PageActions(val page: ReaderPage) : Dialog
+
+        data class ProcessingSummary(
+            val details: PageProcessingDetails? = null,
+            val isLoading: Boolean = true,
+        ) : Dialog
 
         /** 重繪當頁去字法選擇對話框（帶著要重繪的頁）。 */
         data class ReRenderMethod(val page: ReaderPage, val allowReRender: Boolean = true) : Dialog

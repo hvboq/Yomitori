@@ -47,6 +47,7 @@ fun ReaderPageActionsDialog(
     // 翻譯當頁；只在已下載章可用（線上章先不提供），呼叫端傳 null 時不顯示此鈕。
     onTranslatePage: (() -> Unit)? = null,
     onToggleOriginal: (() -> Unit)? = null,
+    onShowProcessingRecord: (() -> Unit)? = null,
     isOriginalPreview: Boolean = false,
     // 開始翻譯這話（已下載＝排佇列／線上＝觸發下載+標記待翻）。當前章「未在翻譯」時顯示（與停止互斥）。
     onStartChapterTranslate: (() -> Unit)? = null,
@@ -119,6 +120,13 @@ fun ReaderPageActionsDialog(
                     },
                     supportingContent = { Text(stringResource(MR.strings.reader_original_preview_summary)) },
                     modifier = Modifier.clickable(onClick = onToggleOriginal),
+                )
+            }
+            if (onShowProcessingRecord != null) {
+                ListItem(
+                    headlineContent = { Text(stringResource(MR.strings.reader_processing_record)) },
+                    supportingContent = { Text(stringResource(MR.strings.reader_processing_record_summary)) },
+                    modifier = Modifier.clickable(onClick = onShowProcessingRecord),
                 )
             }
             // 第二列：翻譯控制。每顆鈕的回呼自己關對話框（VM 內 closeDialog），故這裡不再呼叫 onDismissRequest。

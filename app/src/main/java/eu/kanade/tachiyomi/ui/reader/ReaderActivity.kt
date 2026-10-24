@@ -62,6 +62,7 @@ import eu.kanade.presentation.reader.ReaderContentOverlay
 import eu.kanade.presentation.reader.ReaderLiveTranslateIndicator
 import eu.kanade.presentation.reader.ReaderPageActionsDialog
 import eu.kanade.presentation.reader.ReaderPageIndicator
+import eu.kanade.presentation.reader.ReaderProcessingSummaryDialog
 import eu.kanade.presentation.reader.ReadingModeSelectDialog
 import eu.kanade.presentation.reader.appbars.ReaderAppBars
 import eu.kanade.presentation.reader.components.ChapterNavigatorType
@@ -536,6 +537,7 @@ class ReaderActivity : BaseActivity() {
                     // 「翻譯這頁」：只在已下載章提供（單頁進引擎翻、就地覆蓋）；線上章本里程碑先不給。
                     onTranslatePage = viewModel::translateThisPage.takeIf { pageOnDisk },
                     onToggleOriginal = viewModel::toggleOriginalPreview.takeIf { pageOnDisk },
+                    onShowProcessingRecord = viewModel::openPageProcessingRecord.takeIf { pageOnDisk },
                     isOriginalPreview = page.isOriginalPreview,
                     // Stop also applies while downloading for translation; download state is not page progress.
                     onStartChapterTranslate = viewModel::startChapterTranslate,
@@ -547,6 +549,13 @@ class ReaderActivity : BaseActivity() {
                     onRegenerateChapterNight = { viewModel.startChapterNightRender(force = true) }
                         .takeIf { nightRegenerate },
                     onUpdateChapterNight = { viewModel.startChapterNightRender() }.takeIf { nightUpdate },
+                )
+            }
+            is ReaderViewModel.Dialog.ProcessingSummary -> {
+                ReaderProcessingSummaryDialog(
+                    onDismissRequest = onDismissRequest,
+                    details = dialog.details,
+                    isLoading = dialog.isLoading,
                 )
             }
             is ReaderViewModel.Dialog.ReRenderMethod -> {
