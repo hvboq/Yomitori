@@ -24,6 +24,7 @@ import dev.icerock.moko.resources.StringResource
 import eu.kanade.domain.ui.UiPreferences
 import eu.kanade.presentation.capture.CaptureReviewScreenContent
 import eu.kanade.presentation.capture.CaptureScreenContent
+import eu.kanade.presentation.capture.awaitOwnedCaptureBitmap
 import eu.kanade.presentation.util.Screen
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.ui.manga.MangaScreen
@@ -40,7 +41,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -52,7 +52,6 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
-import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
@@ -1075,15 +1074,7 @@ class CaptureViewModel(
 
     /** 把 [FrameGrabber] 的 callback 包成 suspend；在主執行緒發起（讀 view 屬性 / fallback draw 需主執行緒）。 */
     private suspend fun grabFrame(grabber: FrameGrabber): Bitmap? = withUIContext {
-        suspendCancellableCoroutine { cont ->
-            grabber { bmp ->
-                if (cont.isActive) {
-                    cont.resume(bmp)
-                } else if (bmp != null && !bmp.isRecycled) {
-                    bmp.recycle() // 已取消卻仍回幀 → 別讓它洩漏
-                }
-            }
-        }
+        awaitOwnedCaptureBitmap(grabber)
     }
 
     /** 把整張 [bitmap] 縮成 [THUMB_SIZE]² 灰階亮度陣列（0–255）；縮圖及時 recycle、不動原圖。 */

@@ -714,7 +714,7 @@ fun CaptureScreenContent(
                     context.toast(context.contextStringResource(MR.strings.webview_capture_failed))
                     return@captureWebView
                 }
-                scope.launch {
+                scope.launchOwnedCaptureBitmap(bitmap) {
                     when (val result = onCapture(bitmap, url)) {
                         is CaptureSaveResult.Saved -> {
                             when {
@@ -741,7 +741,6 @@ fun CaptureScreenContent(
                         is CaptureSaveResult.Failed ->
                             context.toast(context.contextStringResource(result.reason.messageRes))
                     }
-                    if (!bitmap.isRecycled) bitmap.recycle()
                 }
             }
         }
@@ -788,9 +787,8 @@ fun CaptureScreenContent(
                 fun toBitmapY(v: Float) =
                     (v + cropOverlayOrigin.y).roundToInt().minus(loc[1]).coerceIn(0, bitmap.height)
                 val rect = Rect(toBitmapX(selLeft), toBitmapY(selTop), toBitmapX(selRight), toBitmapY(selBottom))
-                scope.launch {
+                scope.launchOwnedCaptureBitmap(bitmap) {
                     val uri = onSaveCover(bitmap, rect, book)
-                    if (!bitmap.isRecycled) bitmap.recycle()
                     coverCropMode = false
                     cropStart = null
                     cropEnd = null
@@ -825,9 +823,8 @@ fun CaptureScreenContent(
                     context.toast(context.contextStringResource(MR.strings.webview_capture_failed))
                     return@captureWebView
                 }
-                scope.launch {
+                scope.launchOwnedCaptureBitmap(bitmap) {
                     val (top, bottom) = withContext(Dispatchers.Default) { detectCropBounds(bitmap) }
-                    if (!bitmap.isRecycled) bitmap.recycle()
                     if (top <= 0f && bottom <= 0f) {
                         context.toast(context.contextStringResource(MR.strings.capture_crop_auto_none))
                     } else {
