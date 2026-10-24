@@ -2490,7 +2490,7 @@ class PageTranslator(private val context: Context) {
         return partialStore(chapterDir)?.applyDoneOverlay(legacy) ?: legacy
     }
 
-    private fun readManifestFiles(chapterDir: UniFile): Map<String, ByteArray> {
+    private fun readManifestFiles(chapterDir: UniFile): Map<String, ByteArray> = synchronized(manifestSnapshotLock) {
         val files = (chapterDir.listFiles() ?: throw java.io.IOException("Cannot list translation manifests")).filter {
             it.isFile && it.name?.let { name ->
                 name == MARKER || name == CompletionManifestCodec.PREVIOUS || CompletionManifestCodec.isCheckpoint(name)
@@ -2502,7 +2502,7 @@ class PageTranslator(private val context: Context) {
         if (files.isNotEmpty() && !CompletionManifestCodec.hasUsableSnapshot(readable)) {
             throw java.io.IOException("No usable translation completion snapshot")
         }
-        return readable
+        readable
     }
 
     private fun readManifestBytes(file: UniFile): ByteArray? {
@@ -2514,7 +2514,7 @@ class PageTranslator(private val context: Context) {
     }
 
     /** 覆寫 manifest（每頁成功後叫一次；小檔、相對翻譯耗時可忽略，給中斷後 resume）。只給 [commitManifest] 用。 */
-    private fun writeManifest(chapterDir: UniFile, done: Set<String>) {
+    private fun writeManifest(chapterDir: UniFile, done: Set<String>) = synchronized(manifestSnapshotLock) {
         CompletionManifestStore(
             readFiles = { readManifestFiles(chapterDir) },
             write = { name, bytes -> writeExactNamed(chapterDir, name, bytes) },
@@ -3235,6 +3235,14 @@ class PageTranslator(private val context: Context) {
          * Shared translation/night diagnostics use this mutex too; page callers acquire their page lock first.
          */
         private val manifestMutex = Mutex()
+
+        /**
+         * Synchronous completion readers also share the whole manifest snapshot transaction.
+         * A writer may retire checkpoints only after every active reader has consumed its listed
+         * files. Reentrant because commit readback calls readManifestFiles on this same thread.
+         * Writers acquire manifestMutex before this monitor; no coroutine suspension is allowed here.
+         */
+        private val manifestSnapshotLock = Any()
 
         /**
          * 頁鎖（分條，行程內共用）：同一頁的「進場檢查」與「落地」（存原檔 → 覆蓋頁檔 → 存素材 → 記清單）不交錯。
