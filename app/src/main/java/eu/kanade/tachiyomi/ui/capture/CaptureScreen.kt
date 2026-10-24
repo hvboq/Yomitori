@@ -914,8 +914,9 @@ class CaptureViewModel(
                         delay(CAPTURE_INTERVAL_MS)
                         continue
                     }
-                    val thumb = withContext(Dispatchers.Default) { thumbLuma(frame) }
-                    if (!frame.isRecycled) frame.recycle()
+                    val thumb = consumeOwnedContinuousCaptureBitmap(frame) { comparison ->
+                        withContext(Dispatchers.Default) { thumbLuma(comparison) }
+                    }
 
                     val stable = prev?.let { mad(thumb, it) < STABLE_THRESHOLD } ?: false
                     val changed = lastCaptured?.let { mad(thumb, it) > CHANGE_THRESHOLD } ?: true
@@ -955,20 +956,24 @@ class CaptureViewModel(
                         delay(CAPTURE_INTERVAL_MS)
                         continue
                     }
-                    val cleanThumb = withContext(Dispatchers.Default) { thumbLuma(clean) }
-                    // ③ 空白/黑頁判斷在**乾淨幀**上做（比較幀含工具列會墊高亮度值域、判不準）。
-                    if (isBlank(cleanThumb)) {
-                        if (!clean.isRecycled) clean.recycle()
+                    val result: CaptureSaveResult? = consumeOwnedContinuousCaptureBitmap(clean) { captured ->
+                        val cleanThumb = withContext(Dispatchers.Default) { thumbLuma(captured) }
+                        // ③ 空白/黑頁判斷在**乾淨幀**上做（比較幀含工具列會墊高亮度值域、判不準）。
+                        if (isBlank(cleanThumb)) {
+                            null
+                        } else {
+                            // ④ 存檔（WebView 網址須在主執行緒讀）。
+                            val url = withUIContext { urlProvider() }
+                            saveCapture(captured, url)
+                        }
+                    }
+                    if (result == null) {
                         lastRejected = thumb
                         prev = thumb
                         delay(CAPTURE_INTERVAL_MS)
                         continue
                     }
 
-                    // ④ 存檔（WebView 網址須在主執行緒讀）。
-                    val url = withUIContext { urlProvider() }
-                    val result = saveCapture(clean, url)
-                    if (!clean.isRecycled) clean.recycle()
                     if (result is CaptureSaveResult.Saved) {
                         _sessionPages.add(result.page)
                         lastCaptured = thumb // ★ 存比較幀縮圖（與比較基準一致）
