@@ -11,6 +11,24 @@ import android.os.Looper
 import android.view.PixelCopy
 import android.view.Window
 import android.webkit.WebView
+import java.util.concurrent.atomic.AtomicLong
+
+internal enum class WebViewCaptureBackend { PIXEL_COPY, DRAW_FALLBACK, UNAVAILABLE }
+
+/** Scalar diagnostics only: observers never receive or own a captured bitmap or view. */
+internal data class WebViewCaptureObservation(
+    val requestId: Long,
+    val backend: WebViewCaptureBackend,
+    val pixelCopyResult: Int?,
+    val width: Int,
+    val height: Int,
+    val bitmapAvailable: Boolean,
+)
+
+@Volatile
+internal var webViewCaptureObserver: ((WebViewCaptureObservation) -> Unit)? = null
+
+private val observedCaptureSequence = AtomicLong()
 
 // Yakuyomi：WebView 截圖工具（B0 spike 從 WebViewScreenContent 抽出成模組內共用）。
 // 目前唯一使用者＝「擷取漫畫→存 local」（CaptureScreen）；舊 WebView 畫面的「截這頁」過渡入口已移除。
@@ -36,7 +54,28 @@ internal fun captureWebView(
     window: Window?,
     onResult: (Bitmap?) -> Unit,
 ) {
+    // Capture the observer once so a late callback cannot be attributed to a later observer.
+    val observer = webViewCaptureObserver
+    val requestId = if (observer == null) 0L else observedCaptureSequence.incrementAndGet()
+    val observedWidth = if (observer == null) 0 else webView?.width ?: 0
+    val observedHeight = if (observer == null) 0 else webView?.height ?: 0
+    fun observe(backend: WebViewCaptureBackend, result: Int?, available: Boolean) {
+        if (observer == null) return
+        runCatching {
+            observer.invoke(
+                WebViewCaptureObservation(
+                    requestId,
+                    backend,
+                    result,
+                    observedWidth,
+                    observedHeight,
+                    available,
+                ),
+            )
+        }
+    }
     if (webView == null || webView.width <= 0 || webView.height <= 0) {
+        observe(WebViewCaptureBackend.UNAVAILABLE, null, false)
         onResult(null)
         return
     }
@@ -50,6 +89,10 @@ internal fun captureWebView(
     } catch (e: Throwable) {
         if (!bitmap.isRecycled) bitmap.recycle()
         null
+    }
+
+    fun observedFallback(copyResult: Int?): Bitmap? = drawFallback().also {
+        observe(WebViewCaptureBackend.DRAW_FALLBACK, copyResult, it != null)
     }
 
     if (window != null) {
@@ -68,9 +111,10 @@ internal fun captureWebView(
                 bitmap,
                 { copyResult ->
                     if (copyResult == PixelCopy.SUCCESS) {
+                        observe(WebViewCaptureBackend.PIXEL_COPY, copyResult, true)
                         onResult(bitmap)
                     } else {
-                        onResult(drawFallback())
+                        onResult(observedFallback(copyResult))
                     }
                 },
                 Handler(Looper.getMainLooper()),
@@ -78,9 +122,9 @@ internal fun captureWebView(
             return
         } catch (e: Throwable) {
             // PixelCopy 對沒有 backing surface 的 window 會丟 IllegalArgumentException
-            onResult(drawFallback())
+            onResult(observedFallback(null))
             return
         }
     }
-    onResult(drawFallback())
+    onResult(observedFallback(null))
 }

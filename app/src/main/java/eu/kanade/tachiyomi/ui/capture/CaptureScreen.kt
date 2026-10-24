@@ -708,7 +708,9 @@ class CaptureViewModel(
         val cropped = cropForSave(bitmap, setting)
         val out = if (setting.autoTrim) autoTrimForSave(cropped) else cropped
         try {
-            openTruncating(file).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            openTruncating(file).use {
+                check(out.compress(Bitmap.CompressFormat.PNG, 100, it)) { "Cannot encode captured page" }
+            }
         } finally {
             if (out !== cropped && !out.isRecycled) out.recycle()
             if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
@@ -1143,10 +1145,23 @@ class CaptureViewModel(
 
             val page = nextPageNumber(chapterDir)
             val name = "%03d.png".format(page)
+            // Never truncate a page that was already present when allocating this capture.
+            if (chapterDir.findFile(name) != null) throw CaptureSaveException(CaptureSaveError.WRITE)
             val file = chapterDir.createFile(name)
                 ?: throw CaptureSaveException(CaptureSaveError.WRITE)
+            // A provider returning an unexpected handle does not establish ownership of it.
+            check(file.name == name && file.isFile) { "Unexpected captured page name" }
             // 依該站的「去頭去尾」設定裁掉上下（沒設定＝原樣存）。
-            writePage(file, bitmap, url)
+            try {
+                writePage(file, bitmap, url)
+            } catch (failure: Throwable) {
+                // Only the newly allocated handle belongs to this attempt. Keep earlier pages,
+                // and keep the original failure even if the provider refuses cleanup.
+                runCatching {
+                    check(file.delete()) { "Cannot remove incomplete captured page" }
+                }.onFailure { cleanupFailure -> failure.addSuppressed(cleanupFailure) }
+                throw failure
+            }
             updateMetaUrl(chapterDir, page, url)
             // ★ 安全網（件 1）：確保**漫畫層** meta（.yakuyomi_manga）存在——供日後「繼續擷取」開回原站。
             // 不再只靠「新漫畫 panel 按確定」那一條（continue-capture 帶著書名進來根本不開該 panel、就漏寫）；
@@ -1154,7 +1169,10 @@ class CaptureViewModel(
             ensureMangaMeta(mangaDir, url)
 
             CaptureSaveResult.Saved(page, file.uri.toString())
-        }.getOrElse { it.toCaptureFailure() }
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            it.toCaptureFailure()
+        }
     }
 
     /**
@@ -1297,12 +1315,10 @@ class CaptureViewModel(
         }
     }
 
-    private fun nextPageNumber(chapterDir: UniFile): Int =
-        (
-            chapterDir.listFiles().orEmpty()
-                .mapNotNull { it.name?.substringBeforeLast('.')?.toIntOrNull() }
-                .maxOrNull() ?: 0
-            ) + 1
+    private fun nextPageNumber(chapterDir: UniFile): Int {
+        val pages = chapterDir.listFiles() ?: throw CaptureSaveException(CaptureSaveError.WRITE)
+        return (pages.mapNotNull { it.name?.substringBeforeLast('.')?.toIntOrNull() }.maxOrNull() ?: 0) + 1
+    }
 
     // 覆寫用截斷串流：SAF DocumentFile 走 ContentResolver "wt"（避免 DocumentFile "w" 不截斷留舊尾）；
     // file:// 用一般 openOutputStream（FileOutputStream 本就截斷、且 "wt" 對 file:// 不落地）。新建檔通常為空、

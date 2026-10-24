@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
+import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileNotFoundException
 import java.util.UUID
@@ -91,7 +92,26 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         check(parent.isDirectory)
         requireName(displayName)
         session.createRequests.add(mimeType to displayName)
-        val child = session.checked(File(parent, displayName))
+        // UniFile separates recognized suffixes from the requested display name. Mirror a real
+        // provider's MIME-aware naming while retaining the original request for fixture assertions.
+        val mimeTypes = MimeTypeMap.getSingleton()
+        val extension = when (mimeType) {
+            DocumentsContract.Document.MIME_TYPE_DIR, "application/octet-stream" -> null
+            else -> mimeTypes.getExtensionFromMimeType(mimeType)
+        }
+        val currentExtension = displayName.substringAfterLast('.', "").lowercase()
+        val hasMatchingExtension = extension != null &&
+            (
+                displayName.endsWith(".$extension", ignoreCase = true) ||
+                    mimeTypes.getMimeTypeFromExtension(currentExtension) == mimeType
+                )
+        val fileName = if (!extension.isNullOrEmpty() && !hasMatchingExtension) {
+            "$displayName.$extension"
+        } else {
+            displayName
+        }
+        requireName(fileName)
+        val child = session.checked(File(parent, fileName))
         check(!child.exists()) { "Fixture entry already exists" }
         check(if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) child.mkdir() else child.createNewFile())
         return session.documentId(child)
