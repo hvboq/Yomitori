@@ -4,6 +4,8 @@ import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -12,6 +14,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModel
@@ -31,9 +34,13 @@ import eu.kanade.tachiyomi.ui.manga.MangaScreen
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import eu.kanade.tachiyomi.util.system.toast
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -207,6 +214,8 @@ class CaptureScreen(
         val navigator = LocalNavigator.currentOrThrow
         val context = LocalContext.current
         val viewModel = viewModel<CaptureViewModel>()
+        val captureScope = rememberCoroutineScope()
+        var reviewTransition by remember { mutableStateOf<Job?>(null) }
 
         // 「繼續擷取」：進畫面把帶入的書名塞進 model（一次性；bookName 非空 → 漸進解鎖到 S2）。
         LaunchedEffect(Unit) {
@@ -278,9 +287,10 @@ class CaptureScreen(
         // [CaptureStopReason.MANUAL]（按停止 / 生命週期）不在此處理——那條路自己會呼叫 enterReview。
         // 一次性事件：切完模式即 consume 歸零，免 recomposition 重複觸發。
         LaunchedEffect(continuous.stopReason) {
-            val reason = continuous.stopReason
+            val terminal = viewModel.continuous.value
+            val reason = terminal.stopReason
             if (reason != null && reason != CaptureStopReason.MANUAL) {
-                enterReview(reason, continuous.stopDetail)
+                if (mode == CaptureMode.CAPTURING) enterReview(reason, terminal.stopDetail)
                 viewModel.consumeStopReason()
             }
         }
@@ -316,10 +326,26 @@ class CaptureScreen(
             // 本話頁數（使用者選填）：有值時進度顯示「已截 5/16 頁」。
             capturedTarget = continuous.targetPages,
             justCapturedPage = continuous.justCapturedPage,
-            onStartContinuous = viewModel::startContinuous,
+            onStartContinuous = { compare, clean, url, pages, tapDelay, autoTap ->
+                if (mode == CaptureMode.CAPTURING && reviewTransition?.isCompleted != false) {
+                    viewModel.startContinuous(compare, clean, url, pages, tapDelay, autoTap)
+                }
+            },
             onStopContinuous = viewModel::stopContinuous,
             // 按停止＝進確認模式（不 push Screen、WebView 續活）；使用者主動停＝不顯示停止原因提示。
-            onEnterReview = { enterReview() },
+            onEnterReview = {
+                if (mode == CaptureMode.CAPTURING && reviewTransition?.isCompleted != false) {
+                    reviewTransition = captureScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                        viewModel.stopContinuousAndAwait()
+                        currentCoroutineContext().ensureActive()
+                        if (mode == CaptureMode.CAPTURING) {
+                            val stopped = viewModel.continuous.value
+                            val reason = stopped.stopReason?.takeUnless { it == CaptureStopReason.MANUAL }
+                            enterReview(reason, if (reason == null) null else stopped.stopDetail)
+                        }
+                    }
+                }
+            },
             reCaptureTargetPage = target?.pageNumber,
             insertTargetPage = insert?.insertAtPage,
             // 單張模式：該頁有記網址才開回去；沒有就保持 WebView 現狀（不是每個站的網址都帶頁資訊）。
@@ -840,6 +866,7 @@ class CaptureViewModel(
     private val _continuous = MutableStateFlow(ContinuousCaptureState())
     val continuous: StateFlow<ContinuousCaptureState> = _continuous.asStateFlow()
     private var continuousJob: Job? = null
+    private var continuousStopRequested = false
 
     /**
      * 開始半自動連續截圖。★ 2026-07 改寫（消除閃爍）：**偵測階段不隱藏工具列**，只有真的要存檔那一刻才隱藏。
@@ -881,10 +908,11 @@ class CaptureViewModel(
         autoTap: PageTapper? = null,
     ) {
         if (bookName.isBlank() || chapterName.isBlank()) return
-        if (continuousJob?.isActive == true) return
+        if (continuousJob?.isCompleted == false) return
         val target = targetPages?.takeIf { it > 0 }
         val tapDelay = tapDelayMs.coerceIn(CAPTURE_TAP_DELAY_MIN, CAPTURE_TAP_DELAY_MAX).toLong()
-        continuousJob = viewModelScope.launch {
+        continuousStopRequested = false
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             var prev: IntArray? = null // 前一幀縮圖（判穩定）
             var lastCaptured: IntArray? = null // 上次已截那頁的縮圖（判換頁 + 去重）
             // 上次「抓了乾淨幀卻是空白/黑頁」而丟棄的畫面：同一張黑頁不再反覆抓乾淨幀（免無謂閃爍）。
@@ -966,9 +994,22 @@ class CaptureViewModel(
                         } else {
                             // ④ 存檔（WebView 網址須在主執行緒讀）。
                             val url = withUIContext { urlProvider() }
-                            saveCapture(captured, url)
+                            currentCoroutineContext().ensureActive()
+                            // Once a page is accepted, finish its write and Main session accounting
+                            // together. Frame acquisition, URL reads and later taps stay cancellable.
+                            withContext(NonCancellable) {
+                                val saved = saveCapture(captured, url)
+                                if (saved is CaptureSaveResult.Saved) {
+                                    _sessionPages.add(saved.page)
+                                    _continuous.update {
+                                        it.copy(count = it.count + 1, justCapturedPage = saved.page)
+                                    }
+                                }
+                                saved
+                            }
                         }
                     }
+                    currentCoroutineContext().ensureActive()
                     if (result == null) {
                         lastRejected = thumb
                         prev = thumb
@@ -977,12 +1018,10 @@ class CaptureViewModel(
                     }
 
                     if (result is CaptureSaveResult.Saved) {
-                        _sessionPages.add(result.page)
                         lastCaptured = thumb // ★ 存比較幀縮圖（與比較基準一致）
                         lastRejected = null
                         saveFails = 0 // 成功即歸零（門檻看的是「連續」失敗）
-                        val captured = _continuous.value.count + 1
-                        _continuous.update { it.copy(count = captured, justCapturedPage = result.page) }
+                        val captured = _continuous.value.count
                         // ⑤ 暫停偵測 + 顯示「已擷取第 N 頁 · 請翻下一頁」；期間畫面可能被翻動 →
                         // prev 歸零，回去後重新建立穩定基準。
                         prev = null
@@ -1027,20 +1066,32 @@ class CaptureViewModel(
                     delay(CAPTURE_INTERVAL_MS)
                 }
             } finally {
-                // 停止原因：迴圈自己判定的優先；被 [stopContinuous] 取消時本地變數是 null，保留它已寫進去的
-                // [CaptureStopReason.MANUAL]（cancel() 非同步、finally 晚一步跑，不能無條件覆蓋）。
-                val reason = stopReason
+                // Publish terminal state only after the accepted page and its accounting settle.
+                val reason = stopReason ?: CaptureStopReason.MANUAL.takeIf { continuousStopRequested }
                 val detail = stopDetail
                 _continuous.update {
                     it.copy(
                         running = false,
                         justCapturedPage = null,
-                        stopReason = reason ?: it.stopReason,
-                        stopDetail = if (reason != null) detail else it.stopDetail,
+                        stopReason = reason,
+                        stopDetail = detail,
                     )
                 }
             }
         }
+        // Publish ownership before even an immediate frame callback can request Stop.
+        continuousJob = job
+        job.invokeOnCompletion {
+            // LAZY jobs retain their initial continuation and grabber closures after completion.
+            // Release this model's handle on Main without clearing a newer loop's ownership.
+            val release = { if (continuousJob === job) continuousJob = null }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                release()
+            } else {
+                Handler(Looper.getMainLooper()).post { release() }
+            }
+        }
+        job.start()
     }
 
     /**
@@ -1057,21 +1108,20 @@ class CaptureViewModel(
      * 標成 [CaptureStopReason.MANUAL]＝畫面層**不**自動進確認頁（按停止那條路自己會進、也不顯示原因提示）。
      */
     fun stopContinuous() {
-        continuousJob?.cancel()
-        continuousJob = null
-        _continuous.update {
-            it.copy(
-                running = false,
-                justCapturedPage = null,
-                stopReason = CaptureStopReason.MANUAL,
-                stopDetail = null,
-            )
-        }
+        val job = continuousJob ?: return
+        if (job.isCompleted) return
+        continuousStopRequested = true
+        job.cancel()
+    }
+
+    /** Manual Review entry waits without blocking Main; lifecycle callers only request Stop. */
+    suspend fun stopContinuousAndAwait() {
+        val job = withUIContext { continuousJob.also { stopContinuous() } }
+        job?.join()
     }
 
     /** 畫面層消費完 [ContinuousCaptureState.stopReason]（已切進確認頁）後歸零，免重複觸發。 */
     fun consumeStopReason() {
-        continuousJob = null
         _continuous.update { it.copy(stopReason = null, stopDetail = null) }
     }
 

@@ -16,7 +16,10 @@ import java.io.FileNotFoundException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -69,6 +72,14 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         if (!file.isFile) throw FileNotFoundException("Fixture document is not a file")
         if ('w' in mode) {
             session.writeModes.add(documentId to mode)
+            val pendingGate = session.pendingWriteGate.get()
+            if (
+                pendingGate != null && pendingGate.documentId == documentId &&
+                session.pendingWriteGate.compareAndSet(pendingGate, null)
+            ) {
+                // The owned file already exists; only this exact session/document write waits.
+                pendingGate.waitForRelease()
+            }
             val pendingWriteFailure = session.failNextWriteDocumentId.get()
             // Provider arguments may be equal strings carried across Binder, not the same object.
             val failSelectedWrite = pendingWriteFailure == documentId &&
@@ -188,16 +199,65 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    /** Bounded one-shot gate for an owned provider write, with no effect on ordinary sessions. */
+    class WriteGate internal constructor(val documentId: String) {
+        private val enteredLatch = CountDownLatch(1)
+        private val releaseLatch = CountDownLatch(1)
+        private val entries = AtomicInteger()
+        private val exits = AtomicInteger()
+        private val timeout = AtomicBoolean(false)
+        private val interruption = AtomicBoolean(false)
+
+        val enteredCount: Int get() = entries.get()
+        val exitedCount: Int get() = exits.get()
+        val timedOut: Boolean get() = timeout.get()
+        val interrupted: Boolean get() = interruption.get()
+
+        fun awaitEntered(timeoutMillis: Long): Boolean {
+            require(timeoutMillis in 1..10_000)
+            return enteredLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)
+        }
+
+        fun release() {
+            releaseLatch.countDown()
+        }
+
+        internal fun waitForRelease() {
+            check(entries.incrementAndGet() == 1)
+            enteredLatch.countDown()
+            try {
+                if (!releaseLatch.await(10, TimeUnit.SECONDS)) {
+                    timeout.set(true)
+                    throw FileNotFoundException("Owned provider write gate timed out")
+                }
+            } catch (failure: InterruptedException) {
+                interruption.set(true)
+                Thread.currentThread().interrupt()
+                throw FileNotFoundException("Owned provider write gate interrupted").apply { initCause(failure) }
+            } finally {
+                exits.incrementAndGet()
+            }
+        }
+    }
+
     class Session internal constructor(val directory: File, val id: String) {
         val chapter = checked(File(directory, "chapter")).apply { check(mkdir()) }
         val page = checked(File(chapter, "target.png"))
         val failNextPageWrite = AtomicBoolean(false)
         val failNextWriteDocumentId = AtomicReference<String?>(null)
+        val pendingWriteGate = AtomicReference<WriteGate?>(null)
         val writeModes = CopyOnWriteArrayList<Pair<String, String>>()
         val createRequests = CopyOnWriteArrayList<Pair<String, String>>()
         val reads = CopyOnWriteArrayList<String>()
 
         fun documentId(file: File): String = "$id|${checked(file).relativeTo(directory).invariantSeparatorsPath}"
+
+        fun gateNextWrite(file: File): WriteGate {
+            require(checked(file) != directory)
+            return WriteGate(documentId(file)).also {
+                check(pendingWriteGate.compareAndSet(null, it)) { "An owned write gate is already pending" }
+            }
+        }
 
         fun checked(file: File): File {
             val root = directory.absoluteFile
@@ -208,10 +268,12 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
             return absolute
         }
 
-        fun close() {
-            check(sessions.remove(id, this))
+        /** Call after owned IO settles; retained failures remain available to the host by cache path. */
+        fun close(retainOwnedFiles: Boolean = false) {
             val root = checked(directory)
             check(root.name == "saf-alias-$id" && root.parentFile?.name == "cache")
+            check(sessions.remove(id, this))
+            if (retainOwnedFiles) return
             check(root.deleteRecursively()) { "Cannot remove owned SAF fixture" }
             check(!root.exists())
         }

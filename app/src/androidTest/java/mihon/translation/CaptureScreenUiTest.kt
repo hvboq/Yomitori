@@ -1,11 +1,13 @@
 package mihon.translation
 
 import android.app.Application
+import android.content.ComponentName
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.util.Base64
 import android.view.PixelCopy
 import android.view.View
@@ -19,6 +21,7 @@ import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -28,6 +31,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -58,6 +62,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import mihon.testprovider.SafAliasDocumentsProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -241,7 +246,141 @@ class CaptureScreenUiTest {
         }
     }
 
-    private fun withCase(name: String, block: (Fixture, JSONObject) -> Unit) {
+    @Test
+    fun stopDuringProviderWriteDefersReviewUntilCommittedPageIsAccounted() = withCase(
+        "stopDuringProviderWriteDefersReviewUntilCommittedPageIsAccounted",
+        useSafFixture = true,
+    ) { fixture, evidence ->
+        withHost(fixture, CaptureScreen(initialUrl = NEUTRAL_PAGE)) { activity ->
+            stage(evidence, "neutral-saf-page")
+            waitUntil("Neutral WebView did not finish layout") {
+                onMain {
+                    findWebView(activity.window.decorView)?.let {
+                        it.width > 0 && it.height > 0 && it.progress == 100 &&
+                            it.contentHeight * it.scale > it.height + 10
+                    } == true
+                }
+            }
+            compose.onNodeWithContentDescription(context.stringResource(MR.strings.capture_new_manga)).performClick()
+            compose.onNode(hasText(context.stringResource(MR.strings.capture_book_name)) and hasSetTextAction())
+                .performTextReplacement(fixture.book)
+            compose.onNodeWithText(context.stringResource(MR.strings.action_ok)).performClick()
+            compose.onNodeWithContentDescription(context.stringResource(MR.strings.capture_new_chapter)).performClick()
+            compose.onNode(hasText(context.stringResource(MR.strings.capture_chapter_name)) and hasSetTextAction())
+                .performTextReplacement(fixture.chapter)
+            compose.onNodeWithText(context.stringResource(MR.strings.action_ok)).performClick()
+            onMain {
+                assertEquals(fixture.book, fixture.model.bookName)
+                assertEquals(fixture.chapter, fixture.model.chapterName)
+            }
+            val gate = fixture.gateFirstWrite()
+            var boundaryFailure: Throwable? = null
+            try {
+                compose.onNodeWithContentDescription(context.stringResource(MR.strings.capture_continuous_start))
+                    .assertIsDisplayed().performClick()
+                waitUntil("Continuous Start did not start the actual model") { fixture.model.continuous.value.running }
+                fixture.captureJob = onMain { fixture.currentCaptureJob() }
+                val originalJob = checkNotNull(fixture.captureJob)
+                waitUntil("The actual fresh SAF write did not enter its owned gate", 25_000) {
+                    gate.enteredCount == 1
+                }
+                assertEquals(0, gate.exitedCount)
+                assertFalse(gate.timedOut)
+                assertFalse(gate.interrupted)
+                fixture.assertGatedWriteObserved()
+                evidence.put("actualSafWrite", true).put("stopWhileWriteBlocked", true)
+                    .put("gateEntered", gate.enteredCount)
+                stage(evidence, "provider-write-blocked")
+                compose.onNodeWithContentDescription(context.stringResource(MR.strings.capture_continuous_stop))
+                    .assertIsDisplayed().performClick()
+                compose.waitForIdle()
+                // This title is present even while Review is loading or its page list is empty.
+                val prematureReview = compose.onAllNodesWithText(
+                    context.stringResource(MR.strings.capture_review_title),
+                ).fetchSemanticsNodes().isNotEmpty()
+                evidence.put("prematureReviewWhenBlocked", prematureReview)
+                assertEquals("The provider must still be blocked at the Review assertion", 0, gate.exitedCount)
+                assertFalse("Review must not open before the active provider write settles", prematureReview)
+                evidence.put("reviewWasHiddenUntilWriteSettled", true)
+                stage(evidence, "review-deferred-until-write")
+                gate.release()
+                runBlocking { withTimeout(10_000) { originalJob.join() } }
+                assertTrue("The original capture job must complete before review", originalJob.isCompleted)
+                assertFalse(fixture.model.continuous.value.running)
+                assertEquals(1, gate.exitedCount)
+                assertFalse(gate.timedOut)
+                assertFalse(gate.interrupted)
+                waitUntil("Review did not include the completed in-flight page") {
+                    !fixture.review.state.value.loading && fixture.review.state.value.pages.size == 1
+                }
+                compose.onNodeWithText(context.stringResource(MR.strings.capture_review_title)).assertIsDisplayed()
+                compose.onNodeWithText(context.stringResource(MR.strings.capture_review_continue)).assertIsDisplayed()
+                val page = fixture.pngFiles().single()
+                assertEquals("001.png", page.name)
+                verifyPng(page, evidence, darkOnLeft = true)
+                compose.onNodeWithContentDescription(page.name).assertIsDisplayed()
+                assertEquals(listOf(1), fixture.model.sessionPages)
+                assertEquals(1, fixture.model.continuous.value.count)
+                assertEquals(1, fixture.review.state.value.sessionPageCount)
+                val pages = JSONObject(File(fixture.chapterDirectory, CAPTURE_META_FILE).readText())
+                    .getJSONObject("pages")
+                assertEquals(setOf("001"), pages.keys().asSequence().toSet())
+                assertEquals(NEUTRAL_PAGE, pages.getJSONObject("001").getString("url"))
+                val afterStop = fixture.snapshot()
+                val callbacksAfterStop = fixture.observations.size
+                val stableUntil = SystemClock.elapsedRealtime() + 3_000
+                while (SystemClock.elapsedRealtime() < stableUntil) {
+                    compose.waitForIdle()
+                    SystemClock.sleep(250)
+                    assertEquals("A settled UI Stop must not write another page", afterStop, fixture.snapshot())
+                    assertEquals(
+                        "A settled UI Stop must not request further captures",
+                        callbacksAfterStop,
+                        fixture.observations.size,
+                    )
+                }
+                assertTrue(
+                    "The UI boundary test must observe real PixelCopy success",
+                    fixture.observations.any {
+                        it.backend == WebViewCaptureBackend.PIXEL_COPY && it.pixelCopyResult == PixelCopy.SUCCESS &&
+                            it.bitmapAvailable
+                    },
+                )
+                evidence.put("gateExited", gate.exitedCount).put("pngCount", 1).put("metaPages", 1)
+                    .put("reviewThumbnails", 1).put("sessionPages", JSONArray(fixture.model.sessionPages))
+                    .put("continuousJobCompleted", true).put("postStopStableMs", 3_000)
+                    .put("callbacksStableAfterStop", true)
+                val hashes = JSONArray()
+                afterStop.forEach { (name, hash) -> hashes.put(JSONObject().put("file", name).put("sha256", hash)) }
+                evidence.put("savedFiles", hashes)
+                compose.onNodeWithText(context.stringResource(MR.strings.capture_review_continue)).performClick()
+                compose.onNodeWithContentDescription(context.stringResource(MR.strings.capture_continuous_start))
+                    .assertIsDisplayed()
+                assertEquals(afterStop, fixture.snapshot())
+                stage(evidence, "saf-stop-review-verified", 1)
+            } catch (caught: Throwable) {
+                boundaryFailure = caught
+                throw caught
+            } finally {
+                // Even a premature-Review assertion must release and settle the original IO worker.
+                gate.release()
+                runCatching {
+                    fixture.captureJob?.let { job -> runBlocking { withTimeout(10_000) { job.join() } } }
+                }.onFailure { cleanupFailure ->
+                    if (boundaryFailure == null) throw cleanupFailure
+                    boundaryFailure!!.addSuppressed(cleanupFailure)
+                }
+                evidence.put("gateExited", gate.exitedCount).put("gateTimedOut", gate.timedOut)
+                    .put("gateInterrupted", gate.interrupted)
+            }
+        }
+    }
+
+    private fun withCase(
+        name: String,
+        useSafFixture: Boolean = false,
+        block: (Fixture, JSONObject) -> Unit,
+    ) {
         val arguments = InstrumentationRegistry.getArguments()
         assumeTrue("Explicit captureScreenUi=true is required", arguments.getString("captureScreenUi") == "true")
         val runId = UUID.fromString(checkNotNull(arguments.getString("captureScreenUiRunId"))).toString()
@@ -254,8 +393,10 @@ class CaptureScreenUiTest {
         activeReport = reportFile to evidence
         var failure: Throwable? = null
         var fixture: Fixture? = null
+        var safSession: SafAliasDocumentsProvider.Session? = null
         try {
-            fixture = Fixture()
+            if (useSafFixture) safSession = SafAliasDocumentsProvider.createSession(context)
+            fixture = Fixture(safSession)
             block(fixture, evidence)
         } catch (caught: Throwable) {
             failure = caught
@@ -265,6 +406,7 @@ class CaptureScreenUiTest {
                     val continuous = owned.model.continuous.value
                     evidence.put("continuousCount", continuous.count)
                         .put("continuousRunning", continuous.running)
+                        .put("sessionPages", JSONArray(onMain { owned.model.sessionPages }))
                         .put("stopReason", continuous.stopReason?.name ?: JSONObject.NULL)
                         .put("stopDetail", continuous.stopDetail?.name ?: JSONObject.NULL)
                         .put("bookNonempty", onMain { owned.model.bookName.isNotBlank() })
@@ -300,9 +442,17 @@ class CaptureScreenUiTest {
             }
             try {
                 fixture?.close(retainFiles = failure != null)
-                if (failure != null) evidence.put("retainedFixture", fixture?.directoryName ?: JSONObject.NULL)
+                if (fixture == null && safSession != null) {
+                    safSession.close(retainOwnedFiles = true)
+                }
             } catch (caught: Throwable) {
                 if (failure == null) failure = caught else failure!!.addSuppressed(caught)
+            }
+            if (failure != null) {
+                evidence.put(
+                    "retainedFixture",
+                    fixture?.directoryName ?: safSession?.directory?.name ?: JSONObject.NULL,
+                )
             }
         }
         failure?.let { throw it }
@@ -354,9 +504,18 @@ class CaptureScreenUiTest {
         }
     }
 
-    private inner class Fixture : ViewModelStoreOwner {
-        val directoryName = "capture-screen-owned-${UUID.randomUUID()}"
-        private val directory = File(context.cacheDir, directoryName).apply { check(mkdir()) }
+    private inner class Fixture(
+        private val safSession: SafAliasDocumentsProvider.Session? = null,
+    ) : ViewModelStoreOwner {
+        val directoryName = safSession?.directory?.name ?: "capture-screen-owned-${UUID.randomUUID()}"
+        private val directory = safSession?.directory ?: File(context.cacheDir, directoryName).apply { check(mkdir()) }
+        private val storageUri = safSession?.let { session ->
+            val authority = context.packageManager.getProviderInfo(
+                ComponentName(context, SafAliasDocumentsProvider::class.java),
+                0,
+            ).authority
+            DocumentsContract.buildTreeDocumentUri(authority, "${session.id}|root-a")
+        } ?: Uri.fromFile(directory)
         val book = "neutral-${UUID.randomUUID()}"
         val chapter = "chapter-1"
         val chapterDirectory = File(directory, "local/$book/$chapter")
@@ -366,7 +525,7 @@ class CaptureScreenUiTest {
             StoragePreferences(
                 object : FolderProvider {
                     override fun directory(): File = directory
-                    override fun path(): String = Uri.fromFile(directory).toString()
+                    override fun path(): String = storageUri.toString()
                 },
                 InMemoryPreferenceStore(),
             ),
@@ -383,6 +542,7 @@ class CaptureScreenUiTest {
         }
         val observations = CopyOnWriteArrayList<WebViewCaptureObservation>()
         var captureJob: Job? = null
+        private var writeGate: SafAliasDocumentsProvider.WriteGate? = null
         private val oldObserver = onMain {
             val old = webViewCaptureObserver
             webViewCaptureObserver = { observations.add(it) }
@@ -405,6 +565,20 @@ class CaptureScreenUiTest {
         fun currentCaptureJob(): Job? = CaptureViewModel::class.java.getDeclaredField("continuousJob")
             .apply { isAccessible = true }.get(model) as Job?
 
+        fun gateFirstWrite(): SafAliasDocumentsProvider.WriteGate {
+            val session = checkNotNull(safSession)
+            check(storageUri.scheme == "content")
+            return session.gateNextWrite(File(chapterDirectory, "001.png")).also { writeGate = it }
+        }
+
+        fun assertGatedWriteObserved() {
+            val session = checkNotNull(safSession)
+            val gate = checkNotNull(writeGate)
+            assertTrue(File(chapterDirectory, "001.png").isFile)
+            assertTrue(session.writeModes.any { it.first == gate.documentId && it.second == "wt" })
+            assertTrue(session.createRequests.any { it.first == "image/png" && it.second == "001" })
+        }
+
         fun close(retainFiles: Boolean) {
             var failure: Throwable? = null
             fun cleanup(block: () -> Unit) {
@@ -415,21 +589,32 @@ class CaptureScreenUiTest {
                 }
             }
             val job = captureJob ?: onMain { currentCaptureJob() }
+            val modelJobs = onMain {
+                listOfNotNull(model.viewModelScope.coroutineContext[Job], review.viewModelScope.coroutineContext[Job])
+            }
+            cleanup { writeGate?.release() }
             cleanup { onMain { viewModelStore.clear() } }
             cleanup { if (job != null) runBlocking { withTimeout(10_000) { job.join() } } }
+            cleanup { runBlocking { withTimeout(10_000) { modelJobs.forEach { it.join() } } } }
             cleanup { onMain { webViewCaptureObserver = oldObserver } }
             cleanup {
                 val storageScope = StorageManager::class.java.getDeclaredField("scope").apply { isAccessible = true }
                     .get(storage) as CoroutineScope
                 storageScope.cancel()
+                runBlocking { withTimeout(5_000) { storageScope.coroutineContext[Job]?.join() } }
             }
             // A timed-out worker must retain its files for diagnosis rather than race deletion.
             if (failure != null) throw checkNotNull(failure)
-            if (retainFiles) return
             // Only this UUID fixture's recognized files and empty directories may be deleted.
             check(directory.canonicalFile == File(context.cacheDir.canonicalFile, directoryName))
             val allowedDirectories =
-                listOf(chapterDirectory, File(directory, "local/$book"), File(directory, "local"), directory)
+                listOfNotNull(
+                    chapterDirectory,
+                    File(directory, "local/$book"),
+                    File(directory, "local"),
+                    safSession?.chapter,
+                    directory,
+                )
             allowedDirectories.forEach {
                 check(it.canonicalFile == File(directory.canonicalFile, it.relativeTo(directory).path))
                 check(it.canonicalFile.toPath().startsWith(directory.canonicalFile.toPath()))
@@ -445,6 +630,13 @@ class CaptureScreenUiTest {
                     (parent == File(directory, "local/$book") && file.name == MANGA_META_FILE)
                 check(allowed && file.canonicalFile == File(parent!!.canonicalFile, file.name))
             }
+            val observedDirectories = directory.walkTopDown().filter { it.isDirectory }.toSet()
+            check(observedDirectories.all { it in allowedDirectories })
+            if (safSession != null) {
+                safSession.close(retainOwnedFiles = retainFiles)
+                return
+            }
+            if (retainFiles) return
             files.forEach { check(it.delete()) }
             allowedDirectories.forEach {
                 if (it.exists()) check(it.delete())
