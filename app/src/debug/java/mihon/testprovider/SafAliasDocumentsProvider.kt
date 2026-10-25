@@ -13,6 +13,7 @@ import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileNotFoundException
+import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -130,7 +131,41 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
 
     override fun deleteDocument(documentId: String) {
         val (session, file) = resolve(documentId)
-        check(file != session.directory && file.delete()) { "Cannot delete fixture entry" }
+        check(file != session.directory) { "Cannot delete the fixture root" }
+        if (session.recursiveDelete && file.isDirectory) {
+            deleteOwnedSubtree(session, file)
+        } else {
+            check(file.delete()) { "Cannot delete fixture entry" }
+        }
+    }
+
+    /** Explicit normal-directory semantics for one owned session; legacy fault sessions stay strict. */
+    private fun deleteOwnedSubtree(session: Session, selected: File) {
+        val root = session.checked(selected)
+        check(root != session.directory && root.isDirectory)
+        val pending = mutableListOf(root)
+        val entries = mutableListOf<File>()
+        fun checkedEntry(file: File): File = session.checked(file).also {
+            check(it == root || it.toPath().startsWith(root.toPath()))
+            check(!Files.isSymbolicLink(it.toPath()) && (it.isDirectory || it.isFile))
+        }
+        // Validate the entire bounded subtree before the first deletion. A newly appearing entry
+        // subsequently makes its directory delete fail instead of broadening this saved inventory.
+        while (pending.isNotEmpty()) {
+            check(entries.size < MAX_RECURSIVE_DELETE_ENTRIES) { "Owned fixture deletion limit exceeded" }
+            val entry = checkedEntry(pending.removeAt(pending.lastIndex))
+            entries += entry
+            if (entry.isDirectory) {
+                val children = checkNotNull(entry.listFiles()) { "Cannot list owned fixture directory" }
+                check(entries.size + pending.size + children.size <= MAX_RECURSIVE_DELETE_ENTRIES) {
+                    "Owned fixture deletion limit exceeded"
+                }
+                pending += children
+            }
+        }
+        for (entry in entries.asReversed()) {
+            check(checkedEntry(entry).delete()) { "Cannot delete owned fixture subtree entry" }
+        }
     }
 
     override fun renameDocument(documentId: String, displayName: String): String {
@@ -240,7 +275,11 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         }
     }
 
-    class Session internal constructor(val directory: File, val id: String) {
+    class Session @JvmOverloads internal constructor(
+        val directory: File,
+        val id: String,
+        val recursiveDelete: Boolean = false,
+    ) {
         val chapter = checked(File(directory, "chapter")).apply { check(mkdir()) }
         val page = checked(File(chapter, "target.png"))
         val failNextPageWrite = AtomicBoolean(false)
@@ -280,6 +319,7 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
     }
 
     companion object {
+        private const val MAX_RECURSIVE_DELETE_ENTRIES = 256
         private val sessions = ConcurrentHashMap<String, Session>()
         private val COLUMNS = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -290,14 +330,15 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
         )
 
-        fun createSession(context: Context): Session {
+        @JvmOverloads
+        fun createSession(context: Context, recursiveDelete: Boolean = false): Session {
             check(context.packageName == "app.yomitori.yakuyomi.audit") { "Isolated audit only" }
             val id = UUID.randomUUID().toString()
             val cache = context.cacheDir.canonicalFile
             val directory = File(cache, "saf-alias-$id")
             check(directory.parentFile == cache && directory.mkdir())
             return try {
-                Session(directory, id).also { check(sessions.putIfAbsent(id, it) == null) }
+                Session(directory, id, recursiveDelete).also { check(sessions.putIfAbsent(id, it) == null) }
             } catch (failure: Throwable) {
                 try {
                     check(directory.canonicalFile.parentFile == cache && directory.name == "saf-alias-$id")
