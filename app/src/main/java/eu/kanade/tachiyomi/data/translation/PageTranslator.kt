@@ -158,7 +158,6 @@ class PageTranslator(private val context: Context) {
         var translated = 0
         var promptTokens = 0
         var completionTokens = 0
-        val errors = mutableListOf<String>()
         var materialsWarningRecorded = false
         coroutineScope {
             for (image in pending) {
@@ -171,17 +170,30 @@ class PageTranslator(private val context: Context) {
                         val attempt =
                             translateStoredPage(chapterDir, image, method, false, keepMaterials, nightOnly, shouldStop)
                         if (attempt.kind == AttemptKind.STOPPED) return@launch
+                        // A committed partial already recorded its diagnostic under the page lock.
+                        // Publish other failures before callbacks can start a newer page operation.
+                        if (attempt.kind != AttemptKind.PARTIAL || !attempt.displayChanged) {
+                            attempt.error?.let { reason ->
+                                pageLock(image).withLock { recordSinglePageError(chapterDir, name, reason) }
+                            }
+                        }
+                        attempt.materialsWarning?.let { warning ->
+                            val recordWarning = stateMutex.withLock {
+                                if (materialsWarningRecorded) {
+                                    false
+                                } else {
+                                    materialsWarningRecorded = true
+                                    true
+                                }
+                            }
+                            if (recordWarning) recordMaterialsWarning(chapterDir, warning)
+                        }
                         stateMutex.withLock {
                             promptTokens += attempt.stats?.promptTokens ?: 0
                             completionTokens += attempt.stats?.completionTokens ?: 0
                             if (attempt.kind == AttemptKind.TRANSLATED) translated++
                             done.clear()
                             done.addAll(readDonePages(chapterDir))
-                            attempt.error?.let { errors += "$name\t$it" }
-                            if (attempt.materialsWarning != null && !materialsWarningRecorded) {
-                                materialsWarningRecorded = true
-                                errors += "(materials)\t${attempt.materialsWarning}"
-                            }
                             processed++
                             onProgress(processed, images.size)
                         }
@@ -192,19 +204,6 @@ class PageTranslator(private val context: Context) {
                         gate.release()
                     }
                 }
-            }
-        }
-        val pendingNames = pending.mapNotNullTo(HashSet()) { it.name }
-        manifestMutex.withLock {
-            val carried = readErrorLines(chapterDir).filter { line ->
-                val page = line.substringBefore('\t')
-                page !in pendingNames && page in done && PageSizeCap.isTooLargeReason(line.substringAfter('\t', ""))
-            }
-            val allErrors = carried + errors
-            if (allErrors.isEmpty()) {
-                deleteFileOnly(chapterDir.findFile(ERRORS_FILE), ERRORS_FILE)
-            } else {
-                overwriteBytes(chapterDir, ERRORS_FILE, allErrors.joinToString("\n", postfix = "\n").toByteArray())
             }
         }
         if (translated > 0 || promptTokens > 0 || completionTokens > 0) {
@@ -587,7 +586,10 @@ class PageTranslator(private val context: Context) {
         }
         coroutineContext.ensureActive()
         if (shouldStop()) return PageAttempt(AttemptKind.STOPPED, stats)
-        if (commitCompletion) commitManifest(chapterDir, setOf(name))
+        if (commitCompletion) {
+            commitManifest(chapterDir, setOf(name))
+            if (error == null) clearCompletedPageErrorLocked(chapterDir, name)
+        }
         processingOutcome?.let {
             saveProcessingSummaryLocked(
                 chapterDir,
@@ -2917,15 +2919,42 @@ class PageTranslator(private val context: Context) {
 
     /**
      * reader 單頁路徑把一頁的失敗原因寫進該話錯誤檔（[ERRORS_FILE]，行格式同佇列：`<頁名>\t<原因>`）：同頁舊的翻譯錯誤行換成
-     * 這行，別頁的行與夜讀行原樣保留。整章佇列下一輪跑完會照它自己的結果整檔重寫。best-effort：失敗只記 log。
+     * 這行，別頁的行與夜讀行原樣保留。整章也逐頁更新，不在章末用舊結果取代較新的診斷。best-effort：失敗只記 log。
      */
     private suspend fun recordSinglePageError(chapterDir: UniFile, pageName: String, reason: String) {
         runCatching {
-            manifestMutex.withLock {
-                val kept = readErrorLines(chapterDir).filterNot { it.startsWith("$pageName\t") }
-                overwriteBytes(chapterDir, ERRORS_FILE, (kept + "$pageName\t$reason").joinToString("\n").toByteArray())
+            withContext(NonCancellable) {
+                manifestMutex.withLock {
+                    val kept = readErrorLinesForUpdate(chapterDir).filterNot { it.startsWith("$pageName\t") }
+                    check(
+                        overwriteBytes(
+                            chapterDir,
+                            ERRORS_FILE,
+                            (kept + "$pageName\t$reason").joinToString("\n").toByteArray(),
+                        ),
+                    ) { "Cannot record page diagnostic" }
+                }
             }
         }.onFailure { logcat(LogPriority.WARN, it) { "寫翻譯錯誤檔失敗 ${chapterDir.name}" } }
+    }
+
+    /** Materials warnings have no page owner; a later chapter cannot prove an old warning resolved. */
+    private suspend fun recordMaterialsWarning(chapterDir: UniFile, warning: String) {
+        runCatching {
+            withContext(NonCancellable) {
+                manifestMutex.withLock {
+                    val existing = readErrorLinesForUpdate(chapterDir)
+                    val line = "(materials)\t$warning"
+                    if (line !in existing) {
+                        check(
+                            overwriteBytes(chapterDir, ERRORS_FILE, (existing + line).joinToString("\n").toByteArray()),
+                        ) {
+                            "Cannot record materials diagnostic"
+                        }
+                    }
+                }
+            }
+        }.onFailure { logcat(LogPriority.WARN, it) { "Cannot record materials diagnostic ${chapterDir.name}" } }
     }
 
     /** Caller holds the page lock, before returning a newly committed success to the reader. */
@@ -2958,12 +2987,16 @@ class PageTranslator(private val context: Context) {
         }.onFailure { logcat(LogPriority.WARN, it) { "Cannot clear resolved translation error ${chapterDir.name}" } }
     }
 
-    /** 該話錯誤檔（[ERRORS_FILE]）現有的非空行；沒有檔、讀不到 → 空。 */
-    private fun readErrorLines(chapterDir: UniFile): List<String> = runCatching {
-        chapterDir.findFile(ERRORS_FILE)?.let { f ->
-            context.contentResolver.openInputStream(f.uri)?.use { it.bufferedReader().readLines() }
-        }.orEmpty().filter { it.isNotBlank() }
-    }.getOrDefault(emptyList())
+    /** Missing diagnostics are empty; unreadable diagnostics cannot authorize overwriting other owners. */
+    private fun readErrorLinesForUpdate(chapterDir: UniFile): List<String> {
+        val file = chapterDir.findFile(ERRORS_FILE) ?: return emptyList()
+        check(file.isFile && file.name == ERRORS_FILE) { "Invalid translation error file" }
+        return (
+            context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readLines() }
+                ?: throw java.io.IOException("Cannot read translation error file")
+            )
+            .filter { it.isNotBlank() }
+    }
 
     /**
      * 上次覆蓋頁檔到一半被打斷的善後（[OriginalMaterial.shouldRecover]；只給**還沒進清單**的頁用）：進行中記號在、

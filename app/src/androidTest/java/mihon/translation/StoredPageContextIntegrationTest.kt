@@ -1,5 +1,8 @@
 package mihon.translation
 
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -13,6 +16,7 @@ import eu.kanade.tachiyomi.data.translation.PartialPageStore
 import eu.kanade.tachiyomi.data.translation.StoredTranslationContext
 import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
+import eu.kanade.tachiyomi.data.translation.TranslationStatsStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -505,6 +509,33 @@ class StoredPageContextIntegrationTest {
         }
     }
 
+    /** Chapter accounting uses only a UUID-owned statistics file, including on assertion failure. */
+    private suspend fun withChapterDiagnosticFixture(block: suspend (Fixture) -> Unit) {
+        val target = context
+        val statsName = "chapter-diagnostics-stats-${UUID.randomUUID()}"
+        val statistics = target.getSharedPreferences(statsName, Context.MODE_PRIVATE)
+        val privateStatsContext = object : ContextWrapper(target) {
+            override fun getSharedPreferences(name: String, mode: Int): SharedPreferences {
+                check(name == "translation_stats") { "Unexpected chapter fixture preference" }
+                return target.getSharedPreferences(statsName, mode)
+            }
+        }
+        try {
+            withSourceProtectionFixture { fixture ->
+                PageTranslator::class.java.getDeclaredField("statsStore").apply { isAccessible = true }
+                    .set(fixture.translator, TranslationStatsStore(privateStatsContext))
+                block(fixture)
+            }
+        } finally {
+            // A synchronous edit drains preceding apply() writes before deleting our own file.
+            check(statistics.edit().clear().commit()) { "Cannot finish owned chapter statistics writes" }
+            check(target.deleteSharedPreferences(statsName)) { "Cannot delete owned chapter statistics" }
+            val preferencesDirectory = File(target.applicationInfo.dataDir, "shared_prefs")
+            assertFalse(File(preferencesDirectory, "$statsName.xml").exists())
+            assertFalse(File(preferencesDirectory, "$statsName.xml.bak").exists())
+        }
+    }
+
     @Test
     fun languageRestartFailurePreservesPriorOutputThenReplacesAllTargetsAndResumes() = runBlocking {
         withPending { fixture, pending ->
@@ -719,6 +750,280 @@ class StoredPageContextIntegrationTest {
             assertEquals(kept + "$PAGE\tmanual retry failed", fixture.errors.readLines())
             assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
             fixture.assertOriginalPreserved()
+        }
+    }
+
+    @Test
+    fun chapterSuccessClearsItsDiagnosticAndPreservesOtherPageNightAndMaterialsOwners() = runBlocking {
+        withChapterDiagnosticFixture { fixture ->
+            val kept = listOf(
+                "002.png\tother page failure",
+                "001.png.extra\tunrelated diagnostic with a shared prefix",
+                "(night)\t$PAGE\tnight generation failure",
+                "(materials)\toptional materials warning",
+            )
+            fixture.errors.writeText((kept + "$PAGE\tprevious page failure").joinToString("\n", postfix = "\n"))
+            val calls = AtomicInteger()
+            val returned = mutableListOf<PageResult.Translated>()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    assertEquals(Color.WHITE, page.getPixel(0, 0))
+                    return (result("한국어", true) as PageResult.Translated).also { returned += it }
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A fresh chapter page must not resume saved analysis")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            val progress = mutableListOf<Pair<Int, Int>>()
+            assertEquals(
+                1,
+                fixture.translator.translateChapter(
+                    fixture.chapter,
+                    "boxfill",
+                    onProgress = { done, total -> progress += done to total },
+                    nightMaterials = false,
+                ),
+            )
+            assertEquals(1, calls.get())
+            assertEquals(listOf(0 to 1, 1 to 1), progress)
+            assertTrue(fixture.translator.isChapterTranslated(fixture.chapter))
+            assertEquals("Fresh completed output uses the legacy completion path", null, fixture.store.load(PAGE))
+            assertEquals(
+                setOf(PAGE),
+                CompletionManifestCodec.decode(File(fixture.directory, CompletionManifestCodec.PRIMARY).readBytes()),
+            )
+            fixture.assertOriginalPreserved()
+            assertSolidPage(fixture.page, Color.BLACK)
+            assertTrue(returned.single().page.isRecycled)
+            assertTrue(requireNotNull(returned.single().analysis).mask.isRecycled)
+            assertEquals(
+                "Chapter success must preserve diagnostics owned by other pages, night and materials",
+                kept,
+                fixture.errors.takeIf { it.isFile }?.readLines().orEmpty(),
+            )
+        }
+    }
+
+    @Test
+    fun chapterFailureReplacesOnlyItsDiagnosticAndPreservesOtherOwners() = runBlocking {
+        withChapterDiagnosticFixture { fixture ->
+            val kept = listOf(
+                "002.png\tother page failure",
+                "001.png.extra\tunrelated diagnostic with a shared prefix",
+                "(night)\t$PAGE\tnight generation failure",
+                "(materials)\toptional materials warning",
+            )
+            fixture.errors.writeText((kept + "$PAGE\tprevious page failure").joinToString("\n", postfix = "\n"))
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    return PageResult.Failed("current chapter page failure")
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A fresh chapter page must not resume saved analysis")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            val progress = mutableListOf<Pair<Int, Int>>()
+            assertEquals(
+                0,
+                fixture.translator.translateChapter(
+                    fixture.chapter,
+                    "boxfill",
+                    onProgress = { done, total -> progress += done to total },
+                    nightMaterials = false,
+                ),
+            )
+            assertEquals(1, calls.get())
+            assertEquals(listOf(0 to 1, 1 to 1), progress)
+            assertFalse(fixture.translator.isChapterTranslated(fixture.chapter))
+            assertArrayEquals(fixture.initialBytes, fixture.page.readBytes())
+            assertFalse(File(fixture.materials, "001.orig.png").exists())
+            assertEquals(
+                "Chapter failure must replace only its own page diagnostic",
+                kept + "$PAGE\tcurrent chapter page failure",
+                fixture.errors.takeIf { it.isFile }?.readLines().orEmpty(),
+            )
+        }
+    }
+
+    @Test
+    fun chapterFreshNoTextCompletionClearsOnlyItsOwnDiagnosticAndPreservesSource() = runBlocking {
+        withChapterDiagnosticFixture { fixture ->
+            val kept = listOf(
+                "002.png\tother page failure",
+                "(night)\t$PAGE\tnight generation failure",
+                "(materials)\toptional materials warning",
+            )
+            fixture.errors.writeText((kept + "$PAGE\tprevious page failure").joinToString("\n", postfix = "\n"))
+            val calls = AtomicInteger()
+            val masks = mutableListOf<Bitmap>()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    assertEquals(Color.WHITE, page.getPixel(0, 0))
+                    val progress = PageProgress(SIZE, SIZE, emptyList(), noTextDetected = true)
+                    return PageResult.Skipped(
+                        "No text detected",
+                        PageStats(0, 0, 0, 0, 0, 0, 0, 0),
+                        PageAnalysis(image(Color.WHITE).also { masks += it }, emptyList(), progress),
+                    )
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A fresh chapter page must not resume saved analysis")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            val progress = mutableListOf<Pair<Int, Int>>()
+            assertEquals(
+                0,
+                fixture.translator.translateChapter(
+                    fixture.chapter,
+                    "boxfill",
+                    onProgress = { done, total -> progress += done to total },
+                    nightMaterials = false,
+                ),
+            )
+            assertEquals(1, calls.get())
+            assertEquals(listOf(0 to 1, 1 to 1), progress)
+            assertTrue(fixture.translator.isChapterTranslated(fixture.chapter))
+            assertEquals(
+                setOf(PAGE),
+                CompletionManifestCodec.decode(File(fixture.directory, CompletionManifestCodec.PRIMARY).readBytes()),
+            )
+            assertArrayEquals(fixture.initialBytes, fixture.page.readBytes())
+            assertFalse(
+                "Unchanged no-text completion must not invent an original copy",
+                File(fixture.materials, "001.orig.png").exists(),
+            )
+            assertTrue(masks.single().isRecycled)
+            assertEquals(
+                "Fresh no-text chapter completion must clear only its own diagnostic",
+                kept,
+                fixture.errors.takeIf { it.isFile }?.readLines().orEmpty(),
+            )
+        }
+    }
+
+    @Test
+    fun chapterStoppedBeforeInferencePreservesUnattemptedPageDiagnostics() = runBlocking {
+        withChapterDiagnosticFixture { fixture ->
+            val second = File(fixture.directory, "002.png").apply { writeBytes(encoded(Color.BLUE)) }
+            val kept = listOf(
+                "$PAGE\tunattempted first page failure",
+                "002.png\tunattempted second page failure",
+                "(night)\t$PAGE\tnight generation failure",
+                "(materials)\toptional materials warning",
+            )
+            val diagnosticBytes = kept.joinToString("\n", postfix = "\n").toByteArray()
+            fixture.errors.writeBytes(diagnosticBytes)
+            val sourceHashes = protectedFileHashes(fixture.directory)
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult {
+                    calls.incrementAndGet()
+                    error("A stopped chapter must not start page inference")
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult {
+                    calls.incrementAndGet()
+                    error("A stopped chapter must not resume page inference")
+                }
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            val progress = mutableListOf<Pair<Int, Int>>()
+            assertEquals(
+                0,
+                fixture.translator.translateChapter(
+                    fixture.chapter,
+                    "boxfill",
+                    onProgress = { done, total -> progress += done to total },
+                    shouldStop = { true },
+                    nightMaterials = false,
+                ),
+            )
+            assertEquals(0, calls.get())
+            assertEquals(listOf(0 to 2), progress)
+            assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+            assertFalse(fixture.translator.isPageTranslated(fixture.chapter, second.name))
+            assertEquals(sourceHashes, protectedFileHashes(fixture.directory))
+            assertArrayEquals(
+                "A cooperative stop before inference must preserve unattempted diagnostics",
+                diagnosticBytes,
+                fixture.errors.takeIf { it.isFile }?.readBytes() ?: byteArrayOf(),
+            )
+        }
+    }
+
+    @Test
+    fun chapterCompletionCannotClearLaterManualFailureRecordedByPageDoneCallback() = runBlocking {
+        withChapterDiagnosticFixture { fixture ->
+            val calls = AtomicInteger()
+            fixture.select(object : TranslationEngine {
+                override val translationContext = semantic("Korean")
+                override suspend fun translatePage(page: Bitmap): PageResult = when (calls.incrementAndGet()) {
+                    1 -> result("한국어", true)
+                    2 -> PageResult.Failed("newer manual page failure")
+                    else -> error("Unexpected chapter or manual inference")
+                }
+                override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult =
+                    error("A completed page requires a fresh manual attempt")
+                override fun warmUp() = Unit
+                override fun close() = Unit
+            })
+            var callbackCalls = 0
+            var committedManifest: ByteArray? = null
+            var committedFiles: Map<String, String>? = null
+            assertEquals(
+                1,
+                fixture.translator.translateChapter(
+                    fixture.chapter,
+                    "boxfill",
+                    nightMaterials = false,
+                    onPageDone = { pageName ->
+                        callbackCalls++
+                        assertEquals(PAGE, pageName)
+                        assertEquals(null, fixture.store.load(PAGE))
+                        committedManifest = File(fixture.directory, CompletionManifestCodec.PRIMARY).readBytes().also {
+                            assertEquals(setOf(PAGE), CompletionManifestCodec.decode(it))
+                        }
+                        committedFiles = protectedFileHashes(fixture.directory)
+                        // The public callback runs after the chapter page is durable, outside its
+                        // page/manifest locks. Complete a later manual attempt before returning.
+                        val manual = runBlocking { withTimeout(5_000) { fixture.translate() } }
+                        assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, manual)
+                        assertEquals(null, fixture.store.load(PAGE))
+                        assertArrayEquals(
+                            requireNotNull(committedManifest),
+                            File(fixture.directory, CompletionManifestCodec.PRIMARY).readBytes(),
+                        )
+                        assertEquals(committedFiles, protectedFileHashes(fixture.directory))
+                        assertEquals(listOf("$PAGE\tnewer manual page failure"), fixture.errors.readLines())
+                    },
+                ),
+            )
+            assertEquals(1, callbackCalls)
+            assertEquals(2, calls.get())
+            assertEquals(null, fixture.store.load(PAGE))
+            assertArrayEquals(
+                requireNotNull(committedManifest),
+                File(fixture.directory, CompletionManifestCodec.PRIMARY).readBytes(),
+            )
+            assertEquals(committedFiles, protectedFileHashes(fixture.directory))
+            assertTrue(fixture.translator.isChapterTranslated(fixture.chapter))
+            fixture.assertOriginalPreserved()
+            assertEquals(
+                "Chapter completion must not clear a newer manual failure recorded after page commit",
+                listOf("$PAGE\tnewer manual page failure"),
+                fixture.errors.takeIf { it.isFile }?.readLines().orEmpty(),
+            )
         }
     }
 
