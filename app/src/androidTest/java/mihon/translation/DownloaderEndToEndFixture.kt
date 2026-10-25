@@ -35,8 +35,12 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
 import mihon.testprovider.SafAliasDocumentsProvider
 import okhttp3.Headers
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
@@ -74,7 +78,15 @@ import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-internal class DownloaderEndToEndFixture(private val target: Context, private val archive: Boolean) {
+internal class DownloaderEndToEndFixture(
+    private val target: Context,
+    private val archive: Boolean,
+    private val cachedFirstPage: Boolean = false,
+) {
+    init {
+        check(!cachedFirstPage || !archive)
+    }
+
     private val uuid = UUID.randomUUID()
     private val prefix = "downloader-e2e-$uuid"
     private val root = File(target.cacheDir.canonicalFile, prefix).apply { check(mkdir()) }
@@ -112,6 +124,7 @@ internal class DownloaderEndToEndFixture(private val target: Context, private va
     private var registration: OnlineReaderSourceRegistration? = null
     private var session: SafAliasDocumentsProvider.Session? = null
     private var chapterCache: ChapterCache? = null
+    private var cachedDescriptorProbe: CachedDownloadDescriptorProbe? = null
     private var manager: DownloadManager? = null
     private var privateTranslations: TranslationManager? = null
     private var privateEngine: TranslationEngineService? = null
@@ -219,6 +232,7 @@ internal class DownloaderEndToEndFixture(private val target: Context, private va
         assertFalse("DOWNLOADER_E2E_METADATA_FS_NOT_DOWNLOADED", downloaded(skipCache = true))
         assertEquals("DOWNLOADER_E2E_METADATA_COUNT_ZERO", 0, cache.getDownloadCount(manga))
         assertEquals("DOWNLOADER_E2E_NO_PREPARATION_HTTP", emptyList<String>(), server.requests.toList())
+        if (cachedFirstPage) prepareCachedFirstPage(ownedSession)
     }
 
     suspend fun downloadAndRead() {
@@ -252,7 +266,11 @@ internal class DownloaderEndToEndFixture(private val target: Context, private va
         assertEquals("DOWNLOADER_E2E_COMPLETED_STATE", Download.State.DOWNLOADED, queued.status)
         assertEquals(
             "DOWNLOADER_E2E_REAL_HTTP_PATHS",
-            mapOf("/chapter" to 1, "/image/1.png" to 1, "/image/2.png" to 1),
+            buildMap {
+                put("/chapter", 1)
+                if (!cachedFirstPage) put("/image/1.png", 1)
+                put("/image/2.png", 1)
+            },
             server.requests.groupingBy { it }.eachCount(),
         )
         assertEquals("DOWNLOADER_E2E_SERVER_HEALTH", null, server.failure)
@@ -316,6 +334,7 @@ internal class DownloaderEndToEndFixture(private val target: Context, private va
         assertFalse("DOWNLOADER_E2E_NO_NATIVE_ENGINE_WARM", requireNotNull(privateEngine).warm.value)
         assertEquals("DOWNLOADER_E2E_NO_NATIVE_ENGINE", null, nullableField(requireNotNull(privateEngine), "engine"))
         assertEquals("DOWNLOADER_E2E_NO_TRANSLATION_STATS", emptyList<Any>(), requireNotNull(privateStats).allDays())
+        cachedDescriptorProbe?.verifyClosedBeforeRename()
         completed = true
     }
 
@@ -323,6 +342,7 @@ internal class DownloaderEndToEndFixture(private val target: Context, private va
         if (downloadStarted && manager?.isRunning == true) manager?.downloaderStop()
         // Never restore DI while an owned callback could still capture an unrelated production object.
         for (owner in scopeOwners.asReversed()) withTimeout(10_000) { scopeJob(owner).cancelAndJoin() }
+        cachedDescriptorProbe?.close()
         chapterCache?.let { (field(it, "diskCache") as Closeable).close() }
         server.close()
         registration?.close()
@@ -364,12 +384,37 @@ internal class DownloaderEndToEndFixture(private val target: Context, private va
             .put("privateDebugSafProvider", true).put("oemSafOrPersistedGrantCovered", false)
             .put("providerContractVerified", providerContractVerified)
             .put("workerSchedulingCovered", false).put("liveHitomiOrLlmOrNativeModelInferenceInvoked", false)
+        if (cachedFirstPage) {
+            evidence.put("cachedPageDescriptorEvidence", requireNotNull(cachedDescriptorProbe).evidence())
+        }
         InstrumentationRegistry.getInstrumentation().sendStatus(
             2,
             Bundle().apply {
                 putString("downloaderEndToEndEvidence", evidence.toString())
             },
         )
+    }
+
+    private fun prepareCachedFirstPage(ownedSession: SafAliasDocumentsProvider.Session) {
+        val imageUrl = server.source.baseUrl + "/image/1.png"
+        val privateCache = requireNotNull(chapterCache)
+        Response.Builder()
+            .request(Request.Builder().url(imageUrl).build())
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .body(server.pages.first().toResponseBody("image/png".toMediaType()))
+            .build()
+            .use { privateCache.putImageToCache(imageUrl, it) }
+        assertTrue("CACHED_DOWNLOAD_FD_REAL_CACHE_ENTRY", privateCache.isImageInCache(imageUrl))
+        val file = privateCache.getImageFile(imageUrl).canonicalFile
+        assertArrayEquals("CACHED_DOWNLOAD_FD_CACHE_BYTES", server.pages.first(), file.readBytes())
+        cachedDescriptorProbe = CachedDownloadDescriptorProbe(
+            ownedSession,
+            File(cacheDirectory, "chapter_disk_cache"),
+            file,
+            File(mangaDirectory, canonical.name + "_tmp/001.tmp"),
+        ).also { it.prepare() }
     }
 
     private fun lease(type: Type, value: Any) {

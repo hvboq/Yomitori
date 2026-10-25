@@ -173,6 +173,13 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         requireName(displayName)
         check(file != session.directory)
         val destination = session.checked(File(requireNotNull(file.parentFile), displayName))
+        val pending = session.pendingRenameObservation.get()
+        if (
+            pending != null && pending.documentId == documentId && pending.displayName == displayName &&
+            session.pendingRenameObservation.compareAndSet(pending, null)
+        ) {
+            pending.observe()
+        }
         check(!destination.exists() && file.renameTo(destination))
         return session.documentId(destination)
     }
@@ -275,6 +282,21 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    /** One exact owned-document rename observation; the callback never waits or changes the file. */
+    class RenameObservation internal constructor(
+        val documentId: String,
+        val displayName: String,
+        callback: () -> Unit,
+    ) {
+        private val callback = AtomicReference<(() -> Unit)?>(callback)
+
+        internal fun observe() = checkNotNull(callback.getAndSet(null)).invoke()
+
+        internal fun discard() {
+            callback.set(null)
+        }
+    }
+
     class Session @JvmOverloads internal constructor(
         val directory: File,
         val id: String,
@@ -285,11 +307,28 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         val failNextPageWrite = AtomicBoolean(false)
         val failNextWriteDocumentId = AtomicReference<String?>(null)
         val pendingWriteGate = AtomicReference<WriteGate?>(null)
+        internal val pendingRenameObservation = AtomicReference<RenameObservation?>(null)
         val writeModes = CopyOnWriteArrayList<Pair<String, String>>()
         val createRequests = CopyOnWriteArrayList<Pair<String, String>>()
         val reads = CopyOnWriteArrayList<String>()
 
         fun documentId(file: File): String = "$id|${checked(file).relativeTo(directory).invariantSeparatorsPath}"
+
+        fun observeNextRename(file: File, displayName: String, callback: () -> Unit): RenameObservation {
+            require(checked(file) != directory)
+            requireName(displayName)
+            return RenameObservation(documentId(file), displayName, callback).also {
+                check(pendingRenameObservation.compareAndSet(null, it)) { "An owned rename observation is pending" }
+            }
+        }
+
+        /** Call only after the fixture's own downloader jobs have settled. */
+        fun clearRenameObservation(observation: RenameObservation) {
+            val pending = pendingRenameObservation.get()
+            check(pending == null || pending === observation)
+            if (pending === observation) check(pendingRenameObservation.compareAndSet(observation, null))
+            observation.discard()
+        }
 
         fun gateNextWrite(file: File): WriteGate {
             require(checked(file) != directory)

@@ -49,8 +49,8 @@ android {
     defaultConfig {
         applicationId = "app.yomitori.yakuyomi"
 
-        versionCode = 104
-        versionName = "0.23.0-yomitori.38"
+        versionCode = 105
+        versionName = "0.23.0-yomitori.39"
 
         buildConfigField("String", "COMMIT_COUNT", "\"${getLatestCommitCount()}\"")
         buildConfigField("String", "COMMIT_SHA", "\"${getLatestCommitSha()}\"")
