@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
+        <activity
+            android:name="mihon.testprovider.HitomiOemPickerActivity"
+            android:exported="false" />
+
         <!-- DocumentsProvider mandates these flags. Runtime access is additionally UID-guarded. -->
         <provider
             android:name="mihon.testprovider.SafAliasDocumentsProvider"
