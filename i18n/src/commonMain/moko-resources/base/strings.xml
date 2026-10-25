@@ -1760,4 +1760,27 @@
     <string name="pref_nightread_clear_nothing">Nothing to clear</string>
     <string name="hitomi_dpi_bypass">DPI bypass</string>
     <string name="hitomi_dpi_bypass_summary">Use an alternative connection for Hitomi when your network blocks it. Changes apply to new requests. Encrypted DNS remains enabled when this is off.</string>
+    <string name="translation_failure_server_dns">The translation server address could not be resolved. Check the server address and VPN.</string>
+    <string name="translation_failure_server_connection">The translation server could not be reached. Check the server and VPN connection.</string>
+    <string name="translation_failure_server_timeout">The translation server did not respond in time. Try again.</string>
+    <string name="translation_failure_server_tls">A secure connection to the translation server could not be verified. Check the server certificate.</string>
+    <string name="translation_failure_server_auth">The translation server rejected authentication. Check the API key and access permissions.</string>
+    <string name="translation_failure_server_rate_limit">The translation server request limit was reached. Wait before trying again.</string>
+    <string name="translation_failure_server_http">The translation server returned an error. Check the server status.</string>
+    <string name="translation_failure_server_request">The translation server rejected the request. Check the server and model settings.</string>
+    <string name="translation_failure_server_response">The translation response format or region mapping was invalid. Try again.</string>
+    <string name="translation_failure_model_unavailable">Required models are unavailable. Check the model settings.</string>
+    <string name="translation_failure_no_pages">No image pages were found in this chapter. Check the download.</string>
+    <string name="translation_failure_ocr_pending">Some text could not be recognized. Saved translations are kept and you can try again.</string>
+    <string name="translation_failure_image_read">The page image could not be read. Check the file format and storage access.</string>
+    <string name="translation_failure_original_missing">Processing requires the saved original. Check the original files.</string>
+    <string name="translation_failure_original_ambiguous">The original could not be matched to this page. Restore the original before trying again.</string>
+    <string name="translation_failure_storage">The result could not be saved safely. Check free space and storage access.</string>
+    <string name="translation_failure_render">Translated text could not be laid out. Check the text layout settings and try again.</string>
+    <string name="translation_failure_inpaint">Text removal failed. Check the processing method and try again.</string>
+    <string name="translation_failure_detect">Text region detection failed. Try again.</string>
+    <string name="translation_failure_ocr">Text recognition failed. Check the models and page image.</string>
+    <string name="translation_failure_not_downloaded">The chapter files could not be found. Complete the download first.</string>
+    <string name="translation_failure_multiple">Several errors prevented completion. Check the settings and chapter files before trying again.</string>
+    <string name="translation_failure_unknown">Processing failed. Check the settings and files before trying again.</string>
 </resources>

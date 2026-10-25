@@ -989,4 +989,27 @@
     <string name="reader_translate_page_source_ambiguous">번역 기록이 없어 저장된 원본이 현재 페이지의 원본인지 확인할 수 없습니다. 재식자 메뉴에서 원본을 복원한 뒤 번역을 다시 시도하세요.</string>
     <string name="pref_translation_live_inpaint_method">읽는 중 원문 제거</string>
     <string name="pref_translation_live_inpaint_summary">AI 배경 복원은 원문 뒤의 배경을 복원합니다. 빠른 채우기는 단색 배경에서 처리 시간을 줄이는 데 적합합니다.</string>
+    <string name="translation_failure_server_dns">번역 서버의 주소를 찾지 못했습니다. VPN과 서버 주소를 확인하세요.</string>
+    <string name="translation_failure_server_connection">번역 서버에 연결하지 못했습니다. 서버와 VPN 연결을 확인하세요.</string>
+    <string name="translation_failure_server_timeout">번역 서버의 응답 시간이 초과됐습니다. 다시 시도하세요.</string>
+    <string name="translation_failure_server_tls">번역 서버의 보안 연결을 확인할 수 없습니다. 서버 인증서를 확인하세요.</string>
+    <string name="translation_failure_server_auth">번역 서버 인증이 거절됐습니다. API 키와 접근 권한을 확인하세요.</string>
+    <string name="translation_failure_server_rate_limit">번역 서버의 요청 한도에 도달했습니다. 잠시 뒤 다시 시도하세요.</string>
+    <string name="translation_failure_server_http">번역 서버에서 오류를 반환했습니다. 서버 상태를 확인하세요.</string>
+    <string name="translation_failure_server_request">번역 서버가 요청을 거절했습니다. 서버·모델 설정을 확인하세요.</string>
+    <string name="translation_failure_server_response">번역 응답의 형식이나 영역 대응이 올바르지 않습니다. 다시 시도하세요.</string>
+    <string name="translation_failure_model_unavailable">필요한 모델을 사용할 수 없습니다. 모델 설정을 확인하세요.</string>
+    <string name="translation_failure_no_pages">회차에서 이미지 페이지를 찾지 못했습니다. 다운로드 상태를 확인하세요.</string>
+    <string name="translation_failure_ocr_pending">일부 글자를 인식하지 못했습니다. 저장된 번역을 유지하고 다시 시도할 수 있습니다.</string>
+    <string name="translation_failure_image_read">페이지 이미지를 읽지 못했습니다. 파일 형식과 저장소 접근 권한을 확인하세요.</string>
+    <string name="translation_failure_original_missing">저장된 원본이 없어 처리를 진행하지 못했습니다. 원본 파일을 확인하세요.</string>
+    <string name="translation_failure_original_ambiguous">원본과 현재 페이지의 관계를 확인하지 못했습니다. 원본 복원 후 다시 시도하세요.</string>
+    <string name="translation_failure_storage">처리 결과를 안전하게 저장하지 못했습니다. 저장 공간과 접근 권한을 확인하세요.</string>
+    <string name="translation_failure_render">번역문 배치에 실패했습니다. 식자 설정을 확인한 뒤 다시 시도하세요.</string>
+    <string name="translation_failure_inpaint">원문 제거 중 오류가 발생했습니다. 처리 방법을 확인한 뒤 다시 시도하세요.</string>
+    <string name="translation_failure_detect">페이지의 글자 영역을 찾는 중 오류가 발생했습니다. 다시 시도하세요.</string>
+    <string name="translation_failure_ocr">글자 인식 중 오류가 발생했습니다. 모델과 페이지를 확인하세요.</string>
+    <string name="translation_failure_not_downloaded">회차 파일을 찾지 못했습니다. 다운로드를 먼저 완료하세요.</string>
+    <string name="translation_failure_multiple">여러 원인으로 처리를 마치지 못했습니다. 설정과 회차 파일을 확인한 뒤 다시 시도하세요.</string>
+    <string name="translation_failure_unknown">처리 중 오류가 발생했습니다. 설정과 파일을 확인한 뒤 다시 시도하세요.</string>
 </resources>

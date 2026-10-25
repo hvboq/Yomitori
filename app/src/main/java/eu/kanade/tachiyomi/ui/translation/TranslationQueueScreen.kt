@@ -85,6 +85,7 @@ import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
 import eu.kanade.tachiyomi.data.translation.TranslationManager
 import eu.kanade.tachiyomi.data.translation.model.QueuePoolKey
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.ui.manga.MangaScreen
 import eu.kanade.tachiyomi.ui.setting.SettingsScreen
@@ -556,6 +557,16 @@ private fun MangaGroupCard(
                 )
             }
         }
+        if (!expanded && errors > 0) {
+            val causes = group.chapters
+                .filter { it.status == TranslationItem.Status.ERROR }
+                .map { it.failureCode ?: TranslationFailureCode.UNKNOWN }
+                .distinct()
+            TranslationFailureHint(
+                failureCode = causes.singleOrNull() ?: TranslationFailureCode.MULTIPLE,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            )
+        }
         // 展開：章列（每章狀態 + ⏸/▶ 單章暫停⇄繼續 + ✕ 刪單章）。
         AnimatedVisibility(visible = expanded) {
             Column(modifier = Modifier.fillMaxWidth()) {
@@ -593,14 +604,18 @@ private fun ChapterRow(
             .padding(start = startPadding, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = statusLine(item),
-            style = textStyle,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = statusLine(item),
+                style = textStyle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (item.status == TranslationItem.Status.ERROR) {
+                TranslationFailureHint(item.failureCode)
+            }
+        }
         if (item.status != TranslationItem.Status.ERROR) {
             IconButton(
                 onClick = if (item.paused) onResume else onPause,

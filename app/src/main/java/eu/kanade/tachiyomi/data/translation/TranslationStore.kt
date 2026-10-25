@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.translation
 
 import android.content.Context
 import androidx.core.content.edit
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -57,6 +58,7 @@ class TranslationStore(
                     it.nightRender,
                     it.paused,
                     it.nightForce,
+                    if (it.errored) it.failureCode?.wireValue else null,
                 )
                 putString(index.toString(), json.encodeToString(obj))
             }
@@ -87,6 +89,7 @@ class TranslationStore(
                     o.nightRender,
                     o.paused,
                     o.nightForce,
+                    if (o.errored) TranslationFailureCode.fromWire(o.failureCode) else null,
                 ),
             )
         }
@@ -133,6 +136,7 @@ class TranslationStore(
         val paused: Boolean = false,
         /** 夜讀強制重做（-1＝否；0＝已要求未開跑；>0＝那一輪開跑時間，見 TranslationManager.Entry.nightForce）。 */
         val nightForce: Long = -1L,
+        val failureCode: TranslationFailureCode? = null,
     )
 
     /** [restore] 的輸出：已把 id 解析回 domain 物件，交給 [TranslationManager] 重建 Entry。 */
@@ -146,6 +150,7 @@ class TranslationStore(
         val nightRender: Boolean = false,
         val paused: Boolean = false,
         val nightForce: Long = -1L,
+        val failureCode: TranslationFailureCode? = null,
     )
 
     companion object {
@@ -184,4 +189,6 @@ private data class TranslationObject(
     val paused: Boolean = false,
     /** 夜讀強制重做（無此欄的舊 JSON＝不強制）。 */
     val nightForce: Long = -1L,
+    /** Keep as a nullable string so a future code cannot make an otherwise valid entry undecodable. */
+    val failureCode: String? = null,
 )

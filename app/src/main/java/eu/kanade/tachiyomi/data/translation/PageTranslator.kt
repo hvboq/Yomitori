@@ -18,6 +18,7 @@ import eu.kanade.tachiyomi.data.nightread.NightPages
 import eu.kanade.tachiyomi.data.nightread.NightPerfProbe
 import eu.kanade.tachiyomi.data.nightread.NightPump
 import eu.kanade.tachiyomi.data.nightread.NightTicket
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -128,9 +129,29 @@ class PageTranslator(private val context: Context) {
         shouldStop: () -> Boolean = { false },
         nightMaterials: Boolean = true,
         onPageDone: (pageName: String) -> Unit = {},
-    ): Int {
-        if (!TranslationEngineConfig.modelsResolvable(context)) return 0
-        val images = chapterImages(chapterDir).takeIf { it.isNotEmpty() } ?: return 0
+    ): Int = translateChapterDetailed(
+        chapterDir,
+        method,
+        onProgress,
+        shouldStop,
+        nightMaterials,
+        onPageDone,
+    ).translatedPages
+
+    /** Per-attempt safe metadata for the queue; the legacy count-only entry point stays unchanged. */
+    suspend fun translateChapterDetailed(
+        chapterDir: UniFile,
+        method: String = translationPreferences.inpaintMethod.get(),
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+        shouldStop: () -> Boolean = { false },
+        nightMaterials: Boolean = true,
+        onPageDone: (pageName: String) -> Unit = {},
+    ): ChapterTranslationResult {
+        if (!TranslationEngineConfig.modelsResolvable(context)) {
+            return ChapterTranslationResult(0, TranslationFailureCode.MODEL_UNAVAILABLE)
+        }
+        val images = chapterImages(chapterDir).takeIf { it.isNotEmpty() }
+            ?: return ChapterTranslationResult(0, TranslationFailureCode.NO_PAGES)
         for (image in images) {
             val name = image.name ?: continue
             pageLock(image).withLock { recoverCapturedSourceLocked(chapterDir, image, name) }
@@ -148,7 +169,7 @@ class PageTranslator(private val context: Context) {
         }
         val pending = images.filter { it.name !in done }
         onProgress(images.size - pending.size, images.size)
-        if (pending.isEmpty()) return 0
+        if (pending.isEmpty()) return ChapterTranslationResult(0)
 
         val keepMaterials = translationPreferences.keepMaterials.get() || translationPreferences.liveTranslate.get()
         val nightOnly = nightMaterials && !keepMaterials && translationPreferences.nightReadEnabled.get()
@@ -159,6 +180,7 @@ class PageTranslator(private val context: Context) {
         var promptTokens = 0
         var completionTokens = 0
         var materialsWarningRecorded = false
+        var failureCode: TranslationFailureCode? = null
         coroutineScope {
             for (image in pending) {
                 if (shouldStop()) break
@@ -189,6 +211,7 @@ class PageTranslator(private val context: Context) {
                             if (recordWarning) recordMaterialsWarning(chapterDir, warning)
                         }
                         stateMutex.withLock {
+                            failureCode = TranslationFailureCode.merge(failureCode, attempt.chapterFailureCode())
                             promptTokens += attempt.stats?.promptTokens ?: 0
                             completionTokens += attempt.stats?.completionTokens ?: 0
                             if (attempt.kind == AttemptKind.TRANSLATED) translated++
@@ -222,7 +245,7 @@ class PageTranslator(private val context: Context) {
         }
         // Count fully translated pages as before. Archive callers separately preserve partial work
         // using hasPartialProgress; a useful output is not the same as completing all OCR groups.
-        return translated
+        return ChapterTranslationResult(translated, failureCode)
     }
 
     private enum class AttemptKind {
@@ -243,7 +266,16 @@ class PageTranslator(private val context: Context) {
         val error: String? = null,
         val materialsWarning: String? = null,
         val displayChanged: Boolean = false,
+        val failureCode: TranslationFailureCode? = null,
     )
+
+    private fun PageAttempt.chapterFailureCode(): TranslationFailureCode? = failureCode ?: when (kind) {
+        AttemptKind.PARTIAL -> TranslationFailureCode.OCR_PENDING
+        AttemptKind.NO_ORIGINAL -> TranslationFailureCode.ORIGINAL_MISSING
+        AttemptKind.SOURCE_AMBIGUOUS -> TranslationFailureCode.ORIGINAL_AMBIGUOUS
+        AttemptKind.FAILED -> TranslationFailureCode.UNKNOWN
+        else -> null
+    }
 
     private data class PreparedInput(
         val decoded: PageDecode.Ok,
@@ -385,10 +417,16 @@ class PageTranslator(private val context: Context) {
         nightOnly: Boolean,
         shouldStop: () -> Boolean,
     ): PageAttempt {
-        val name = pageFile.name ?: return PageAttempt(AttemptKind.FAILED)
+        val name = pageFile.name ?: return PageAttempt(
+            AttemptKind.FAILED,
+            failureCode = TranslationFailureCode.STORAGE,
+        )
         var prepared: PreparedInput? = null
         var result: PageResult? = null
         var borrowedAnalysis: PageAnalysis? = null
+        // Preparation and commit operate on local authorities; an inference exception is not
+        // evidence of a storage failure or a particular transport problem.
+        var exceptionCode = TranslationFailureCode.STORAGE
         try {
             val input = pageLock(pageFile).withLock {
                 recoverCapturedSourceLocked(chapterDir, pageFile, name)
@@ -399,12 +437,19 @@ class PageTranslator(private val context: Context) {
                 var detachedOriginal: Pair<UniFile, Boolean>? = null
                 val kept = if (journal != null) {
                     chapterDir.findFile(MATERIALS_DIR)?.findFile(journal.original.name)
-                        ?: throw java.io.IOException("Missing journal original")
+                        ?: run {
+                            exceptionCode = TranslationFailureCode.ORIGINAL_MISSING
+                            throw java.io.IOException("Missing journal original")
+                        }
                 } else if (alreadyDone) {
                     ownOutputOriginal(chapterDir, pageFile, name)
                 } else {
                     if (!recoverInterrupted(chapterDir, pageFile, name)) {
-                        return PageAttempt(AttemptKind.FAILED, error = "Cannot recover previous page replacement")
+                        return PageAttempt(
+                            AttemptKind.FAILED,
+                            error = "Cannot recover previous page replacement",
+                            failureCode = TranslationFailureCode.STORAGE,
+                        )
                     }
                     // Missing records cannot authorize replacing a source: the visible page
                     // could be our old output or an externally replaced, unrelated image.
@@ -434,7 +479,11 @@ class PageTranslator(private val context: Context) {
                             token,
                         )
                     }
-                    is PageDecode.Unreadable -> return PageAttempt(AttemptKind.FAILED, error = decoded.reason)
+                    is PageDecode.Unreadable -> return PageAttempt(
+                        AttemptKind.FAILED,
+                        error = decoded.reason,
+                        failureCode = TranslationFailureCode.IMAGE_READ,
+                    )
                     is PageDecode.Ok -> {
                         val targetSha256 = try {
                             val displayBytes = if (kept == null) null else readPageBytes(pageFile)
@@ -479,6 +528,7 @@ class PageTranslator(private val context: Context) {
                     throw failure
                 }
             }
+            exceptionCode = TranslationFailureCode.UNKNOWN
             val inference = runTranslationUntilStopped(
                 shouldStop,
                 { operation: StoredPageResult -> recyclePageResult(operation.result) },
@@ -486,6 +536,7 @@ class PageTranslator(private val context: Context) {
                 engineService.translateStoredPage(bitmap, borrowedAnalysis, previous?.safeContextPayload, method)
             } ?: return PageAttempt(AttemptKind.STOPPED)
             result = inference.result
+            exceptionCode = TranslationFailureCode.STORAGE
             return when (val pageResult = result!!) {
                 is PageResult.Translated -> persistStoredResult(
                     chapterDir, pageFile, input, pageResult.page, pageResult.analysis, pageResult.stats,
@@ -529,7 +580,11 @@ class PageTranslator(private val context: Context) {
                         }
                     }
                 }
-                is PageResult.Failed -> PageAttempt(AttemptKind.FAILED, error = pageResult.reason)
+                is PageResult.Failed -> PageAttempt(
+                    AttemptKind.FAILED,
+                    error = pageResult.reason,
+                    failureCode = TranslationFailureCode.fromProcessingFailure(pageResult.failure),
+                )
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -544,6 +599,7 @@ class PageTranslator(private val context: Context) {
                     else -> null
                 },
                 error = "${failure.javaClass.simpleName}: ${failure.message}",
+                failureCode = exceptionCode,
             )
         } finally {
             result?.let(::recyclePageResult)

@@ -15,6 +15,7 @@ import eu.kanade.tachiyomi.data.nightread.NightGovernor
 import eu.kanade.tachiyomi.data.nightread.NightPages
 import eu.kanade.tachiyomi.data.nightread.NightStorageService
 import eu.kanade.tachiyomi.data.translation.model.QueuePoolKey
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.util.system.powerManager
 import kotlinx.coroutines.CancellationException
@@ -184,6 +185,9 @@ class TranslationManager(private val context: Context) {
         /** 夜讀強制重做（見類別說明）。持久化。 */
         var nightForce: Long = NIGHT_NO_FORCE,
     ) {
+        /** Safe per-attempt metadata, protected by the manager lock like status and progress. */
+        var failureCode: TranslationFailureCode? = null
+
         /**
          * 夜讀項正在跑的時候又被要求補頁（[enqueueNight] 的 TRANSLATING 分支、[cancelTranslation]）：這一輪照常做完，
          * 做完不離開佇列、改回 QUEUE 再跑一輪（resume 只補被作廢的頁）。不中斷這一輪：中斷的話在飛的頁丟回待做、下一輪
@@ -528,6 +532,7 @@ class TranslationManager(private val context: Context) {
                     it.effectiveMethod,
                     it.kind,
                     it.paused,
+                    if (it.status == TranslationItem.Status.ERROR) it.failureCode else null,
                 )
             }
         }
@@ -598,6 +603,7 @@ class TranslationManager(private val context: Context) {
                     nightRender = it.nightRender,
                     paused = it.paused,
                     nightForce = it.nightForce,
+                    failureCode = it.failureCode,
                 )
             }
         }
@@ -640,7 +646,7 @@ class TranslationManager(private val context: Context) {
                                     nightRender = r.nightRender,
                                     paused = r.paused,
                                     nightForce = r.nightForce,
-                                )
+                                ).also { it.failureCode = if (r.errored) r.failureCode else null }
                                 if ((entry.chapter.id to entry.kind) !in present) entries.add(entry)
                             }
                             // 還原「整本暫停」：每項各自記它那組 (漫畫, pool)（向後相容：舊資料無此欄→不暫停）。
@@ -720,6 +726,7 @@ class TranslationManager(private val context: Context) {
                             entries.remove(existing)
                             existing.method = m // 插隊＝使用者剛要讀，刷新成當下去字法
                             existing.status = TranslationItem.Status.QUEUE // ERROR 重排也算重試
+                            existing.failureCode = null
                             existing.paused = false // 明確要讀這章 → 解除單章暫停（與解除 pool 暫停同理）
                             batch.add(existing)
                         }
@@ -833,6 +840,7 @@ class TranslationManager(private val context: Context) {
                 TranslationItem.Status.ERROR -> {
                     // 重試。單章暫停只有明確要求才解除（上面已處理）；自動路徑留著，免得把使用者停住的章偷偷跑起來
                     entry.status = TranslationItem.Status.QUEUE
+                    entry.failureCode = null
                     if (force) entry.nightForce = NIGHT_FORCE_PENDING
                     changed = true
                 }
@@ -1291,6 +1299,7 @@ class TranslationManager(private val context: Context) {
             entries.filter { it.poolKey == key && it.status == TranslationItem.Status.ERROR }
                 .forEach {
                     it.status = TranslationItem.Status.QUEUE
+                    it.failureCode = null
                     it.paused = false // 明確重試 → 連單章暫停一起解除
                 }
         }
@@ -1329,6 +1338,7 @@ class TranslationManager(private val context: Context) {
             entries.filter { it.chapter.id in ids && it.status == TranslationItem.Status.ERROR }
                 .onEach {
                     it.status = TranslationItem.Status.QUEUE
+                    it.failureCode = null
                     it.paused = false // 明確重試 → 連單章暫停一起解除
                 }
                 .mapTo(HashSet()) { it.nightRender }
@@ -1540,6 +1550,7 @@ class TranslationManager(private val context: Context) {
                     if (isPoolPaused(night)) return@synchronized null
                     pickNextQueuedLocked(night)?.also {
                         it.status = TranslationItem.Status.TRANSLATING
+                        it.failureCode = null
                         it.done = 0
                         it.total = 0
                         it.nightRerun = false
@@ -1558,6 +1569,7 @@ class TranslationManager(private val context: Context) {
                     TraceLog.log("queue", "chapter fail m=${entry.manga.id} c=${entry.chapter.id} ${e.message}")
                     synchronized(lock) {
                         entry.status = TranslationItem.Status.ERROR // 失敗 → 留佇列可重試
+                        entry.failureCode = entry.failureCode ?: TranslationFailureCode.UNKNOWN
                         entry.nightRerun = false // 例外（缺模型等）再跑一輪也一樣，等使用者重試
                     }
                     nightStorage.chapterChanged(entry.manga, entry.chapter) // 做到一半的頁也可能動了夜讀檔
@@ -1576,7 +1588,10 @@ class TranslationManager(private val context: Context) {
                     when {
                         // 被暫停/取消/清空/改法/總開關關打斷：還在佇列(暫停/改法/開關關)→回 QUEUE 等續傳；已被移除(取消/清空)→不動。
                         isStop(night) -> {
-                            if (entries.contains(entry)) entry.status = TranslationItem.Status.QUEUE
+                            if (entries.contains(entry)) {
+                                entry.status = TranslationItem.Status.QUEUE
+                                entry.failureCode = null
+                            }
                             true
                         }
                         // 這一輪跑的時候有頁被作廢（見 [Entry.nightRerun]）→ 不離開佇列、回 QUEUE 再跑一輪補那些頁。成功的話
@@ -1584,6 +1599,7 @@ class TranslationManager(private val context: Context) {
                         // 被覆寫、這輪 0 頁），不標 ERROR。
                         rerun && entries.contains(entry) -> {
                             entry.status = TranslationItem.Status.QUEUE
+                            entry.failureCode = null
                             false
                         }
                         ok -> {
@@ -1595,6 +1611,7 @@ class TranslationManager(private val context: Context) {
                         else -> {
                             // 沒下載 / 沒做成（部分失敗）→ 標 ERROR 留佇列可重試，不誤標「已翻」
                             entry.status = TranslationItem.Status.ERROR
+                            entry.failureCode = entry.failureCode ?: TranslationFailureCode.UNKNOWN
                             false
                         }
                     }
@@ -1667,7 +1684,10 @@ class TranslationManager(private val context: Context) {
      * 夜讀項的 [onProgress] 會從多條夜讀 worker 呼叫（多頁並行）：它只在 [lock] 內寫進度再 [publish]，本來就可重入。
      */
     private suspend fun translateOne(entry: Entry): Boolean {
-        val dir = chapterDir(entry.manga, entry.chapter) ?: return false // 沒下載 → 不算做成
+        val dir = chapterDir(entry.manga, entry.chapter) ?: run {
+            synchronized(lock) { entry.failureCode = TranslationFailureCode.NOT_DOWNLOADED }
+            return false // 沒下載 → 不算做成
+        }
         val onProgress: (Int, Int) -> Unit = { done, total ->
             synchronized(lock) {
                 entry.done = done
@@ -1704,9 +1724,10 @@ class TranslationManager(private val context: Context) {
             }
         } else if (dir.isDirectory) {
             // entry.method＝排入當下擷取（可在排隊時經 setItemMethod 改）；傳給引擎用、不再讀全域 pref。
-            pageTranslator.translateChapter(dir, entry.method, onProgress, shouldStop) { name ->
+            val result = pageTranslator.translateChapterDetailed(dir, entry.method, onProgress, shouldStop) { name ->
                 _donePageEvents.tryEmit(entry.chapter.id to name) // 每翻好一頁就推給即時翻 loader 即時重畫該頁
             }
+            synchronized(lock) { entry.failureCode = result.failureCode }
             pageTranslator.isChapterTranslated(dir)
         } else {
             // CBZ 翻譯：保留舊 translateArchiveInPlace 的雙條件——
@@ -1714,15 +1735,19 @@ class TranslationManager(private val context: Context) {
             //   成功＝manifest 全覆蓋（部分成功仍回 false → drain 標 ERROR 留佇列、下次補剩頁）。
             processArchiveInPlace(dir, onProgress, shouldStop) { tmpU ->
                 // Night-only materials are not needed; original and re-render materials are retained in the ZIP.
-                val n = pageTranslator.translateChapter(
+                val result = pageTranslator.translateChapterDetailed(
                     tmpU,
                     entry.method,
                     onProgress,
                     shouldStop,
                     nightMaterials = false,
                 )
+                synchronized(lock) { entry.failureCode = result.failureCode }
                 val done = pageTranslator.isChapterTranslated(tmpU)
-                ProcessResult(swap = n > 0 || done || pageTranslator.hasPartialProgress(tmpU), success = done)
+                ProcessResult(
+                    swap = result.translatedPages > 0 || done || pageTranslator.hasPartialProgress(tmpU),
+                    success = done,
+                )
             }
         }
     }
@@ -2174,6 +2199,7 @@ class TranslationManager(private val context: Context) {
                     entry.paused = false // Keep the existing explicit-enqueue resume behavior.
                     if (entry.status == TranslationItem.Status.ERROR) {
                         entry.status = TranslationItem.Status.QUEUE
+                        entry.failureCode = null
                         entry.method = method
                         entry.done = 0
                         entry.total = 0

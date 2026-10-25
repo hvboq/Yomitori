@@ -31,6 +31,8 @@ data class TranslationItem(
      * 與「整本（pool）暫停」「pool 暫停」是三層獨立的 hold，任一層 hold 住就不跑。跨重啟保留。
      */
     val paused: Boolean = false,
+    /** Safe cause for an ERROR snapshot; no raw exception or server-reflected text. */
+    val failureCode: TranslationFailureCode? = null,
 ) {
     enum class Status {
         QUEUE, // 排隊中
