@@ -117,7 +117,9 @@ class TranslationEndpointProbeTest {
                         thinking = false,
                     ),
                 )
-                val translated = translator.translateDetailed(listOf("こんにちは。", "今日はいい天気ですね。"))
+                val translated = translator.use {
+                    it.translateDetailed(listOf("こんにちは。", "今日はいい天気ですね。"))
+                }
                 report.put("translationElapsedMs", elapsed(stageStarted))
                     .put("targetCount", translated.translations.size)
                 safeApiError(translated.error)?.let { report.put("lastError", it) }

@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -260,14 +261,19 @@ class TranslationManager(private val context: Context) {
     fun onDownloadedForTranslation(manga: Manga, chapter: Chapter): Boolean =
         pendingTranslationDispatch.onDownloaded(chapter.id) {
             val pending = isPendingTranslate(chapter.id)
-            if (pending || (isReady() && !isSourceExcluded(manga))) {
-                translate(
+            if (pending) {
+                // This intent predates the completed download. Retain it as a durable QUEUE entry
+                // even while the master switch is OFF; admission itself must not start work then.
+                enqueueTranslations(
                     manga,
                     listOf(chapter),
-                    atFront = pending,
-                    method = if (pending) liveInpaintMethod() else null,
+                    atFront = true,
+                    method = liveInpaintMethod(),
                 )
-                if (pending) clearPending(chapter.id)
+                clearPending(chapter.id)
+                true
+            } else if (isReady() && !isSourceExcluded(manga)) {
+                translate(manga, listOf(chapter))
                 true
             } else {
                 false
@@ -476,8 +482,8 @@ class TranslationManager(private val context: Context) {
 
     /**
      * 翻譯總開關（[TranslationPreferences.translationMasterEnabled]）是否開啟。
-     * 這是**硬總開關**：關閉時自動/手動翻一律不排入、佇列一律不 drain、引擎不建——把關責任集中在佇列這層
-     * （入口各 gate 之外的最後一道），避免「持久佇列還原/手動排入」繞過總開關。
+     * 這是**硬總開關**：關閉時不接受新的自動/手動翻譯要求、佇列不 drain、引擎不建。
+     * 已明確標記的下載完成可以保留為 QUEUE，與持久佇列還原一樣等待總開關再開。
      */
     private fun masterEnabled(): Boolean = translationPreferences.translationMasterEnabled.get()
 
@@ -707,6 +713,11 @@ class TranslationManager(private val context: Context) {
     fun translate(manga: Manga, chapters: List<Chapter>, atFront: Boolean = false, method: String? = null) {
         if (chapters.isEmpty()) return
         if (!masterEnabled()) return // 硬總開關：關閉時自動/手動翻一律不排入
+        enqueueTranslations(manga, chapters, atFront, method)
+    }
+
+    /** Admit an existing explicit download intent while OFF without starting a drain or worker. */
+    private fun enqueueTranslations(manga: Manga, chapters: List<Chapter>, atFront: Boolean, method: String?) {
         // method 非 null＝呼叫端指定去字法（即時翻/reader 情境傳 [liveInpaintMethod]，使用者可自訂、預設 AI 去字）；
         // null＝用設定的去字法（下載時翻、詳情頁手動翻——可慢可高品質）。
         val m = method ?: translationPreferences.inpaintMethod.get()
@@ -741,9 +752,11 @@ class TranslationManager(private val context: Context) {
         }
         publish()
         _isTranslatePaused.value = false // 明確要求翻譯 → 解除翻譯 pool 暫停、直接開跑（對照下載：排入即啟動）；夜讀 pool 不動
-        ensureDrain()
-        TranslationJob.start(context)
         persist()
+        if (masterEnabled()) {
+            ensureDrain()
+            TranslationJob.start(context)
+        }
     }
 
     /**
@@ -2182,6 +2195,18 @@ class TranslationManager(private val context: Context) {
 
     /** Archive completion requires verified metadata covering every page, including checkpoint recovery. */
     private fun archiveHasMarker(cbz: UniFile): Boolean = pageTranslator.isArchiveTranslated(cbz)
+
+    init {
+        scope.launch {
+            // Settings can invoke the ON callback before saving the preference. A completion may
+            // arrive after that callback scanned an empty queue but before the committed TRUE.
+            // Every emitted TRUE can matter: conflation may hide the intervening FALSE.
+            // Restoration resumes on its own after applying persisted pool/item pauses.
+            translationPreferences.translationMasterEnabled.changes().collect { enabled ->
+                if (enabled && masterEnabled() && restored) resumeForMasterOn()
+            }
+        }
+    }
 
     companion object {
         /** Caller holds the queue lock. Explicit enqueue retries failures without replacing active entries. */

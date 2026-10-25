@@ -4,30 +4,25 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.net.Uri
 import android.os.SystemClock
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.hippo.unifile.UniFile
-import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.download.DownloadProvider
 import eu.kanade.tachiyomi.data.translation.PageMaterials
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationBusy
 import eu.kanade.tachiyomi.data.translation.TranslationCache
-import eu.kanade.tachiyomi.data.translation.TranslationEngineService
-import eu.kanade.tachiyomi.data.translation.TranslationManager
 import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.ReaderActivity
 import eu.kanade.tachiyomi.ui.reader.loader.HttpPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.TranslatingPageLoader
-import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import li.joye.yakuyomi.engine.LlmProviders
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -37,20 +32,16 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.domain.chapter.model.Chapter
 import tachiyomi.domain.chapter.repository.ChapterRepository
-import tachiyomi.domain.download.service.DownloadPreferences
-import tachiyomi.domain.manga.interactor.GetFavorites
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.manga.model.MangaUpdate
 import tachiyomi.domain.manga.repository.MangaRepository
-import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.domain.storage.service.StorageManager
-import tachiyomi.domain.storage.service.StoragePreferences
-import tachiyomi.domain.translation.service.TranslationPreferences
+import tachiyomi.i18n.MR
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
@@ -59,52 +50,38 @@ import java.security.MessageDigest
 
 /**
  * Opt in with onlineReaderFlow=true. Exercises a synthetic HTTP manga source, NOT Hitomi.
- * Uses the configured real server unless both liveTranslationBase/liveTranslationModel are supplied.
- * Explicit overrides use an empty API key and are restored, including absent preferences, on exit.
+ * Uses the configured real server through isolated settings/queue/stats and the verified audit models.
+ * Source/model inputs are read only; API overrides are deliberately rejected by this protected flow.
  */
 @RunWith(AndroidJUnit4::class)
 class OnlineReaderFlowTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
-    @Test
+    @Test(timeout = 900_000)
     fun onlinePagesDownloadTranslateAndReopenInTheSameReader() = runBlocking<Unit> {
         val args = InstrumentationRegistry.getArguments()
-        assumeTrue(args.getString("onlineReaderFlow") == "true")
-        val overrideBase = args.getString("liveTranslationBase").orEmpty().trim()
-        val overrideModel = args.getString("liveTranslationModel").orEmpty().trim()
-        require(overrideBase.isBlank() == overrideModel.isBlank()) {
-            "Supply liveTranslationBase and liveTranslationModel together"
+        check(context.packageName == "app.yomitori.yakuyomi.audit") { "ISOLATED_AUDIT_REQUIRED" }
+        check(args.getString("onlineReaderFlow") == "true") { "ONLINE_READER_EXPLICIT_OPT_IN_REQUIRED" }
+        check(
+            args.getString("liveTranslationBase").isNullOrBlank() &&
+                args.getString("liveTranslationModel").isNullOrBlank(),
+        ) {
+            "PROTECTED_FLOW_USES_CONFIGURED_SERVER_ONLY"
         }
-        val downloads = Injekt.get<DownloadManager>()
-        val translations = Injekt.get<TranslationManager>()
-        // Never start, pause, or remove the user's existing queue as part of this test.
-        assertTrue("Requires an idle download queue", downloads.queueState.value.isEmpty() && !downloads.isRunning)
-        assertTrue("Requires an idle translation queue", translations.queueState.value.isEmpty())
-        assertEquals(0, TranslationBusy.active.value)
-        val prefs = Injekt.get<TranslationPreferences>()
-        val apiPreferences = listOf(
-            prefs.provider,
-            prefs.model,
-            prefs.apiBase,
-            prefs.apiKeyFor(prefs.provider.get()),
-            prefs.apiKeyFor("custom"),
-        ).distinctBy { it.key() }
-        val apiBefore = apiPreferences.map { it.isSet() to it.get() }
-        val sources = Injekt.get<SourceManager>()
-        withTimeout(20000) { sources.isInitialized.first { it } }
-        Injekt.get<GetFavorites>().await()
-        val output = File(context.getExternalFilesDir(null), "online-reader-flow-${System.currentTimeMillis()}")
-            .apply { check(mkdirs()) }
+        val scope = OnlineReaderFlowScope(context)
         val stages = JSONArray()
-        val report = JSONObject().put("source", "synthetic HTTP fixture; not Hitomi")
+        val report = JSONObject().put("source", "complete two-page synthetic HTTP chapter; not Hitomi")
             .put("translation", "configured real server and native OCR")
-            .put("stages", stages).put("success", false)
+            .put("sessionUuid", scope.uuid.toString()).put("stages", stages).put("success", false)
         val started = SystemClock.elapsedRealtime()
+        var currentStage = "private_guard"
+        var failure: Throwable? = null
         fun saveReport() {
             report.put("elapsedMs", SystemClock.elapsedRealtime() - started)
-            File(output, "result.json").writeText(report.toString(2))
+            scope.saveReport(report)
         }
         fun stage(name: String, block: () -> Unit) {
+            currentStage = name
             val step = JSONObject().put("name", name).put("success", false)
             stages.put(step)
             val start = SystemClock.elapsedRealtime()
@@ -118,29 +95,25 @@ class OnlineReaderFlowTest {
         }
         val originals = listOf(sample(1), sample(2))
         try {
-            OnlineReaderSettings(context).use { settings ->
+            scope.prepare()
+            val downloads = scope.downloads
+            val translations = scope.translations
+            val prefs = scope.preferences
+            val sources = scope.sources
+            val output = scope.output
+            val settings = scope
+            run {
                 configure(settings)
-                if (overrideBase.isNotBlank()) {
-                    settings.set(prefs.apiKeyFor("custom"), "")
-                    settings.set(prefs.apiBase, overrideBase)
-                    settings.set(prefs.model, overrideModel)
-                    settings.set(prefs.provider, "custom")
-                }
                 val provider = LlmProviders.byId(prefs.provider.get())
                 val endpoint = LlmProviders.chatUrlOf(provider, prefs.apiBase.get()).toHttpUrlOrNull()
-                report.put("temporaryApiOverride", overrideBase.isNotBlank())
-                    .put("model", prefs.model.get().ifBlank { provider.defaultModel })
-                    .put(
-                        "base",
-                        endpoint?.newBuilder()?.username("")?.password("")?.query(null)?.fragment(null)
-                            ?.build()?.toString().orEmpty(),
-                    )
+                report.put("temporaryApiOverride", false)
+                    .put("modelSha256", digest(prefs.model.get().ifBlank { provider.defaultModel }.toByteArray()))
+                    .put("endpointSha256", digest(checkNotNull(endpoint).toString().toByteArray()))
                 assertTrue(
                     "Configure the real server and install native models first",
-                    Injekt.get<TranslationEngineService>().isReady(),
+                    scope.engine.isReady(),
                 )
-                val root = File(context.filesDir, "online-reader-${System.nanoTime()}").apply { check(mkdirs()) }
-                settings.set(Injekt.get<StoragePreferences>().baseStorageDirectory, Uri.fromFile(root).toString())
+                val root = scope.storageRoot
                 stage("isolated_empty_storage") {
                     val expected = File(root, "downloads").canonicalFile
                     waitFor(10000) {
@@ -151,20 +124,22 @@ class OnlineReaderFlowTest {
                     // StorageManager creates its own .nomedia sentinel when switching roots.
                     assertTrue(expected.listFiles().orEmpty().all { it.isFile && it.name == ".nomedia" })
                 }
-                OnlineReaderFixtureServer(originals).use { server ->
-                    OnlineReaderSourceRegistration(sources, server.source).use {
+                run {
+                    val server = scope.openServer(originals)
+                    run {
                         val mangaRepository = Injekt.get<MangaRepository>()
                         val chapterRepository = Injekt.get<ChapterRepository>()
                         val manga = mangaRepository.insertNetworkManga(
                             listOf(
                                 Manga.create().copy(
                                     source = server.source.id,
-                                    url = "/fixture/${System.nanoTime()}",
-                                    title = "Online reader synthetic ${System.nanoTime()}",
+                                    url = "/fixture/${scope.uuid}",
+                                    title = "Online reader synthetic ${scope.uuid}",
                                     initialized = true,
                                 ),
                             ),
                         ).single()
+                        scope.recordManga(manga)
                         val chapter = chapterRepository.addAll(
                             listOf(
                                 Chapter.create().copy(
@@ -175,6 +150,7 @@ class OnlineReaderFlowTest {
                                 ),
                             ),
                         ).single()
+                        scope.recordOwned(manga, chapter)
                         val cache = Injekt.get<TranslationCache>()
                         val provider = Injekt.get<DownloadProvider>()
                         val translator = PageTranslator(context)
@@ -186,12 +162,22 @@ class OnlineReaderFlowTest {
                             server.source,
                         )
                         fun checkBackgroundFailure() {
-                            check(server.failure == null) { "Fixture HTTP server failed" }
-                            check(
-                                translations.queueState.value.none {
-                                    it.chapter.id == chapter.id && it.status == TranslationItem.Status.ERROR
-                                },
-                            ) { "Real translation queue reported an error; inspect application diagnostics" }
+                            server.failure?.let {
+                                report.put("fixtureServerFailure", onlineReaderFlowFailure(it))
+                                error("FIXTURE_HTTP_SERVER_FAILED")
+                            }
+                            translations.queueState.value.firstOrNull {
+                                it.chapter.id == chapter.id && it.status == TranslationItem.Status.ERROR
+                            }?.let {
+                                report.put(
+                                    "ownedQueueFailure",
+                                    JSONObject().put("status", it.status.name)
+                                        .put("failureCode", it.failureCode?.wireValue ?: "absent")
+                                        .put("done", it.done).put("total", it.total)
+                                        .put("kind", it.kind.name).put("paused", it.paused),
+                                )
+                                error("OWNED_TRANSLATION_QUEUE_FAILED")
+                            }
                         }
                         try {
                             mangaRepository.update(
@@ -202,7 +188,7 @@ class OnlineReaderFlowTest {
                             val intent = ReaderActivity.newIntent(context, manga.id, chapter.id)
                             lateinit var downloadedDir: UniFile
                             var completedHashes = emptyMap<String, String>()
-                            ActivityScenario.launch<ReaderActivity>(intent).use { scenario ->
+                            scope.launchReader(intent).use { scenario ->
                                 lateinit var activity: ReaderActivity
                                 scenario.onActivity { activity = it }
                                 stage("http_reader_two_original_pages") {
@@ -230,8 +216,9 @@ class OnlineReaderFlowTest {
                                 }
                                 stage("real_downloader_queued_from_reader") {
                                     server.holdImages = true
+                                    clickChapterAction(scenario, activity, output)
+                                    report.put("realReaderMenuStartClicked", true)
                                     settings.set(prefs.liveTranslate, true)
-                                    scenario.onActivity { it.viewModel.startChapterTranslate() }
                                     waitFor(30000) {
                                         checkBackgroundFailure()
                                         server.heldImageRequest.count == 0L &&
@@ -301,7 +288,9 @@ class OnlineReaderFlowTest {
                                         )
                                         regions.forEach {
                                             regionsReport.put(
-                                                JSONObject().put("source", it.source).put("target", it.target),
+                                                JSONObject().put("sourceSha256", digest(it.source.toByteArray()))
+                                                    .put("targetSha256", digest(it.target.toByteArray()))
+                                                    .put("koreanTarget", Regex("[가-힣]").containsMatchIn(it.target)),
                                             )
                                         }
                                     }
@@ -331,7 +320,7 @@ class OnlineReaderFlowTest {
                             }
                             val requestsBeforeReopen = server.requests.size
                             stage("reopen_without_http_or_file_changes") {
-                                ActivityScenario.launch<ReaderActivity>(intent).use { scenario ->
+                                scope.launchReader(intent).use { scenario ->
                                     lateinit var reopened: ReaderActivity
                                     scenario.onActivity { reopened = it }
                                     waitFor(30000) {
@@ -355,35 +344,77 @@ class OnlineReaderFlowTest {
                                 .put("files", JSONObject(completedHashes))
                         } finally {
                             server.releaseDownload()
-                            translations.cancelPendingTranslation(chapter.id)
-                            downloads.getQueuedDownloadOrNull(chapter.id)?.let {
-                                downloads.cancelQueuedDownloads(listOf(it))
-                            }
-                            withTimeout(120000) { TranslationBusy.active.first { it == 0 } }
-                            waitFor(30000) { downloads.getQueuedDownloadOrNull(chapter.id) == null }
-                            chapterRepository.removeChaptersWithIds(listOf(chapter.id))
-                            cache.invalidate(manga.id)
+                            // Dependency/file/DB cleanup belongs to the outer scope, after all Activity callbacks settle.
                         }
                     }
-                    assertTrue("Test source must be unregistered", sources.get(server.source.id) == null)
+                    assertTrue(
+                        "Fixture source remains owned until callbacks settle",
+                        sources.get(server.source.id) === server.source,
+                    )
                 }
             }
-            assertTrue(
-                "API configuration must remain unchanged",
-                apiPreferences.map { it.isSet() to it.get() } == apiBefore,
-            )
-            report.put("settingsRestoredAndPersisted", true).put("apiConfigurationUnchanged", true).put("success", true)
+            report.put("functionalStagesPassed", true)
         } catch (error: Throwable) {
-            report.put("failureType", error.javaClass.simpleName)
-            runCatching { screenshot(output, "failure.png") }
-            throw error
+            // Structural exception frames only; no messages, endpoint values, API keys or response text.
+            report.put("failureType", error.javaClass.name).put("failureStage", currentStage)
+                .put("failureStructure", onlineReaderFlowFailure(error))
+            error.stackTrace.firstOrNull {
+                it.fileName in setOf("OnlineReaderFlowTest.kt", "OnlineReaderFlowScope.kt")
+            }?.let {
+                report.put(
+                    "failureFrame",
+                    JSONObject().put("class", it.className).put("method", it.methodName)
+                        .put("file", it.fileName).put("line", it.lineNumber),
+                )
+            }
+            failure = AssertionError("ONLINE_READER_FUNCTIONAL_FAILURE")
         } finally {
-            saveReport()
+            runCatching { saveReport() }.onFailure {
+                report.put("reportFailureType", it.javaClass.name)
+                failure = failure ?: AssertionError("ONLINE_READER_REPORT_FAILURE")
+            }
+            withContext(NonCancellable) {
+                try {
+                    report.put("cleanup", scope.close())
+                } catch (cleanup: Throwable) {
+                    report.put("cleanupFailureType", cleanup.javaClass.name)
+                        .put("cleanupFailureStructure", onlineReaderFlowFailure(cleanup))
+                    failure = failure ?: AssertionError("ONLINE_READER_CLEANUP_FAILURE")
+                }
+            }
         }
+        report.put("success", failure == null).put("elapsedMs", SystemClock.elapsedRealtime() - started)
+        emitOnlineReaderFlow("onlineReaderFlowEvidence", report)
+        failure?.let { throw it }
     }
 
-    private fun configure(settings: OnlineReaderSettings) {
-        val prefs = Injekt.get<TranslationPreferences>()
+    private fun clickChapterAction(
+        scenario: ActivityScenario<ReaderActivity>,
+        activity: ReaderActivity,
+        output: File,
+    ) {
+        lateinit var startLabel: String
+        lateinit var stopLabel: String
+        scenario.onActivity {
+            startLabel = it.stringResource(MR.strings.reader_translate_this_chapter)
+            stopLabel = it.stringResource(MR.strings.reader_stop_chapter_translate)
+            it.viewModel.openPageDialog(it.viewModel.state.value.viewerChapters!!.currChapter.pages!![1])
+        }
+        checkOnlineReaderAction(
+            packageName = context.packageName,
+            expectedLabel = startLabel,
+            forbiddenLabel = stopLabel,
+            click = true,
+            beforeClick = { screenshot(output, "chapter-start-action.png") },
+        )
+        waitFor(10000) { activity.viewModel.state.value.dialog == null }
+    }
+
+    private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
+        .joinToString("") { "%02x".format(it.toInt() and 255) }
+
+    private fun configure(settings: OnlineReaderFlowScope) {
+        val prefs = settings.preferences
         settings.set(prefs.translationMasterEnabled, true)
         settings.set(prefs.translationEnabled, false)
         settings.set(prefs.liveTranslate, false)
@@ -395,14 +426,14 @@ class OnlineReaderFlowTest {
         settings.set(prefs.orientation, "horizontal")
         settings.set(prefs.liveTranslateCategories, emptySet())
         settings.set(prefs.liveTranslateCategoriesExclude, emptySet())
-        val download = Injekt.get<DownloadPreferences>()
+        val download = settings.downloadPreferences
         settings.set(download.downloadOnlyOverWifi, false)
         settings.set(download.saveChaptersAsCBZ, false)
         settings.set(download.splitTallImages, false)
         settings.set(download.autoDownloadWhileReading, 0)
         settings.set(download.removeAfterReadSlots, -1)
         settings.set(download.removeAfterMarkedAsRead, false)
-        val reader = Injekt.get<ReaderPreferences>()
+        val reader = settings.readerPreferences
         settings.set(reader.fullscreen, false)
         settings.set(reader.landscapeZoom, false)
         settings.set(reader.showNavigationOverlayNewUser, false)
