@@ -30,6 +30,8 @@ class DownloadProvider(
     private val libraryPreferences: LibraryPreferences = Injekt.get(),
 ) {
 
+    private val chapterContent = DownloadedChapterContent(context)
+
     private val downloadsDir: UniFile?
         get() = storageManager.getDownloadsDirectory()
 
@@ -107,9 +109,41 @@ class DownloadProvider(
         source: Source,
     ): UniFile? {
         val mangaDir = findMangaDir(mangaTitle, source)
-        return getValidChapterDirNames(chapterName, chapterScanlator, chapterUrl).asSequence()
+        return findChapterCandidates(mangaDir, chapterName, chapterScanlator, chapterUrl).let { candidates ->
+            // Prefer a readable alias (e.g. CBZ beside an old metadata-only folder). Keep the
+            // fallback for original-only recovery and metadata operations when no body survives.
+            preferredChapterCandidate(candidates)
+        }
+    }
+
+    /** A fallback-free lookup for download state, queue exclusion, and actual reader pages. */
+    fun findReadableDownloadedChapterDir(
+        chapterName: String,
+        chapterScanlator: String?,
+        chapterUrl: String,
+        mangaTitle: String,
+        source: Source,
+    ): UniFile? {
+        return findChapterCandidates(findMangaDir(mangaTitle, source), chapterName, chapterScanlator, chapterUrl)
+            .firstOrNull(chapterContent::hasReadablePage)
+    }
+
+    private fun findChapterCandidates(
+        mangaDir: UniFile?,
+        chapterName: String,
+        chapterScanlator: String?,
+        chapterUrl: String,
+    ): List<UniFile> {
+        return getValidChapterDirNames(chapterName, chapterScanlator, chapterUrl)
             .mapNotNull { mangaDir?.findFile(it) }
-            .firstOrNull()
+            .distinctBy { it.uri }
+    }
+
+    private fun preferredChapterCandidate(candidates: List<UniFile>): UniFile? {
+        // A single existing path is already the generic metadata/recovery fallback. Only
+        // competing aliases need body inspection here; authoritative callers use the resolver above.
+        if (candidates.size <= 1) return candidates.firstOrNull()
+        return candidates.firstOrNull(chapterContent::hasReadablePage) ?: candidates.firstOrNull()
     }
 
     /**
@@ -122,9 +156,9 @@ class DownloadProvider(
     fun findChapterDirs(chapters: List<Chapter>, manga: Manga, source: Source): Pair<UniFile?, List<UniFile>> {
         val mangaDir = findMangaDir(manga.title, source) ?: return null to emptyList()
         return mangaDir to chapters.mapNotNull { chapter ->
-            getValidChapterDirNames(chapter.name, chapter.scanlator, chapter.url).asSequence()
-                .mapNotNull { mangaDir.findFile(it) }
-                .firstOrNull()
+            findChapterCandidates(mangaDir, chapter.name, chapter.scanlator, chapter.url).let { candidates ->
+                preferredChapterCandidate(candidates)
+            }
         }
     }
 
@@ -209,11 +243,12 @@ class DownloadProvider(
                 !libraryPreferences.disallowNonAsciiFilenames.get(),
             )
 
-        return buildList(2) {
+        return buildList(3) {
             // Chapter name without hash (unable to handle duplicate
             // chapter names)
             add(chapterNameV1)
             add(otherChapterDirName)
+            add("${otherChapterDirName}_dl")
         }
     }
 
@@ -247,6 +282,11 @@ class DownloadProvider(
             add(chapterDirName)
             // Archived chapters
             add("$chapterDirName.cbz")
+
+            // A fresh body can coexist with an older metadata-only canonical container.
+            // Neither downloading nor publishing may relocate that existing user container.
+            add("${chapterDirName}_dl")
+            add("${chapterDirName}_dl.cbz")
 
             // any legacy names
             legacyChapterDirNames.forEach {

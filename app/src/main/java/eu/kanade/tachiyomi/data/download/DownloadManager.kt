@@ -176,7 +176,13 @@ class DownloadManager(
      * @return the list of pages from the chapter.
      */
     fun buildPageList(source: Source, manga: Manga, chapter: Chapter): List<Page> {
-        val chapterDir = provider.findChapterDir(chapter.name, chapter.scanlator, chapter.url, manga.title, source)
+        val chapterDir = provider.findReadableDownloadedChapterDir(
+            chapter.name,
+            chapter.scanlator,
+            chapter.url,
+            manga.title,
+            source,
+        )
         val files = chapterDir?.listFiles().orEmpty()
             .filter { it.isFile && ImageUtil.isImage(it.name) { it.openInputStream() } }
 
@@ -398,10 +404,13 @@ class DownloadManager(
             return
         }
 
-        // Assume there's only 1 version of the chapter name formats present
-        val oldDownload = oldNames.asSequence()
-            .mapNotNull { mangaDir.findFile(it) }
-            .firstOrNull() ?: return
+        val oldDownload = provider.findChapterDir(
+            oldChapter.name,
+            oldChapter.scanlator,
+            oldChapter.url,
+            manga.title,
+            source,
+        ) ?: return
 
         var newName = provider.getChapterDirName(newChapter.name, newChapter.scanlator, newChapter.url)
         if (oldDownload.isFile && oldDownload.extension == "cbz") {

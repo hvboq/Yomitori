@@ -94,7 +94,9 @@ class DownloadCache(
         .stateIn(scope, SharingStarted.WhileSubscribed(), false)
 
     private val diskCacheFile: File
-        get() = File(context.cacheDir, "dl_index_cache_v3")
+        get() = File(context.cacheDir, "dl_index_cache_v4")
+
+    private val chapterContent = DownloadedChapterContent(context)
 
     private val rootDownloadsDirMutex = Mutex()
     private var rootDownloadsDir = RootDirectory(storageManager.getDownloadsDirectory())
@@ -108,8 +110,13 @@ class DownloadCache(
                         val diskCache = diskCacheFile.inputStream().use {
                             ProtoBuf.decodeFromByteArray<RootDirectory>(it.readBytes())
                         }
-                        rootDownloadsDir = diskCache
-                        lastRenew = System.currentTimeMillis()
+                        // Old content-blind indexes and indexes from another storage root must
+                        // never establish DOWNLOADED. Even a current index is only a list of
+                        // candidates: body files can have disappeared while the app was closed.
+                        restoreDiskCache(diskCache)?.let {
+                            rootDownloadsDir = it
+                            lastRenew = System.currentTimeMillis()
+                        }
                     }
                 } catch (e: Throwable) {
                     logcat(LogPriority.ERROR, e) { "Failed to initialize from disk cache" }
@@ -143,10 +150,17 @@ class DownloadCache(
     ): Boolean {
         if (skipCache) {
             val source = sourceManager.getOrStub(sourceId)
-            return provider.findChapterDir(chapterName, chapterScanlator, chapterUrl, mangaTitle, source) != null
+            return provider.findReadableDownloadedChapterDir(
+                chapterName,
+                chapterScanlator,
+                chapterUrl,
+                mangaTitle,
+                source,
+            ) != null
         }
 
         renewCache()
+        if (!isCurrentStorageRoot()) return false
 
         val sourceDir = rootDownloadsDir.sourceDirs[sourceId]
         if (sourceDir != null) {
@@ -167,6 +181,7 @@ class DownloadCache(
      */
     fun getTotalDownloadCount(): Int {
         renewCache()
+        if (!isCurrentStorageRoot()) return 0
 
         return rootDownloadsDir.sourceDirs.values.sumOf { sourceDir ->
             sourceDir.mangaDirs.values.sumOf { mangaDir ->
@@ -182,6 +197,7 @@ class DownloadCache(
      */
     fun getDownloadCount(manga: Manga): Int {
         renewCache()
+        if (!isCurrentStorageRoot()) return 0
 
         val sourceDir = rootDownloadsDir.sourceDirs[manga.source]
         if (sourceDir != null) {
@@ -200,12 +216,32 @@ class DownloadCache(
      * @param mangaUniFile the directory of the manga.
      * @param manga the manga of the chapter.
      */
-    suspend fun addChapter(chapterDirName: String, mangaUniFile: UniFile, manga: Manga) {
+    suspend fun addChapter(
+        chapterDirName: String,
+        mangaUniFile: UniFile,
+        manga: Manga,
+        publishedChapter: UniFile? = null,
+    ) {
         rootDownloadsDirMutex.withLock {
+            val source = sourceManager.get(manga.source) ?: return
+            // Use a handle read back from the actual publication, not a successful-rename assumption.
+            val chapter = publishedChapter ?: sequenceOf(chapterDirName, "$chapterDirName.cbz")
+                .mapNotNull { mangaUniFile.findFile(it) }
+                .firstOrNull(chapterContent::hasReadablePage)
+                ?: return
+            val actualName = chapter.name ?: return
+            if (mangaUniFile.findFile(actualName)?.uri != chapter.uri || !chapterContent.hasReadablePage(chapter)) {
+                return
+            }
+            if (provider.findMangaDir(manga.title, source)?.uri != mangaUniFile.uri) return
+            if (!isCurrentStorageRoot()) {
+                rootDownloadsDir = RootDirectory(storageManager.getDownloadsDirectory())
+                lastRenew = 0L
+            }
+
             // Retrieve the cached source directory or cache a new one
             var sourceDir = rootDownloadsDir.sourceDirs[manga.source]
             if (sourceDir == null) {
-                val source = sourceManager.get(manga.source) ?: return
                 val sourceUniFile = provider.findSourceDir(source) ?: return
                 sourceDir = SourceDirectory(sourceUniFile)
                 rootDownloadsDir.sourceDirs += manga.source to sourceDir
@@ -220,7 +256,7 @@ class DownloadCache(
             }
 
             // Save the chapter directory
-            mangaDir.chapterDirs += chapterDirName
+            mangaDir.chapterDirs += chapter.cacheChapterName()
         }
 
         notifyChanges()
@@ -340,7 +376,9 @@ class DownloadCache(
      */
     private fun renewCache() {
         // Avoid renewing cache if in the process nor too often
-        if (lastRenew + renewInterval >= System.currentTimeMillis() || renewalJob?.isActive == true) {
+        if ((isCurrentStorageRoot() && lastRenew + renewInterval >= System.currentTimeMillis()) ||
+            renewalJob?.isActive == true
+        ) {
             return
         }
 
@@ -361,7 +399,10 @@ class DownloadCache(
             val sourceMap = sources.associate { provider.getSourceDirName(it).lowercase() to it.id }
 
             rootDownloadsDirMutex.withLock {
-                val updatedRootDir = RootDirectory(storageManager.getDownloadsDirectory())
+                val updatedRootDir = RootDirectory(
+                    storageManager.getDownloadsDirectory(),
+                    bodyValidationVersion = BODY_VALIDATION_VERSION,
+                )
 
                 updatedRootDir.sourceDirs = updatedRootDir.dir?.listFiles().orEmpty()
                     .filter { it.isDirectory && !it.name.isNullOrBlank() }
@@ -384,9 +425,10 @@ class DownloadCache(
                                         // Ignore incomplete downloads
                                         it.name?.endsWith(Downloader.TMP_DIR_SUFFIX) == true -> null
                                         // Folder of images
-                                        it.isDirectory -> it.name
+                                        it.isDirectory && chapterContent.hasReadablePage(it) -> it.name
                                         // CBZ files
-                                        it.isFile && it.extension == "cbz" -> it.nameWithoutExtension
+                                        it.isFile && it.extension == "cbz" && chapterContent.hasReadablePage(it) ->
+                                            it.nameWithoutExtension
                                         // Anything else is irrelevant
                                         else -> null
                                     }
@@ -408,7 +450,7 @@ class DownloadCache(
                 if (exception != null && exception !is CancellationException) {
                     logcat(LogPriority.ERROR, exception) { "DownloadCache: failed to create cache" }
                 }
-                lastRenew = System.currentTimeMillis()
+                lastRenew = if (exception == null) System.currentTimeMillis() else 0L
                 notifyChanges()
             }
         }
@@ -420,6 +462,43 @@ class DownloadCache(
     private fun getSources(): List<Source> {
         return sourceManager.getOnlineSources() + sourceManager.getStubSources()
     }
+
+    private fun isCurrentStorageRoot(): Boolean =
+        rootDownloadsDir.dir?.uri == storageManager.getDownloadsDirectory()?.uri
+
+    private fun restoreDiskCache(saved: RootDirectory): RootDirectory? {
+        val currentRoot = storageManager.getDownloadsDirectory()
+        if (saved.bodyValidationVersion != BODY_VALIDATION_VERSION || saved.dir?.uri != currentRoot?.uri) return null
+
+        val sourceDirs = mutableMapOf<Long, SourceDirectory>()
+        for ((sourceId, savedSource) in saved.sourceDirs) {
+            val sourceName = savedSource.dir?.name ?: continue
+            val sourceDir = currentRoot.findDirectChild(sourceName)?.takeIf { it.isDirectory } ?: continue
+            val mangaDirs = mutableMapOf<String, MangaDirectory>()
+            for ((mangaName, savedManga) in savedSource.mangaDirs) {
+                val mangaDir = sourceDir.findDirectChild(mangaName)?.takeIf { it.isDirectory } ?: continue
+                val chapterNames = savedManga.chapterDirs.mapNotNull { name ->
+                    sequenceOf(name, "$name.cbz")
+                        .mapNotNull { mangaDir.findDirectChild(it) }
+                        .firstOrNull(chapterContent::hasReadablePage)
+                        ?.cacheChapterName()
+                }.toMutableSet()
+                mangaDirs[mangaName] = MangaDirectory(mangaDir, chapterNames)
+            }
+            sourceDirs[sourceId] = SourceDirectory(sourceDir, mangaDirs)
+        }
+        return RootDirectory(currentRoot, sourceDirs, BODY_VALIDATION_VERSION)
+    }
+
+    private fun UniFile?.findDirectChild(name: String): UniFile? {
+        if (name.isBlank() || name in listOf(".", "..") || name.any { it == '/' || it == '\\' || it == '\u0000' }) {
+            return null
+        }
+        return this?.findFile(name)
+    }
+
+    private fun UniFile.cacheChapterName(): String =
+        if (isFile && extension == "cbz") nameWithoutExtension.orEmpty() else name.orEmpty()
 
     private fun notifyChanges() {
         scope.launchNonCancellable {
@@ -434,10 +513,12 @@ class DownloadCache(
         updateDiskCacheJob = scope.launchIO {
             delay(1.seconds)
             ensureActive()
-            val bytes = ProtoBuf.encodeToByteArray(rootDownloadsDir)
-            ensureActive()
             try {
+                val bytes = rootDownloadsDirMutex.withLock { ProtoBuf.encodeToByteArray(rootDownloadsDir) }
+                ensureActive()
                 diskCacheFile.writeBytes(bytes)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 logcat(
                     priority = LogPriority.ERROR,
@@ -446,6 +527,10 @@ class DownloadCache(
                 )
             }
         }
+    }
+
+    private companion object {
+        const val BODY_VALIDATION_VERSION = 1
     }
 }
 
@@ -457,6 +542,7 @@ private class RootDirectory(
     @Serializable(with = UniFileAsStringSerializer::class)
     val dir: UniFile?,
     var sourceDirs: Map<Long, SourceDirectory> = mapOf(),
+    val bodyValidationVersion: Int = 0,
 )
 
 /**

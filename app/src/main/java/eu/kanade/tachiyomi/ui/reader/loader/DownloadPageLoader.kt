@@ -43,7 +43,7 @@ internal class DownloadPageLoader(
 
     override suspend fun getPages(): List<ReaderPage> {
         val dbChapter = chapter.chapter
-        val chapterPath = downloadProvider.findChapterDir(
+        val chapterPath = downloadProvider.findReadableDownloadedChapterDir(
             dbChapter.name,
             dbChapter.scanlator,
             dbChapter.url,

@@ -64,7 +64,9 @@ import tachiyomi.i18n.MR
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
+import java.io.IOException
 import java.util.Locale
+import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -88,6 +90,8 @@ class Downloader(
      * Store for persisting downloads across restarts.
      */
     private val store = DownloadStore(context)
+    private val chapterContent = DownloadedChapterContent(context)
+    private val chapterPublisher = DownloadedChapterPublisher(context)
 
     /**
      * Queue where active downloads are kept.
@@ -310,7 +314,9 @@ class Downloader(
         val wasEmpty = queueState.value.isEmpty()
         val chaptersToQueue = chapters.asSequence()
             // Filter out those already downloaded.
-            .filter { provider.findChapterDir(it.name, it.scanlator, it.url, manga.title, source) == null }
+            .filter {
+                provider.findReadableDownloadedChapterDir(it.name, it.scanlator, it.url, manga.title, source) == null
+            }
             // Add chapters to queue from the start.
             .sortedByDescending { it.sourceOrder }
             // Filter out those already enqueued.
@@ -433,21 +439,44 @@ class Downloader(
                 download.source,
             )
 
-            // Only rename the directory if it's downloaded
+            // Never hide preserved originals behind a new readable alias, or replace a body
+            // which appeared while this download was in progress. A UI presence=false result
+            // alone is not authority to move or overwrite an existing container.
+            provider.getValidChapterDirNames(download.chapter.name, download.chapter.scanlator, download.chapter.url)
+                .mapNotNull { mangaDir.findFile(it) }
+                .distinctBy { it.uri }
+                .forEach(chapterContent::requireMetadataOnly)
+
+            // Only publish a fully downloaded staging container to an unoccupied destination.
             // Yakuyomi：閱讀器要「下載完產生夜讀版」的章一律存鬆散資料夾（夜讀檔要逐檔放在章節夾的 .yakuyomi 子夾）
-            if (downloadPreferences.saveChaptersAsCBZ.get() &&
+            val publishedChapter = if (downloadPreferences.saveChaptersAsCBZ.get() &&
                 !translationManager.isPendingNight(download.chapter.id)
             ) {
-                archiveChapter(mangaDir, chapterDirname, tmpDir)
+                val finalName = if (mangaDir.findFile("$chapterDirname.cbz") == null) {
+                    "$chapterDirname.cbz"
+                } else {
+                    "${chapterDirname}_dl.cbz"
+                }
+                archiveChapter(mangaDir, finalName, tmpDir)
             } else {
-                tmpDir.renameTo(chapterDirname)
+                val finalName = if (mangaDir.findFile(chapterDirname) == null) {
+                    chapterDirname
+                } else {
+                    "${chapterDirname}_dl"
+                }
+                chapterPublisher.publish(mangaDir, tmpDir, finalName)
             }
             // Yakuyomi：這章的檔案是新下載的原圖 → 本 session 記下的「翻成」「夜讀做完」作廢（刪掉後重下載、或在 app 外刪掉
             // 再下載的章，章節列才不會把新原圖亮成已翻／已有夜讀版）。要在進下載快取之前：快取一變章節列就重掃。
             translationManager.forgetChapterOutputs(listOf(download.chapter.id))
-            cache.addChapter(chapterDirname, mangaDir, download.manga)
+            cache.addChapter(
+                publishedChapter.name ?: throw IOException("Cannot identify the published chapter"),
+                mangaDir,
+                download.manga,
+                publishedChapter,
+            )
 
-            DiskUtil.createNoMediaFile(tmpDir, context)
+            if (publishedChapter.isDirectory) DiskUtil.createNoMediaFile(publishedChapter, context)
 
             download.status = Download.State.DOWNLOADED
 
@@ -649,7 +678,7 @@ class Downloader(
                 fileName.endsWith(".tmp") -> false
                 // Only count the first split page and not the others
                 fileName.contains("__") && !fileName.endsWith("__001.jpg") -> false
-                else -> true
+                else -> chapterContent.isReadableImageFile(it)
             }
         }
         return downloadedImagesCount == downloadPageCount
@@ -672,17 +701,24 @@ class Downloader(
      */
     private fun archiveChapter(
         mangaDir: UniFile,
-        dirname: String,
+        finalName: String,
         tmpDir: UniFile,
-    ) {
-        val zip = mangaDir.createFile("$dirname.cbz$TMP_DIR_SUFFIX")!!
+    ): UniFile {
+        // New random staging names avoid truncating an earlier or user-provided archive.
+        val stagedName = ".yomitori-download-${UUID.randomUUID()}$TMP_DIR_SUFFIX"
+        if (mangaDir.findFile(stagedName) != null) throw IOException("Archive staging name collision")
+        val zip = mangaDir.createFile(stagedName) ?: throw IOException("Cannot create the staged archive")
+        if (zip.name != stagedName || mangaDir.findFile(stagedName)?.uri != zip.uri) {
+            throw IOException("The archive provider changed the staging name")
+        }
         ZipWriter(context, zip).use { writer ->
-            tmpDir.listFiles()?.forEach { file ->
+            tmpDir.listFiles().orEmpty().filter { it.isFile && it.name?.endsWith(".tmp") != true }.forEach { file ->
                 writer.write(file)
             }
         }
-        zip.renameTo("$dirname.cbz")
+        val published = chapterPublisher.publish(mangaDir, zip, finalName)
         tmpDir.delete()
+        return published
     }
 
     /**
