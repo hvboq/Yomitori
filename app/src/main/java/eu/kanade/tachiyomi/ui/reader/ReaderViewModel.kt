@@ -32,6 +32,7 @@ import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
 import eu.kanade.tachiyomi.data.translation.TranslationManager
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
@@ -838,7 +839,7 @@ class ReaderViewModel @JvmOverloads constructor(
                     PageTranslator.SinglePageResult.NO_ORIGINAL -> Event.TranslatePageNoOriginal
                     PageTranslator.SinglePageResult.SOURCE_AMBIGUOUS -> Event.TranslatePageSourceAmbiguous
                     PageTranslator.SinglePageResult.TOO_LARGE -> Event.TranslatePageTooLarge
-                    else -> Event.TranslatePageResult(false)
+                    else -> Event.TranslatePageResult(false, progress.failureCode)
                 }
                 eventChannel.trySend(event)
             }
@@ -2331,7 +2332,8 @@ class ReaderViewModel @JvmOverloads constructor(
                         }
                         eventChannel.send(Event.TranslatePageSkipped)
                     }
-                    PageTranslator.SinglePageResult.NOT_TRANSLATED -> finish(false)
+                    PageTranslator.SinglePageResult.NOT_TRANSLATED ->
+                        finish(false, Event.TranslatePageResult(false, outcome.failureCode))
                     // 已翻過、沒有原圖素材（只存夜讀素材的頁）：什麼都沒動，說清楚為什麼不翻、別冒充「翻譯失敗」
                     PageTranslator.SinglePageResult.NO_ORIGINAL -> finish(false, Event.TranslatePageNoOriginal)
                     PageTranslator.SinglePageResult.SOURCE_AMBIGUOUS ->
@@ -2676,7 +2678,7 @@ class ReaderViewModel @JvmOverloads constructor(
         data object TranslatePageStarted : Event
 
         /** 翻譯當頁結果（true＝成功覆蓋並刷新／false＝失敗），給 UI 提示。 */
-        data class TranslatePageResult(val success: Boolean) : Event
+        data class TranslatePageResult(val success: Boolean, val failureCode: TranslationFailureCode? = null) : Event
 
         /** Saved successful regions remain visible while unread regions can be retried. */
         data object TranslatePagePartial : Event

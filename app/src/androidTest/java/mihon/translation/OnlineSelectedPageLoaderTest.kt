@@ -2,9 +2,12 @@ package eu.kanade.tachiyomi.ui.reader.loader
 
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.os.Bundle
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import eu.kanade.tachiyomi.data.translation.OriginalMaterial
 import eu.kanade.tachiyomi.data.translation.PageTranslator
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
@@ -22,6 +25,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -39,6 +44,129 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Real HTTP loader/cache and storage with injected processing; no inference, server or Activity. */
 @RunWith(AndroidJUnit4::class)
 class OnlineSelectedPageLoaderTest {
+    @Test
+    fun timeoutTerminalReplayKeepsCurrentTokenAndRetryClearsTheCause() = runBlocking {
+        val retryResults = listOf(PageTranslator.SinglePageResult.SKIPPED, PageTranslator.SinglePageResult.TRANSLATED)
+        for (retryResult in retryResults) {
+            OnlineSelectedPageFixture.run { fixture ->
+                val calls = CopyOnWriteArrayList<Int>()
+                val targetAttempts = AtomicInteger()
+                val retryEntered = CompletableDeferred<Unit>()
+                val releaseRetry = CompletableDeferred<Unit>()
+                val session = fixture.sessionDetailed(count = 2) { index, stored ->
+                    calls += index
+                    when {
+                        index == 1 -> PageTranslator.SinglePageOutcome(
+                            PageTranslator.SinglePageResult.SKIPPED,
+                            displayChanged = false,
+                        )
+                        targetAttempts.incrementAndGet() == 1 -> PageTranslator.SinglePageOutcome(
+                            PageTranslator.SinglePageResult.NOT_TRANSLATED,
+                            displayChanged = false,
+                            failureCode = TranslationFailureCode.SERVER_TIMEOUT,
+                        )
+                        else -> {
+                            check(targetAttempts.get() == 2) { "Unexpected automatic processing after retry" }
+                            retryEntered.complete(Unit)
+                            releaseRetry.await()
+                            if (retryResult == PageTranslator.SinglePageResult.TRANSLATED) {
+                                fixture.complete(stored, index)
+                            }
+                            PageTranslator.SinglePageOutcome(
+                                retryResult,
+                                displayChanged = retryResult == PageTranslator.SinglePageResult.TRANSLATED,
+                            )
+                        }
+                    }
+                }
+                val loader = session.loader
+                val pages = session.pages
+                val load = launch(Dispatchers.IO) { loader.loadPage(pages[0]) }
+                try {
+                    pages.forEach { ready(it) }
+                    loader.select(pages[0], translate = true, explicitRetry = true, retryVersion = 1)
+                    val failed = finished(
+                        loader,
+                        0,
+                        PageTranslator.SinglePageResult.NOT_TRANSLATED,
+                        retryVersion = 1,
+                        expectedStage = OnlineTranslatedPageLoader.Stage.FAILED,
+                    )
+                    OnlineSelectedPageFixture.settled(loader)
+                    assertEquals(TranslationFailureCode.SERVER_TIMEOUT, failed.failureCode)
+                    val stored = checkNotNull(loader.resolvePage(pages[0]))
+                    val original = OnlineSelectedPageFixture.original(0)
+                    assertArrayEquals(original, File(checkNotNull(stored.pageFile.uri.path)).readBytes())
+                    assertFalse(
+                        PageTranslator(fixture.context).isPageTranslated(stored.chapterDir, stored.pageFile.name!!),
+                    )
+
+                    loader.select(pages[1], translate = true)
+                    val neighbor = finished(loader, 1, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 0)
+                    OnlineSelectedPageFixture.settled(loader)
+                    assertNull(neighbor.failureCode)
+                    loader.select(pages[0], translate = true, retryVersion = 2)
+                    val replay = finished(
+                        loader,
+                        0,
+                        PageTranslator.SinglePageResult.NOT_TRANSLATED,
+                        retryVersion = 2,
+                        expectedStage = OnlineTranslatedPageLoader.Stage.FAILED,
+                    )
+                    OnlineSelectedPageFixture.settled(loader)
+                    assertEquals(TranslationFailureCode.SERVER_TIMEOUT, replay.failureCode)
+                    assertTrue(replay.page === pages[0])
+                    assertTrue(replay.matchesSelection(pages[0], 2, loader, pages[0].chapter, pages[0].chapter))
+                    assertFalse(failed.matchesSelection(pages[0], 2, loader, pages[0].chapter, pages[0].chapter))
+                    assertEquals(listOf(0, 1), calls.toList())
+
+                    loader.select(pages[0], translate = true, explicitRetry = true, retryVersion = 3)
+                    withTimeout(5000) { retryEntered.await() }
+                    val active = checkNotNull(loader.progress.value)
+                    assertEquals(3L, active.retryVersion)
+                    assertEquals(OnlineTranslatedPageLoader.Stage.TRANSLATING, active.stage)
+                    assertNull("A new attempt must not display its prior timeout", active.failureCode)
+                    releaseRetry.complete(Unit)
+                    val retried = finished(loader, 0, retryResult, retryVersion = 3)
+                    OnlineSelectedPageFixture.settled(loader)
+                    assertNull(retried.failureCode)
+                    assertArrayEquals(
+                        original,
+                        File(checkNotNull(stored.chapterDir.uri.path), "source.bin").readBytes(),
+                    )
+                    assertEquals(
+                        retryResult == PageTranslator.SinglePageResult.TRANSLATED,
+                        PageTranslator(fixture.context).isPageTranslated(stored.chapterDir, stored.pageFile.name!!),
+                    )
+
+                    loader.select(pages[1], translate = true)
+                    finished(loader, 1, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 0)
+                    OnlineSelectedPageFixture.settled(loader)
+                    loader.select(pages[0], translate = true, retryVersion = 4)
+                    val completedReplay = finished(loader, 0, retryResult, retryVersion = 4)
+                    OnlineSelectedPageFixture.settled(loader)
+                    assertNull(completedReplay.failureCode)
+                    assertEquals(2, targetAttempts.get())
+                    assertEquals(listOf(0, 1, 0), calls.toList())
+                } finally {
+                    releaseRetry.complete(Unit)
+                    load.cancelAndJoin()
+                }
+            }
+        }
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            2,
+            Bundle().apply {
+                putString(
+                    "typedFailureCacheEvidence",
+                    JSONObject().put("passed", true).put("retryResults", JSONArray(retryResults.map { it.name }))
+                        .put("timeoutCachedReplay", true).put("currentTokenPreserved", true)
+                        .put("activeAndRetryCauseCleared", true).toString(),
+                )
+            },
+        )
+    }
+
     @Test
     fun cachedReplayUsesCurrentTokenAndOnlyExplicitRetryProcessesAgain() = runBlocking {
         OnlineSelectedPageFixture.run { fixture ->
@@ -602,6 +730,7 @@ class OnlineSelectedPageLoaderTest {
         pageIndex: Int,
         expectedResult: PageTranslator.SinglePageResult = PageTranslator.SinglePageResult.TRANSLATED,
         retryVersion: Long? = null,
+        expectedStage: OnlineTranslatedPageLoader.Stage = OnlineTranslatedPageLoader.Stage.FINISHED,
     ): OnlineTranslatedPageLoader.Progress {
         val state = withTimeout(10000) {
             loader.progress.first {
@@ -612,7 +741,7 @@ class OnlineSelectedPageLoaderTest {
                         )
             }
         }
-        assertEquals(OnlineTranslatedPageLoader.Stage.FINISHED, checkNotNull(state).stage)
+        assertEquals(expectedStage, checkNotNull(state).stage)
         assertEquals(expectedResult, state.result)
         return state
     }

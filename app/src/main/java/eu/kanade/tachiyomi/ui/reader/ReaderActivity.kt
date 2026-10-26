@@ -73,6 +73,7 @@ import eu.kanade.tachiyomi.data.coil.TachiyomiImageDecoder
 import eu.kanade.tachiyomi.data.nightread.NightAvailability
 import eu.kanade.tachiyomi.data.notification.NotificationReceiver
 import eu.kanade.tachiyomi.data.notification.Notifications
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.databinding.ReaderActivityBinding
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
@@ -96,6 +97,7 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderSettingsViewModel
 import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
 import eu.kanade.tachiyomi.ui.reader.viewer.pager.PagerViewer
+import eu.kanade.tachiyomi.ui.translation.translationFailureMessage
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.util.system.isNightMode
 import eu.kanade.tachiyomi.util.system.isTabletUiMode
@@ -314,7 +316,8 @@ class ReaderActivity : BaseActivity() {
                         val res = if (event.success) {
                             MR.strings.reader_translate_page_done
                         } else {
-                            MR.strings.reader_translate_page_failed
+                            event.failureCode?.takeUnless { it == TranslationFailureCode.UNKNOWN }
+                                ?.let(::translationFailureMessage) ?: MR.strings.reader_translate_page_failed
                         }
                         toast(stringResource(res))
                     }

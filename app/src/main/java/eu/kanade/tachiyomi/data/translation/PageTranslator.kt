@@ -1153,11 +1153,15 @@ class PageTranslator(private val context: Context) {
             AttemptKind.TOO_LARGE -> SinglePageResult.TOO_LARGE
             else -> SinglePageResult.NOT_TRANSLATED
         }
-        return SinglePageOutcome(result, attempt.displayChanged)
+        return SinglePageOutcome(result, attempt.displayChanged, attempt.failureCode)
     }
 
     /** A completed call's outcome; displayChanged does not grant translated-completion authority. */
-    data class SinglePageOutcome(val result: SinglePageResult, val displayChanged: Boolean)
+    data class SinglePageOutcome(
+        val result: SinglePageResult,
+        val displayChanged: Boolean,
+        val failureCode: TranslationFailureCode? = null,
+    )
 
     /** [translateSinglePage] 的結果。 */
     enum class SinglePageResult {

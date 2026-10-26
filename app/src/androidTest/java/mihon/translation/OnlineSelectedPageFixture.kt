@@ -73,6 +73,18 @@ internal class OnlineSelectedPageFixture private constructor(val root: File, tar
         limits: OnlinePageCache.Limits = loaderLimits(),
         beforeImageResponse: ((Int) -> Unit)? = null,
         translate: suspend (Int, OnlineTranslatedPageLoader.StoredPage) -> PageTranslator.SinglePageResult,
+    ): Session = sessionDetailed(count, limits, beforeImageResponse) { index, stored ->
+        val before = stored.pageFile.openInputStream().use { it.readBytes() }
+        val result = translate(index, stored)
+        val after = stored.pageFile.openInputStream().use { it.readBytes() }
+        PageTranslator.SinglePageOutcome(result, displayChanged = !before.contentEquals(after))
+    }
+
+    suspend fun sessionDetailed(
+        count: Int = 12,
+        limits: OnlinePageCache.Limits = loaderLimits(),
+        beforeImageResponse: ((Int) -> Unit)? = null,
+        translate: suspend (Int, OnlineTranslatedPageLoader.StoredPage) -> PageTranslator.SinglePageOutcome,
     ): Session {
         val requested = CopyOnWriteArrayList<Int>()
         val nonce = UUID.randomUUID().toString()

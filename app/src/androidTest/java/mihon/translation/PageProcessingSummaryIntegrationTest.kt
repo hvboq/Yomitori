@@ -5,6 +5,7 @@ import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.os.Bundle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.hippo.unifile.UniFile
@@ -18,22 +19,29 @@ import eu.kanade.tachiyomi.data.translation.PageProcessingSummaryCodec
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.PartialPageStore
 import eu.kanade.tachiyomi.data.translation.StoredTranslationContext
+import eu.kanade.tachiyomi.data.translation.TranslationBusy
 import eu.kanade.tachiyomi.data.translation.TranslationEngineConfig
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import li.joye.yakuyomi.engine.FailureKind
 import li.joye.yakuyomi.engine.OcrLineProgress
 import li.joye.yakuyomi.engine.PageAnalysis
 import li.joye.yakuyomi.engine.PageProgress
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.PageStats
+import li.joye.yakuyomi.engine.ProcessingFailure
+import li.joye.yakuyomi.engine.ProcessingStage
 import li.joye.yakuyomi.engine.Pt
 import li.joye.yakuyomi.engine.RegionProgress
 import li.joye.yakuyomi.engine.RegionState
 import li.joye.yakuyomi.engine.TranslationContext
 import li.joye.yakuyomi.engine.TranslationEngine
 import li.joye.yakuyomi.engine.TranslatorConfig
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -55,6 +63,54 @@ import java.util.UUID
 @RunWith(AndroidJUnit4::class)
 class PageProcessingSummaryIntegrationTest {
     @Test(timeout = 30_000)
+    fun manualTypedTimeoutAndUntypedFailurePreserveSourceWithoutDuplicateInference(): Unit = runBlocking {
+        val cases = listOf(
+            ProcessingFailure(ProcessingStage.TRANSLATE, FailureKind.TIMEOUT) to TranslationFailureCode.SERVER_TIMEOUT,
+            null to TranslationFailureCode.UNKNOWN,
+        )
+        val observedCodes = mutableListOf<String>()
+        val observedCalls = mutableListOf<Int>()
+        for ((failure, expectedCode) in cases) {
+            withFixture(ScriptedEngine(Kind.FAILED, null, failure = failure)) { fixture ->
+                val originalBefore = fixture.original.takeIf { it.isFile }?.readBytes()
+                val outcome = fixture.translateDetailed()
+                assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, outcome.result)
+                assertEquals(expectedCode, outcome.failureCode)
+                assertFalse(outcome.displayChanged)
+                assertArrayEquals(fixture.initialBytes, fixture.page.readBytes())
+                if (originalBefore == null) {
+                    assertFalse("A failure must not create a new original authority", fixture.original.exists())
+                } else {
+                    assertArrayEquals(originalBefore, fixture.original.readBytes())
+                }
+                assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+                assertFalse(fixture.translator.isChapterTranslated(fixture.chapter))
+                assertTrue(fixture.completionUnion().isEmpty())
+                assertNull(fixture.store.load(PAGE))
+                assertNull(fixture.readWithoutMutation())
+                assertEquals("Detailed must invoke inference exactly once", 1, fixture.engine.freshCalls)
+                assertEquals(0, fixture.engine.resumeCalls)
+                assertEquals(0, TranslationBusy.active.value)
+                fixture.engine.assertReturnedBitmapsRecycled()
+                observedCodes += checkNotNull(outcome.failureCode).wireValue
+                observedCalls += fixture.engine.freshCalls
+            }
+        }
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            2,
+            Bundle().apply {
+                putString(
+                    "typedSinglePageFailureEvidence",
+                    JSONObject().put("passed", true).put("attempts", 2)
+                        .put("inferenceCallsPerAttempt", JSONArray(observedCalls))
+                        .put("failureCodes", JSONArray(observedCodes))
+                        .put("sourcePreserved", true).put("completionAdded", false).toString(),
+                )
+            },
+        )
+    }
+
+    @Test(timeout = 30_000)
     fun manualSkippedResultDistinguishesNoTextAndKeptSourceWithoutInventingCompletion(): Unit = runBlocking {
         val cases = listOf(
             PageProgress(SIZE, SIZE, emptyList(), noTextDetected = true) to PageProcessingReason.NO_TEXT,
@@ -67,6 +123,7 @@ class PageProcessingSummaryIntegrationTest {
                 // Its result must remain distinct from translated completion and actual failure.
                 val outcome = fixture.translateDetailed()
                 assertEquals("SKIPPED", outcome.result.name)
+                assertNull(outcome.failureCode)
                 assertFalse(
                     "Fresh unchanged classification must not invalidate the display or Night image",
                     outcome.displayChanged,
@@ -198,6 +255,7 @@ class PageProcessingSummaryIntegrationTest {
 
                 val restoredOutcome = fixture.translateDetailed()
                 assertEquals("SKIPPED", restoredOutcome.result.name)
+                assertNull(restoredOutcome.failureCode)
                 assertTrue(
                     "Restoring the preserved source must invalidate its former display and Night image",
                     restoredOutcome.displayChanged,
@@ -263,6 +321,7 @@ class PageProcessingSummaryIntegrationTest {
         withFixture(ScriptedEngine(Kind.PARTIAL, first, final)) { fixture ->
             val partialOutcome = fixture.translateDetailed()
             assertEquals(PageTranslator.SinglePageResult.PARTIAL, partialOutcome.result)
+            assertNull(partialOutcome.failureCode)
             assertTrue(partialOutcome.displayChanged)
             val pending = requireNotNull(fixture.store.load(PAGE))
             assertFalse(pending.complete)
@@ -273,6 +332,7 @@ class PageProcessingSummaryIntegrationTest {
             val partialSummary = fixture.summary.readBytes()
             val completedOutcome = fixture.translateDetailed()
             assertEquals(PageTranslator.SinglePageResult.TRANSLATED, completedOutcome.result)
+            assertNull(completedOutcome.failureCode)
             assertTrue(completedOutcome.displayChanged)
             val completed = requireNotNull(fixture.store.load(PAGE))
             assertTrue(completed.complete)
@@ -555,6 +615,7 @@ class PageProcessingSummaryIntegrationTest {
         private var firstKind: Kind,
         private var firstProgress: PageProgress?,
         private val finalProgress: PageProgress? = null,
+        private val failure: ProcessingFailure? = null,
     ) : TranslationEngine {
         override var translationContext = TranslationContext.fromTranslator(TranslatorConfig(toLangName = "Korean"))
             private set
@@ -605,7 +666,7 @@ class PageProcessingSummaryIntegrationTest {
                 Kind.SKIPPED -> PageResult.Skipped("No text detected", stats, analysis)
                 Kind.TRANSLATED -> PageResult.Translated(ownedImage(Color.GREEN), stats, analysis)
                 Kind.PARTIAL -> PageResult.Partial(ownedImage(Color.BLUE), stats, requireNotNull(analysis))
-                Kind.FAILED -> PageResult.Failed("Neutral scripted current-attempt failure")
+                Kind.FAILED -> PageResult.Failed("Neutral scripted current-attempt failure", failure)
             }
         }
 

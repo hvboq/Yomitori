@@ -4,6 +4,7 @@ import android.content.Context
 import com.hippo.unifile.UniFile
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationManager
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
@@ -42,7 +43,7 @@ internal class OnlineTranslatedPageLoader(
     private val manga: Manga,
     context: Context,
     cache: OnlinePageCache? = null,
-    translate: (suspend (StoredPage) -> PageTranslator.SinglePageResult)? = null,
+    translate: (suspend (StoredPage) -> PageTranslator.SinglePageOutcome)? = null,
 ) : PageLoader() {
     data class StoredPage(val chapterDir: UniFile, val pageFile: UniFile)
 
@@ -53,6 +54,7 @@ internal class OnlineTranslatedPageLoader(
         val stage: Stage,
         val result: PageTranslator.SinglePageResult? = null,
         val retryVersion: Long = 0L,
+        val failureCode: TranslationFailureCode? = null,
     ) {
         val pageIndex: Int get() = page.index
 
@@ -76,7 +78,11 @@ internal class OnlineTranslatedPageLoader(
         val retryVersion: Long,
     )
 
-    private data class TerminalResult(val stage: Stage, val result: PageTranslator.SinglePageResult? = null)
+    private data class TerminalResult(
+        val stage: Stage,
+        val result: PageTranslator.SinglePageResult? = null,
+        val failureCode: TranslationFailureCode? = null,
+    )
 
     private sealed interface Command {
         data class Select(val request: Request) : Command
@@ -93,8 +99,8 @@ internal class OnlineTranslatedPageLoader(
     // Failure to create the translation cache must not prevent the HTTP original from loading.
     private val cacheStore by lazy { cache ?: OnlinePageCache(context) }
     private val translationManager: TranslationManager = Injekt.get()
-    private val translatePage: suspend (StoredPage) -> PageTranslator.SinglePageResult = translate ?: { stored ->
-        translator.translateSinglePage(
+    private val translatePage: suspend (StoredPage) -> PageTranslator.SinglePageOutcome = translate ?: { stored ->
+        translator.translateSinglePageDetailed(
             stored.chapterDir,
             checkNotNull(stored.pageFile.name),
             translationManager.liveInpaintMethod(),
@@ -384,6 +390,7 @@ internal class OnlineTranslatedPageLoader(
                         } else {
                             PageTranslator.SinglePageResult.NOT_TRANSLATED
                         },
+                        previous?.failureCode,
                     )
                     return
                 }
@@ -398,7 +405,11 @@ internal class OnlineTranslatedPageLoader(
                     update(request, Stage.TRANSLATING)
                     try {
                         cacheStore.invalidateCompletion(hit.entry)
-                        val result = translatePage(stored)
+                        val outcome = translatePage(stored)
+                        val result = outcome.result
+                        val failureCode = outcome.failureCode.takeIf {
+                            result == PageTranslator.SinglePageResult.NOT_TRANSLATED
+                        }
                         currentCoroutineContext().ensureActive()
                         if (result == PageTranslator.SinglePageResult.TRANSLATED) {
                             runCatching { cacheStore.recordCompletion(hit.entry) }
@@ -422,8 +433,8 @@ internal class OnlineTranslatedPageLoader(
                                 Stage.FAILED
                             }
                         }
-                        terminalResults[key] = TerminalResult(final, result)
-                        update(request, final, result)
+                        terminalResults[key] = TerminalResult(final, result, failureCode)
+                        update(request, final, result, failureCode)
                     } finally {
                         withContext(NonCancellable) {
                             if (cacheStore.exists(hit.entry) && OnlinePageCache.sha(hit.entry.page) != before) {
@@ -461,9 +472,10 @@ internal class OnlineTranslatedPageLoader(
         request: Request,
         stage: Stage,
         result: PageTranslator.SinglePageResult? = null,
+        failureCode: TranslationFailureCode? = null,
     ) {
         if (request.translate && isCurrent(request)) {
-            mutableProgress.value = Progress(request.page, stage, result, request.retryVersion)
+            mutableProgress.value = Progress(request.page, stage, result, request.retryVersion, failureCode)
         }
     }
 

@@ -25,6 +25,7 @@ import eu.kanade.tachiyomi.data.translation.PageProcessingReason
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationBusy
 import eu.kanade.tachiyomi.data.translation.TranslationEngineService
+import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.ReaderActivity
 import eu.kanade.tachiyomi.ui.reader.ReaderViewModel
@@ -39,11 +40,14 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import li.joye.yakuyomi.engine.FailureKind
 import li.joye.yakuyomi.engine.OcrLineProgress
 import li.joye.yakuyomi.engine.PageAnalysis
 import li.joye.yakuyomi.engine.PageProgress
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.PageStats
+import li.joye.yakuyomi.engine.ProcessingFailure
+import li.joye.yakuyomi.engine.ProcessingStage
 import li.joye.yakuyomi.engine.Pt
 import li.joye.yakuyomi.engine.RegionProgress
 import li.joye.yakuyomi.engine.RegionState
@@ -54,6 +58,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -374,6 +379,7 @@ class OnlineSelectedPageReaderTest {
                     )
                 }
                 awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.SKIPPED)
+                assertNull(loader.progress.value?.failureCode)
                 assertUnchangedPage(loader, pages[4], translator, originals[4])
                 awaitRendered(scenario, pages[4], translated = false)
                 assertProcessingReason(scenario, pages[4], PageProcessingReason.NO_TEXT)
@@ -400,6 +406,7 @@ class OnlineSelectedPageReaderTest {
                     )
                 }
                 awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.SKIPPED)
+                assertNull(loader.progress.value?.failureCode)
                 assertUnchangedPage(loader, pages[4], translator, originals[4])
                 assertProcessingReason(scenario, pages[4], PageProcessingReason.OCR_POLICY_KEPT)
 
@@ -414,10 +421,28 @@ class OnlineSelectedPageReaderTest {
                     )
                 }
                 awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.NOT_TRANSLATED)
+                assertEquals(TranslationFailureCode.UNKNOWN, loader.progress.value?.failureCode)
                 assertUnchangedPage(loader, pages[4], translator, originals[4])
                 awaitRendered(scenario, pages[4], translated = false)
                 OnlineSelectedPageFixture.settled(loader)
                 assertEquals(listOf(0, 1, 1, 2, 3, 4, 4, 4), fake.inputPages.toList())
+
+                // A typed request-boundary timeout keeps the same failure/storage semantics,
+                // but the actual public action must announce the predefined specific reason.
+                expectResultToast(MR.strings.translation_failure_server_timeout, fake, pages[4]) {
+                    pageAction(
+                        scenario,
+                        pages[4],
+                        MR.strings.reader_translate_this_page,
+                        MR.strings.reader_stop_page_translate,
+                    )
+                }
+                awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.NOT_TRANSLATED)
+                assertEquals(TranslationFailureCode.SERVER_TIMEOUT, loader.progress.value?.failureCode)
+                assertUnchangedPage(loader, pages[4], translator, originals[4])
+                awaitRendered(scenario, pages[4], translated = false)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(listOf(0, 1, 1, 2, 3, 4, 4, 4, 4), fake.inputPages.toList())
                 assertNoWholeChapterWork(activity)
                 val imageRequests = server.requests.filter { it.startsWith("/image/") }
                 assertTrue("The last page remains navigable", "/image/$PAGE_COUNT.png" in imageRequests)
@@ -432,6 +457,7 @@ class OnlineSelectedPageReaderTest {
                     .put("manualNoTextAndPolicyKeptNeutralNotFailure", true)
                     .put("actualFailureNotInferredFromPriorSummary", true)
                     .put("automaticSkippedRevisitWithoutAnotherInference", true)
+                    .put("typedTimeoutManualNoticeVerified", true)
             }
             report.put("functionalStagesPassed", true)
         } catch (failure: Throwable) {
@@ -610,6 +636,7 @@ class OnlineSelectedPageReaderTest {
             context.stringResource(MR.strings.reader_translate_page_failed),
             context.stringResource(MR.strings.reader_translate_page_done),
             context.stringResource(MR.strings.reader_translate_page_partial),
+            context.stringResource(MR.strings.translation_failure_server_timeout),
         )
         val startedLabel = context.stringResource(MR.strings.reader_translating_page)
         val observedNotices = JSONArray()
@@ -628,7 +655,8 @@ class OnlineSelectedPageReaderTest {
                     .put("loaderRetryVersion", progress?.retryVersion ?: JSONObject.NULL)
                     .put("loaderPageIsRequestedPage", progress?.page === page)
                     .put("loaderStage", progress?.stage?.name ?: JSONObject.NULL)
-                    .put("loaderResult", progress?.result?.name ?: JSONObject.NULL),
+                    .put("loaderResult", progress?.result?.name ?: JSONObject.NULL)
+                    .put("loaderFailureCode", progress?.failureCode?.wireValue ?: JSONObject.NULL),
             )
         }
         recordState("beforeAction")
@@ -1092,8 +1120,8 @@ class OnlineSelectedPageReaderTest {
         val peak = AtomicInteger()
         val closed = AtomicBoolean()
         val failure = AtomicReference<Throwable?>()
-        val entered = List(8) { CountDownLatch(1) }
-        val release = List(8) { CountDownLatch(if (it == 1 || it == 3) 1 else 0) }
+        val entered = List(9) { CountDownLatch(1) }
+        val release = List(9) { CountDownLatch(if (it == 1 || it == 3) 1 else 0) }
         val inputPages = CopyOnWriteArrayList<Int>()
         val outputs = CopyOnWriteArrayList<Bitmap>()
         val resultDiagnostics = CopyOnWriteArrayList<JSONObject>()
@@ -1103,8 +1131,8 @@ class OnlineSelectedPageReaderTest {
             val running = active.incrementAndGet()
             peak.updateAndGet { maxOf(it, running) }
             try {
-                check(!closed.get() && index < 8)
-                val expected = listOf(0, 1, 1, 2, 3, 4, 4, 4)[index]
+                check(!closed.get() && index < 9)
+                val expected = listOf(0, 1, 1, 2, 3, 4, 4, 4, 4)[index]
                 assertEquals(originalColor(expected), page.getPixel(0, 0))
                 (0..3).forEach { marker ->
                     assertEquals(
@@ -1117,7 +1145,17 @@ class OnlineSelectedPageReaderTest {
                 entered[index].countDown()
                 check(release[index].await(45, TimeUnit.SECONDS)) { "Scripted inference gate timed out" }
                 if (index >= 5) {
-                    if (index == 7) return PageResult.Failed("Neutral scripted manual failure")
+                    if (index == 7 || index == 8) {
+                        val failure = if (index == 8) {
+                            ProcessingFailure(ProcessingStage.TRANSLATE, FailureKind.TIMEOUT)
+                        } else {
+                            null
+                        }
+                        resultDiagnostics += JSONObject().put("callIndex", index).put("pageIndex", expected)
+                            .put("result", "FAILED").put("typedStage", failure?.stage?.name ?: JSONObject.NULL)
+                            .put("typedKind", failure?.kind?.name ?: JSONObject.NULL)
+                        return PageResult.Failed("Neutral scripted manual failure", failure)
+                    }
                     val progress = if (index == 5) {
                         PageProgress(WIDTH, HEIGHT, emptyList(), noTextDetected = true)
                     } else {

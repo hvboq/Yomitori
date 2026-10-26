@@ -4,6 +4,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import dev.icerock.moko.resources.StringResource
 import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.i18n.stringResource
@@ -11,7 +12,17 @@ import tachiyomi.presentation.core.i18n.stringResource
 /** Only predefined local messages are shown; exception text and server responses never enter this UI. */
 @Composable
 internal fun TranslationFailureHint(failureCode: TranslationFailureCode?, modifier: Modifier = Modifier) {
-    val message = when (failureCode ?: TranslationFailureCode.UNKNOWN) {
+    Text(
+        text = stringResource(translationFailureMessage(failureCode)),
+        modifier = modifier,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+    )
+}
+
+/** Shared predefined messages; null/unknown retains the queue's existing generic hint. */
+internal fun translationFailureMessage(failureCode: TranslationFailureCode?): StringResource =
+    when (failureCode ?: TranslationFailureCode.UNKNOWN) {
         TranslationFailureCode.SERVER_DNS -> MR.strings.translation_failure_server_dns
         TranslationFailureCode.SERVER_CONNECTION -> MR.strings.translation_failure_server_connection
         TranslationFailureCode.SERVER_TIMEOUT -> MR.strings.translation_failure_server_timeout
@@ -36,10 +47,3 @@ internal fun TranslationFailureHint(failureCode: TranslationFailureCode?, modifi
         TranslationFailureCode.MULTIPLE -> MR.strings.translation_failure_multiple
         TranslationFailureCode.UNKNOWN -> MR.strings.translation_failure_unknown
     }
-    Text(
-        text = stringResource(message),
-        modifier = modifier,
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.error,
-    )
-}
