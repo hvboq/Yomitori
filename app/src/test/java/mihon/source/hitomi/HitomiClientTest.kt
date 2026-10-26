@@ -26,6 +26,102 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class HitomiClientTest {
     @Test
+    fun `remote suggestions replace the editor token and search every namespace with literal wire paths`() =
+        runBlocking<Unit> {
+            data class Case(val namespace: String, val segments: List<String>, val encodedPath: String)
+            // These are literal protocol expectations, not paths built by the production URL helper.
+            val cases = listOf(
+                Case(
+                    "artist",
+                    listOf("artist", "neutral name/a?#%日本-all.nozomi"),
+                    "/artist/neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "group",
+                    listOf("group", "neutral name/a?#%日本-all.nozomi"),
+                    "/group/neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "series",
+                    listOf("series", "neutral name/a?#%日本-all.nozomi"),
+                    "/series/neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "character",
+                    listOf("character", "neutral name/a?#%日本-all.nozomi"),
+                    "/character/neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "tag",
+                    listOf("tag", "neutral name/a?#%日本-all.nozomi"),
+                    "/tag/neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "female",
+                    listOf("tag", "female:neutral name/a?#%日本-all.nozomi"),
+                    "/tag/female:neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "male",
+                    listOf("tag", "male:neutral name/a?#%日本-all.nozomi"),
+                    "/tag/male:neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+                Case(
+                    "language",
+                    listOf("index-neutral name/a?#%日本.nozomi"),
+                    "/index-neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC.nozomi",
+                ),
+                Case(
+                    "type",
+                    listOf("type", "neutral name/a?#%日本-all.nozomi"),
+                    "/type/neutral%20name%2Fa%3F%23%25%E6%97%A5%E6%9C%AC-all.nozomi",
+                ),
+            )
+            for (case in cases) {
+                var requests = 0
+                val client = OkHttpClient.Builder().addInterceptor { chain ->
+                    val request = chain.request()
+                    request.url.query shouldBe null
+                    request.url.fragment shouldBe null
+                    request.header("Referer") shouldBe "https://hitomi.la/"
+                    val body = when (++requests) {
+                        1 -> {
+                            request.url.host shouldBe "tagindex.hitomi.la"
+                            request.url.encodedPath shouldBe "/${case.namespace}/n.json"
+                            """[["Neutral\u3000Name/a?#%日本",31,"${case.namespace}"]]""".toResponseBody()
+                        }
+                        2 -> {
+                            request.url.host shouldBe "ltn.gold-usergeneratedcontent.net"
+                            request.url.pathSegments shouldBe case.segments
+                            request.url.encodedPath shouldBe case.encodedPath
+                            request.header("Range") shouldBe null
+                            ids(9, 7, 5).toResponseBody()
+                        }
+                        else -> error("Unexpected extra fixture request")
+                    }
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                        .body(body).build()
+                }.build()
+                try {
+                    val api = HitomiClient(client) { Headers.headersOf("Referer", "https://hitomi.la/") }
+                    val query = "${case.namespace}:n"
+                    val token = requireNotNull(HitomiSearchQuery.activeToken(query))
+                    val suggestion = api.searchSuggestions(token.text).single()
+                    suggestion.value shouldBe "${case.namespace}:neutral_name/a?#%日本"
+                    suggestion.count shouldBe 31
+                    val replacement = requireNotNull(HitomiSearchQuery.replaceAt(query, token, suggestion.value))
+                    replacement.query shouldBe "${case.namespace}:neutral_name/a?#%日本 "
+                    replacement.caret shouldBe replacement.query.length
+                    api.search(replacement.query, "all", 1) shouldBe (listOf(9L, 7L, 5L) to false)
+                    requests shouldBe 2
+                } finally {
+                    client.dispatcher.executorService.shutdownNow()
+                    client.connectionPool.evictAll()
+                }
+            }
+        }
+
+    @Test
     fun `every editor whitespace separator preserves query intersection and exclusions`() = runBlocking<Unit> {
         val requests = mutableListOf<List<String>>()
         val client = OkHttpClient.Builder().addInterceptor { chain ->

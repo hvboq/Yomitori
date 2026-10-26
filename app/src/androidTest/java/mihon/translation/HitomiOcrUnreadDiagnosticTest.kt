@@ -60,6 +60,8 @@ import kotlin.math.floor
  * Fresh selected-page research, not a replay of the signed reader's private original or geometry.
  * Required arguments: liveHitomiOcrDiagnostic=true, diagnosticRunId=UUID, hitomiReader=/reader/ID.html,
  * pageNumbers=2,3. No content, URL, raw trace, exception message or image is emitted or saved.
+ * Optional liveHitomiOcrPolarityDiagnostic=true adds neutral controls before fetching, then full-page RGB
+ * inversion of owned opaque copies. Candidate confidence is not evidence of actual semantic correctness.
  * Public default Detector/Ocr configurations are test defaults, not the signed app's observed settings.
  */
 @OptIn(InternalEngineApi::class)
@@ -77,6 +79,7 @@ class HitomiOcrUnreadDiagnosticTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val arguments = InstrumentationRegistry.getArguments()
+        val polarityDiagnostic = arguments.getString("liveHitomiOcrPolarityDiagnostic") == "true"
         val report = JSONObject().put("schemaVersion", 1).put("passed", false)
             .put("freshFetchAndDetection", true).put("signedReaderOriginalEqualityClaimed", false)
             .put("signedReaderGeometryEqualityClaimed", false).put("usesTestDefaultConfigurations", true)
@@ -110,6 +113,12 @@ class HitomiOcrUnreadDiagnosticTest {
             idle(context)
             val nativeModels = Models(context).also { models = it }
             report.put("modelsBefore", nativeModels.manifest())
+            if (polarityDiagnostic) {
+                val neutral = JSONObject()
+                report.put("polarityNeutralControl", neutral)
+                neutralPolarity(context, nativeModels, neutral, nativeOwners)
+                status()
+            }
             val source = HitomiSource(Injekt.get<NetworkHelper>())
             // Keep source DNS/proxy/TLS and use a separately owned production image interceptor. This client
             // has no HTTP cache, cookie store, verbose logger or challenge/WebView interceptor.
@@ -175,7 +184,7 @@ class HitomiOcrUnreadDiagnosticTest {
                             val bitmap = checkNotNull(decoder.decode(sampleSize = 1))
                             try {
                                 check(bitmap.width == decoder.width && bitmap.height == decoder.height)
-                                analyze(context, nativeModels, bitmap, row, nativeOwners)
+                                analyze(context, nativeModels, bitmap, row, nativeOwners, polarityDiagnostic)
                             } finally {
                                 bitmap.recycle()
                             }
@@ -247,6 +256,7 @@ class HitomiOcrUnreadDiagnosticTest {
         page: Bitmap,
         row: JSONObject,
         owners: MutableList<Any>,
+        polarityDiagnostic: Boolean,
     ) {
         val source = SourceSnapshot(page)
         row.put("width", page.width).put("height", page.height).put("density", page.density)
@@ -302,7 +312,203 @@ class HitomiOcrUnreadDiagnosticTest {
             .put("finalWhitespaceOnlyLines", on.count { it.text.isNotEmpty() && it.text.isBlank() })
             .put("finalNonBlankLines", on.count { it.text.isNotBlank() }).put("intentionallyKeptLines", onKept.size)
         validateTrace(trace.snapshot(), on, onKept, config, lines, row)
+        if (polarityDiagnostic) {
+            pagePolarity(context, models, page, on, onKept, row, owners)
+            source.verify(page)
+        }
         idle(context)
+    }
+
+    private suspend fun neutralPolarity(
+        context: Context,
+        models: Models,
+        row: JSONObject,
+        owners: MutableList<Any>,
+    ) {
+        val expected = "こんにちは。"
+        val drawing = OcrDiagnosticSample(expected).draw(60f)
+        val source = SourceSnapshot(drawing.page)
+        val geometry = listOf(TextLine(drawing.quad.map { Pt(it.x, it.y) }, 1f))
+        val variants = JSONArray()
+        row.put("variants", variants).put("expectedTextLength", expected.length)
+            .put("beforeAnyLiveFetch", true).put("sourceImagesOrTextExported", false)
+        try {
+            val baseline = JSONObject().put("variant", "black-on-white").also { variants.put(it) }
+            val baselineLine = polarityRecognize(context, models, drawing.page, geometry, baseline, owners).single()
+            baseline.put("groundTruthExact", baselineLine.text == expected)
+            check(baselineLine.text == expected && baselineLine.direction == "h")
+            val inverted = invertedOpaqueCopy(drawing.page)
+            try {
+                val negative = JSONObject().put("variant", "white-on-black").also { variants.put(it) }
+                val negativeLine = polarityRecognize(context, models, inverted, geometry, negative, owners).single()
+                negative.put("groundTruthExact", negativeLine.text == expected)
+                val restored = invertedOpaqueCopy(inverted)
+                try {
+                    source.verify(restored)
+                    val positive = JSONObject().put("variant", "restored-black-on-white").also { variants.put(it) }
+                    val positiveLine = polarityRecognize(context, models, restored, geometry, positive, owners).single()
+                    positive.put("groundTruthExact", positiveLine.text == expected)
+                        .put("baselineTextExact", positiveLine.text == baselineLine.text)
+                    check(positiveLine.text == expected && positiveLine.direction == baselineLine.direction)
+                    check(
+                        baseline.getJSONObject("selectedParam").toString() ==
+                            negative.getJSONObject("selectedParam").toString(),
+                    )
+                    check(
+                        baseline.getJSONObject("selectedParam").toString() ==
+                            positive.getJSONObject("selectedParam").toString(),
+                    )
+                    source.verify(restored)
+                } finally {
+                    restored.recycle()
+                }
+            } finally {
+                inverted.recycle()
+            }
+            check(geometry.single().quad == drawing.quad && geometry.single().text.isEmpty())
+            row.put("exactRgbInversionAndRestoration", true).put("sourcePixelsMetadataAndGeometryUnchanged", true)
+                .put("baselineAndRestoredGroundTruthExact", true)
+        } finally {
+            try {
+                source.verify(drawing.page)
+            } finally {
+                drawing.page.recycle()
+            }
+        }
+    }
+
+    private suspend fun pagePolarity(
+        context: Context,
+        models: Models,
+        page: Bitmap,
+        baseline: List<TextLine>,
+        kept: Set<TextLine>,
+        pageRow: JSONObject,
+        owners: MutableList<Any>,
+    ) {
+        val baselineRows = pageRow.getJSONArray("lines")
+        val pending = baseline.indices.filter { baseline[it].text.isBlank() && baseline[it] !in kept }
+        // The darkest recognized horizontal line is a deterministic control, not a polarity heuristic.
+        val control = checkNotNull(
+            baseline.indices.filter {
+                baseline[it].text.isNotBlank() && baseline[it].direction == "h" && baseline[it] !in kept
+            }.maxByOrNull {
+                val evidence = baselineRows.getJSONObject(it)
+                evidence.getLong("roiRawDarkPixels").toDouble() / evidence.getLong("roiPixels")
+            },
+        )
+        val selected = (pending + control).distinct().sorted()
+        val row = JSONObject().put("pendingLines", pending.size).put("recognizedControlLineIndex", control)
+            .put("fullPageRgbInversion", true).put("semanticCorrectnessClaimed", false)
+            .put("automaticPolarityHeuristicClaimed", false)
+        pageRow.put("polarityCandidate", row)
+        // Match the selected-line batch as well as its geometry; full-page OCR has different fan-out.
+        val selectedOriginal = JSONObject().also { row.put("selectedOriginal", it) }
+        val selectedBaseline = polarityRecognize(
+            context,
+            models,
+            page,
+            selected.map { baseline[it] },
+            selectedOriginal,
+            owners,
+        )
+        check(
+            selected.indices.all { index ->
+                selectedBaseline[index].text == baseline[selected[index]].text &&
+                    selectedBaseline[index].direction == baseline[selected[index]].direction
+            },
+        )
+        row.put("selectedOriginalMatchesFullPage", true).put("sameSelectedBatchForBothPolarities", true)
+        val inverted = invertedOpaqueCopy(page)
+        try {
+            val candidate = polarityRecognize(context, models, inverted, selected.map { baseline[it] }, row, owners)
+            check(pageRow.getJSONObject("onSelectedParam").toString() == row.getJSONObject("selectedParam").toString())
+            check(
+                selectedOriginal.getJSONObject("selectedParam").toString() ==
+                    row.getJSONObject("selectedParam").toString(),
+            )
+            selected.forEachIndexed { index, baselineIndex ->
+                val original = baseline[baselineIndex]
+                check(candidate[index].quad == original.quad)
+                row.getJSONArray("lines").getJSONObject(index).put("baselineLineIndex", baselineIndex)
+                    .put("baselineBlank", original.text.isBlank()).put("recognizedControl", baselineIndex == control)
+                    .put("baselineTextExact", candidate[index].text == original.text)
+                    .put("baselineDirectionExact", candidate[index].direction == original.direction)
+            }
+            row.put("sourceFullyOpaque", true).put("exactRgbInversion", true)
+                .put("sourcePixelsMetadataAndGeometryUnchanged", true)
+        } finally {
+            inverted.recycle()
+        }
+    }
+
+    private suspend fun polarityRecognize(
+        context: Context,
+        models: Models,
+        page: Bitmap,
+        geometry: List<TextLine>,
+        row: JSONObject,
+        owners: MutableList<Any>,
+    ): List<TextLine> {
+        check(geometry.size in 1..MAX_LINES)
+        val source = SourceSnapshot(page)
+        val config = OcrConfig().also { check(it.minProb == 0.5f && it.ignoreBubble == 0) }
+        val lines = geometry.map { cloneLine(it, page) }
+        val trace = OcrSelectionDiagnostics(maxLines = MAX_LINES, maxEvents = 32768)
+        val kept = try {
+            Ocr(models.file("ocr_48px_ctc.ncnn.param").path, models.dictionary, config, diagnostics = trace)
+                .also { owners.add(it) }.use { ocr ->
+                    idle(context)
+                    row.put("selectedParam", models.selected(ocr)).put("minProbability", config.minProb.toDouble())
+                    val started = SystemClock.elapsedRealtimeNanos()
+                    ocr.recognize(page, lines).also {
+                        row.put("recognizeCalls", 1).put("recognizeMs", elapsed(started))
+                    }
+                }
+        } finally {
+            source.verify(page)
+        }
+        val evidence = JSONArray()
+        lines.forEachIndexed { index, line ->
+            check(line.quad == geometry[index].quad && line.score == geometry[index].score)
+            evidence.put(lineEvidence(index, line, line in kept, page))
+        }
+        row.put("lines", evidence).put("width", page.width).put("height", page.height).put("density", page.density)
+            .put("pixelsMetadataAndGeometryUnchanged", true)
+        validateTrace(trace.snapshot(), lines, kept, config, evidence, row)
+        idle(context)
+        return lines
+    }
+
+    private fun invertedOpaqueCopy(source: Bitmap): Bitmap {
+        check(source.config == Bitmap.Config.ARGB_8888)
+        val snapshot = SourceSnapshot(source)
+        val copy = checkNotNull(source.copy(Bitmap.Config.ARGB_8888, true))
+        val before = IntArray(source.width)
+        val after = IntArray(source.width)
+        try {
+            copy.density = source.density
+            snapshot.verify(copy)
+            for (y in 0 until source.height) {
+                source.getPixels(before, 0, before.size, 0, y, before.size, 1)
+                // Deliberately reject nonopaque pages; unpremultiplication must not confound this experiment.
+                check(before.all { it ushr 24 == 255 })
+                before.forEachIndexed { index, pixel -> after[index] = pixel xor 0x00FFFFFF }
+                copy.setPixels(after, 0, after.size, 0, y, after.size, 1)
+                copy.getPixels(after, 0, after.size, 0, y, after.size, 1)
+                check(before.indices.all { after[it] == (before[it] xor 0x00FFFFFF) })
+            }
+            check(copy.width == source.width && copy.height == source.height && copy.density == source.density)
+            check(copy.hasAlpha() == source.hasAlpha() && copy.isPremultiplied == source.isPremultiplied)
+            snapshot.verify(source)
+            return copy
+        } catch (error: Throwable) {
+            copy.recycle()
+            throw error
+        } finally {
+            before.fill(0)
+            after.fill(0)
+        }
     }
 
     private fun validateTrace(
