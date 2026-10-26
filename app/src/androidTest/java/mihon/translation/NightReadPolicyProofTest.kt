@@ -284,9 +284,13 @@ class NightReadPolicyProofTest {
 
     @Test
     fun actualNightRoundPublishesNewPairAndPartialPublicationCannotAuthorizeEitherTier() = raw { f ->
+        val other = f.addOtherPage()
+        val otherBytes = other.exactPageBytes()
+        val oldProofNames = f.proofFiles().map { it.name }.also { assertEquals(2, it.size) }
         val old = f.prepared()
         val round = f.round()
         assertTrue(round.commit())
+        oldProofNames.forEach { name -> assertFalse(File(f.materialsFile, name).exists()) }
         assertNull(f.open(old))
         assertNull(f.open(f.prepared()))
         val proofNames = round.proofs()
@@ -301,6 +305,7 @@ class NightReadPolicyProofTest {
             proofNames.last(),
         ).writeBytes(NightPolicy.encode(checkNotNull(NightPolicy.parse(proofNames.last())), witness))
         assertNotNull(f.open(f.prepared()))
+        other.assertExactPageBytes(otherBytes)
         f.assertProtected()
     }
 
@@ -393,6 +398,9 @@ class NightReadPolicyProofTest {
 
     @Test
     fun skippedColorRetirementReloadsDecodedPageWithoutSuccessfulChapterDone() = raw { f ->
+        val other = f.addOtherPage()
+        val otherBytes = other.exactPageBytes()
+        val oldProofNames = f.proofFiles().map { it.name }.also { assertEquals(2, it.size) }
         val streams = f.streams()
         streams.open(0) { f.source.openInputStream() }.close()
         val page = ReaderPage(0)
@@ -418,6 +426,8 @@ class NightReadPolicyProofTest {
         assertEquals(1, page.reloadFlow.value)
         assertArrayEquals(f.originalBytes, streams.open(0) { f.source.openInputStream() }.use { it.readBytes() })
         assertFalse(NightPages.hasAnyArtifact(f.materialsFile.listFiles().orEmpty().map { it.name }.toSet(), PAGE))
+        oldProofNames.forEach { name -> assertFalse(File(f.materialsFile, name).exists()) }
+        other.assertExactPageBytes(otherBytes)
         f.assertProtected()
     }
 
@@ -535,22 +545,27 @@ class NightReadPolicyProofTest {
         f.assertProtected()
     }
 
-    private inner class Fixture(val chapter: UniFile, val sourceFile: File, val materialsFile: File) {
-        val source = checkNotNull(chapter.findFile(PAGE))
+    private inner class Fixture(
+        val chapter: UniFile,
+        val sourceFile: File,
+        val materialsFile: File,
+        private val pageName: String = PAGE,
+    ) {
+        val source = checkNotNull(chapter.findFile(pageName))
         val materials = checkNotNull(chapter.findFile(NightPages.DIR))
         val originalBytes = sourceFile.readBytes()
-        private val originalFile = File(materialsFile, OriginalMaterial.exactName(PAGE)).apply {
+        private val originalFile = File(materialsFile, OriginalMaterial.exactName(pageName)).apply {
             writeBytes(originalBytes)
         }
-        val materialFile = File(materialsFile, "target.json").apply { writeText("{}") }
+        val materialFile = File(materialsFile, "${OriginalMaterial.base(pageName)}.json").apply { writeText("{}") }
         private val unrelated = File(materialsFile, "unrelated.keep").apply { writeText("neutral-owned-data") }
         val nightBytes = encoded(Color.BLUE)
         private val index = NightPages.Index()
 
         fun addCaptureHistory() {
-            val mutation = NightSourceRevision.begin(context, chapter, materials, PAGE)
+            val mutation = NightSourceRevision.begin(context, chapter, materials, pageName)
             CapturedSourceStore(CapturedSourceUniFileIo(context, chapter, materials)).replace(
-                PAGE,
+                pageName,
                 originalBytes,
                 setOf(originalFile.name),
                 false,
@@ -560,35 +575,35 @@ class NightReadPolicyProofTest {
         }
 
         fun revision(): NightSourceRevision.Revision = NightSourceRevision.read(
-            checkNotNull(materials.findFile(NightSourceRevision.fileName(PAGE))),
+            checkNotNull(materials.findFile(NightSourceRevision.fileName(pageName))),
         )
 
         fun proofFiles(): List<File> = materialsFile.listFiles().orEmpty().filter {
-            NightPolicy.belongsTo(it.name, PAGE)
+            NightPolicy.belongsTo(it.name, pageName)
         }
 
         fun publish() {
-            NightSourceRevision.ensureCommitted(context, chapter, materials, PAGE)
-            val protected = NightPolicy.snapshot(chapter, materials, PAGE)
+            NightSourceRevision.ensureCommitted(context, chapter, materials, pageName)
+            val protected = NightPolicy.snapshot(chapter, materials, pageName)
             proofFiles().forEach { check(it.delete()) }
-            val mutation = NightSourceRevision.beginPublication(context, chapter, materials, PAGE, protected)
-            NightPages.currentNames(PAGE).forEach { File(materialsFile, it).writeBytes(nightBytes) }
+            val mutation = NightSourceRevision.beginPublication(context, chapter, materials, pageName, protected)
+            NightPages.currentNames(pageName).forEach { File(materialsFile, it).writeBytes(nightBytes) }
             mutation.committed()
-            val witness = NightPolicy.snapshot(chapter, materials, PAGE)
-            NightPolicy.names(PAGE, NightSourceRevision.newId(), moreDistinct = true).forEach { name ->
+            val witness = NightPolicy.snapshot(chapter, materials, pageName)
+            NightPolicy.names(pageName, NightSourceRevision.newId(), moreDistinct = true).forEach { name ->
                 File(materialsFile, name).writeBytes(NightPolicy.encode(checkNotNull(NightPolicy.parse(name)), witness))
             }
-            NightSourceRevision.changed(chapter, PAGE)
+            NightSourceRevision.changed(chapter, pageName)
         }
 
         fun prepared(): NightPages.Index.PageFiles? {
             index.refresh(chapter)
-            return index.page(chapter, source, PAGE)
+            return index.page(chapter, source, pageName)
         }
 
         fun open(entry: NightPages.Index.PageFiles?): ByteArray? = try {
             entry?.let {
-                NightPolicy.openCurrent(it.files.keys, PAGE, NightLevel.MORE, it.io)
+                NightPolicy.openCurrent(it.files.keys, pageName, NightLevel.MORE, it.io)
             }?.second?.use { it.readBytes() }
         } catch (_: IOException) {
             null
@@ -602,7 +617,9 @@ class NightReadPolicyProofTest {
             }
             return NightPageStreams(reader, translation).also {
                 it.chapterDir = readerChapter
-                it.registerSource(0) { if (readerChapter.uri == chapter.uri) source else readerChapter.findFile(PAGE) }
+                it.registerSource(0) {
+                    if (readerChapter.uri == chapter.uri) source else readerChapter.findFile(pageName)
+                }
                 it.refresh()
             }
         }
@@ -615,7 +632,7 @@ class NightReadPolicyProofTest {
                 chapter,
                 materials,
                 source,
-                PAGE,
+                pageName,
                 Bitmap.CompressFormat.PNG,
             )
             val token = PageTranslator::class.java.getDeclaredMethod(
@@ -624,12 +641,12 @@ class NightReadPolicyProofTest {
                 UniFile::class.java,
                 String::class.java,
             )
-                .apply { isAccessible = true }.invoke(translator, chapter, source, PAGE)
+                .apply { isAccessible = true }.invoke(translator, chapter, source, pageName)
             type.getDeclaredMethod("bindSource", token.javaClass, NightPolicy.Witness::class.java).apply {
                 isAccessible =
                     true
             }
-                .invoke(instance, token, NightPolicy.snapshot(chapter, materials, PAGE))
+                .invoke(instance, token, NightPolicy.snapshot(chapter, materials, pageName))
             val bitmap = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.CYAN) }
             try {
                 NightLevel.entries.forEach { level ->
@@ -648,6 +665,37 @@ class NightReadPolicyProofTest {
                 bitmap.recycle()
             }
             return Round(instance, type)
+        }
+
+        /** A second real, independently proven page in this same private RawFile chapter. */
+        fun addOtherPage(): Fixture {
+            check(chapter.uri.scheme == "file")
+            val parent = checkNotNull(sourceFile.canonicalFile.parentFile)
+            val name = "other.png"
+            val otherSource = File(parent, name)
+            check(otherSource.canonicalFile.parentFile == parent && !otherSource.exists())
+            otherSource.writeBytes(encoded(Color.GREEN))
+            return Fixture(chapter, otherSource, materialsFile, name).also { other ->
+                other.publish()
+                assertArrayEquals(other.nightBytes, other.open(other.prepared()))
+            }
+        }
+
+        fun exactPageBytes(): Map<File, ByteArray> {
+            val proofs = proofFiles()
+            assertEquals(2, proofs.size)
+            val names = NightPages.currentNames(pageName) + NightSourceRevision.fileName(pageName)
+            val files = listOf(sourceFile, originalFile, materialFile) + proofs + names.map { File(materialsFile, it) }
+            check(files.toSet().size == 8 && files.all { it.isFile })
+            return files.associateWith { it.readBytes() }
+        }
+
+        fun assertExactPageBytes(expected: Map<File, ByteArray>) {
+            val actual = exactPageBytes()
+            assertEquals(expected.keys, actual.keys)
+            expected.forEach { (file, bytes) -> assertArrayEquals(bytes, actual.getValue(file)) }
+            assertArrayEquals(nightBytes, open(prepared()))
+            assertProtected()
         }
 
         fun assertProtected() {

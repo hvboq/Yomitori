@@ -60,7 +60,10 @@ internal object NightPolicy {
         ).onEach { require(it.toByteArray(Charsets.UTF_8).size <= 255 && parse(it) != null) }
     }
 
-    fun belongsTo(name: String, page: String): Boolean = parse(name)?.pageKey == NightSourceRevision.pageKey(page)
+    fun belongsTo(name: String, page: String): Boolean {
+        val stamp = parse(name) ?: return false
+        return stamp.pageKey == NightSourceRevision.pageKey(page)
+    }
 
     fun recipe(names: Set<String>, page: String, level: NightLevel): Recipe? {
         val standard = NightPages.levelName(page, NightLevel.STANDARD)
