@@ -86,6 +86,45 @@ internal class OcrCandidateGroundTruth private constructor(
         recorded += pageNumber
     }
 
+    /** Compare child OCR outputs in caller order; this neither assembles text nor creates ROI artifacts. */
+    fun recordChildCandidates(
+        pageNumber: Int,
+        parentLineIndex: Int,
+        parent: TextLine,
+        children: List<TextLine>,
+        row: JSONObject,
+    ) = guarded(7) {
+        val binding = checkNotNull(bindings[pageNumber])
+        check(pageNumber in validated && parentLineIndex == binding.lineIndex)
+        check(quadBits(parent) == binding.quadBits)
+        check(children.size in 0..12 && !row.has("childGroundTruth"))
+        val results = JSONArray()
+        children.forEachIndexed { index, child ->
+            val text = child.text
+            val textBytes = text.toByteArray(Charsets.UTF_8)
+            val actual = try {
+                MessageDigest.getInstance("SHA-256").apply { update(salt) }.digest(textBytes)
+            } finally {
+                textBytes.fill(0)
+            }
+            val matches = try {
+                JSONArray(binding.expectedHashes.map { MessageDigest.isEqual(actual, it) })
+            } finally {
+                actual.fill(0)
+            }
+            results.put(
+                JSONObject().put("childIndex", index).put("candidateLength", text.length)
+                    .put("expectedMatches", matches),
+            )
+        }
+        row.put(
+            "childGroundTruth",
+            JSONObject().put("provided", true).put("sourceBindingMatched", true).put("parentQuadBitsMatched", true)
+                .put("comparison", "salted-raw-utf8-exact").put("childCount", children.size).put("children", results),
+        )
+        Unit
+    }
+
     fun addSummary(report: JSONObject) = guarded(4) {
         report.put(
             "groundTruthSummary",

@@ -2,6 +2,11 @@ package mihon.translation
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
@@ -22,6 +27,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import li.joye.yakuyomi.engine.Detector
+import li.joye.yakuyomi.engine.DetectorConfig
 import li.joye.yakuyomi.engine.EngineTrace
 import li.joye.yakuyomi.engine.InternalEngineApi
 import li.joye.yakuyomi.engine.Ocr
@@ -59,11 +65,13 @@ import kotlin.math.floor
 /**
  * Fresh selected-page research, not a replay of the signed reader's private original or geometry.
  * Required arguments: liveHitomiOcrDiagnostic=true, diagnosticRunId=UUID, hitomiReader=/reader/ID.html,
- * pageNumbers=2,3. No text, URL, raw trace or exception message is emitted or saved.
+ * pageNumbers=2,3. No user-work text, URL, raw trace or exception message is emitted or saved.
  * Optional liveHitomiOcrPolarityDiagnostic=true adds neutral controls before fetching, then full-page RGB
  * inversion of owned opaque copies. Candidate confidence is not evidence of actual semantic correctness.
  * Optional liveHitomiOcrGroundTruthDiagnostic=true binds private salted expectations to source/quad and
  * retains bounded original ROI PNGs in an isolated cache directory for host extraction and cleanup.
+ * Optional liveHitomiOcrLocalRedetectionDiagnostic=true compares local detection plus child OCR without
+ * modifying or joining parent lines. Child matches do not prove coverage or a safe product recovery.
  * Public default Detector/Ocr configurations are test defaults, not the signed app's observed settings.
  */
 @OptIn(InternalEngineApi::class)
@@ -82,6 +90,7 @@ class HitomiOcrUnreadDiagnosticTest {
         val context = instrumentation.targetContext
         val arguments = InstrumentationRegistry.getArguments()
         val polarityDiagnostic = arguments.getString("liveHitomiOcrPolarityDiagnostic") == "true"
+        val localRedetectionEnabled = arguments.getString("liveHitomiOcrLocalRedetectionDiagnostic") == "true"
         val report = JSONObject().put("schemaVersion", 1).put("passed", false)
             .put("freshFetchAndDetection", true).put("signedReaderOriginalEqualityClaimed", false)
             .put("signedReaderGeometryEqualityClaimed", false).put("usesTestDefaultConfigurations", true)
@@ -96,6 +105,7 @@ class HitomiOcrUnreadDiagnosticTest {
         var models: Models? = null
         var client: OkHttpClient? = null
         var groundTruth: OcrCandidateGroundTruth? = null
+        var localKnownGeometryExact: Boolean? = null
         val nativeOwners = mutableListOf<Any>()
         val httpExecutor = Executors.newCachedThreadPool { task -> Thread(task, "hitomi-ocr-http") }
         val pool = ConnectionPool()
@@ -115,6 +125,7 @@ class HitomiOcrUnreadDiagnosticTest {
             check(Process.is64Bit() && "arm64-v8a" in Build.SUPPORTED_ABIS)
             groundTruth = OcrCandidateGroundTruth.parse(context, arguments)
             check(groundTruth == null || polarityDiagnostic)
+            check(!localRedetectionEnabled || groundTruth != null)
             idle(context)
             val nativeModels = Models(context).also { models = it }
             report.put("modelsBefore", nativeModels.manifest())
@@ -122,6 +133,12 @@ class HitomiOcrUnreadDiagnosticTest {
                 val neutral = JSONObject()
                 report.put("polarityNeutralControl", neutral)
                 neutralPolarity(context, nativeModels, neutral, nativeOwners)
+                status()
+            }
+            if (localRedetectionEnabled) {
+                val neutral = JSONObject().also { report.put("localRedetectionNeutralControl", it) }
+                localKnownGeometryExact = neutralLocalRedetection(context, nativeModels, neutral, nativeOwners)
+                report.put("localKnownGeometryExact", localKnownGeometryExact)
                 status()
             }
             val source = HitomiSource(Injekt.get<NetworkHelper>())
@@ -198,6 +215,7 @@ class HitomiOcrUnreadDiagnosticTest {
                                     nativeOwners,
                                     polarityDiagnostic,
                                     groundTruth,
+                                    localRedetectionEnabled,
                                 )
                             } finally {
                                 bitmap.recycle()
@@ -214,8 +232,12 @@ class HitomiOcrUnreadDiagnosticTest {
             }
             check(pages.length() == 2)
             groundTruth?.let { check(it.retainedImageCount == 2) }
-            report.put("passed", true)
             phase = 20
+            if (localRedetectionEnabled) report.put("terminalQualityGate", "known-neutral-geometry-exact")
+            // Keep the exact quality gate. Collect the alternatives before failing so a known baseline
+            // OCR mismatch cannot hide evidence about whether local re-detection actually improves it.
+            check(!localRedetectionEnabled || localKnownGeometryExact == true)
+            report.put("passed", true)
         } catch (error: Throwable) {
             // A private transport/native exception can embed a URL. Retain failure semantics, never its message/cause.
             failure = error
@@ -276,6 +298,7 @@ class HitomiOcrUnreadDiagnosticTest {
         owners: MutableList<Any>,
         polarityDiagnostic: Boolean,
         groundTruth: OcrCandidateGroundTruth?,
+        localRedetectionEnabled: Boolean,
     ) {
         val source = SourceSnapshot(page)
         row.put("width", page.width).put("height", page.height).put("density", page.density)
@@ -335,7 +358,213 @@ class HitomiOcrUnreadDiagnosticTest {
             pagePolarity(context, models, page, on, onKept, row, owners, groundTruth)
             source.verify(page)
         }
+        if (localRedetectionEnabled) {
+            localRedetection(context, models, page, on, onKept, row, owners, checkNotNull(groundTruth))
+            source.verify(page)
+        }
         idle(context)
+    }
+
+    private suspend fun localRedetection(
+        context: Context,
+        models: Models,
+        page: Bitmap,
+        baseline: List<TextLine>,
+        kept: Set<TextLine>,
+        pageRow: JSONObject,
+        owners: MutableList<Any>,
+        groundTruth: OcrCandidateGroundTruth,
+    ) {
+        val parentIndex = baseline.indices.single { baseline[it].text.isBlank() && baseline[it] !in kept }
+        val parent = baseline[parentIndex]
+        val parentQuad = parent.quad.map { Pt(it.x, it.y) }
+        val parentState = listOf(parent.direction, parent.text, parent.translatedText)
+        val parentScore = parent.score.toRawBits()
+        val bounds = paddedBounds(parent, page)
+        val variants = JSONArray().also { pageRow.put("localRedetectionVariants", it) }
+        val inverted = invertedOpaqueCopy(page)
+        try {
+            for ((name, input) in listOf("original" to page, "inverted" to inverted)) {
+                val row = JSONObject().put("variant", name).put("parentLineIndex", parentIndex)
+                    .put("parentMutation", false).put("childJoin", false).put("coverageClaimed", false)
+                    .put("qualityPromoted", false).also { variants.put(it) }
+                val children = redetectRegion(context, models, input, bounds, row, owners)
+                row.put(
+                    "childBboxRelations",
+                    JSONArray(
+                        children.map { child ->
+                            JSONObject().put("parentIntersectionArea", bboxIntersection(child, parent))
+                                .put(
+                                    "neighborOverlapIndices",
+                                    JSONArray(
+                                        baseline.indices.filter {
+                                            it != parentIndex && bboxIntersection(child, baseline[it]) > 0
+                                        },
+                                    ),
+                                )
+                        },
+                    ),
+                )
+                groundTruth.recordChildCandidates(pageRow.getInt("pageOneBased"), parentIndex, parent, children, row)
+                row.put("parentQuadUnchanged", parent.quad == parentQuad)
+                check(parent.quad == parentQuad && parent.score.toRawBits() == parentScore)
+                check(listOf(parent.direction, parent.text, parent.translatedText) == parentState && parent !in kept)
+                row.put("parentStateAndKeptMembershipUnchanged", true)
+            }
+        } finally {
+            inverted.recycle()
+        }
+    }
+
+    private suspend fun neutralLocalRedetection(
+        context: Context,
+        models: Models,
+        row: JSONObject,
+        owners: MutableList<Any>,
+    ): Boolean {
+        val page = Bitmap.createBitmap(512, 200, Bitmap.Config.ARGB_8888)
+        val expected = listOf("HELLO", "WORLD", "7", "NEXT")
+        val geometry = mutableListOf<TextLine>()
+        try {
+            val canvas = Canvas(page)
+            canvas.drawColor(Color.WHITE)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.DEFAULT_BOLD }
+            paint.color = Color.BLACK
+            canvas.drawRoundRect(100f, 50f, 340f, 110f, 12f, 12f, paint)
+            listOf(Triple(120f, 73f, 18f), Triple(120f, 97f, 18f), Triple(270f, 97f, 36f), Triple(110f, 136f, 18f))
+                .forEachIndexed { index, (x, y, size) ->
+                    paint.color = if (index == 3) Color.BLACK else Color.WHITE
+                    paint.textSize = size
+                    val ink = Rect().also { paint.getTextBounds(expected[index], 0, expected[index].length, it) }
+                    canvas.drawText(expected[index], x, y, paint)
+                    geometry.add(
+                        TextLine(
+                            listOf(
+                                Pt(x + ink.left, y + ink.top),
+                                Pt(x + ink.right, y + ink.top),
+                                Pt(x + ink.right, y + ink.bottom),
+                                Pt(x + ink.left, y + ink.bottom),
+                            ),
+                            1f,
+                        ),
+                    )
+                }
+            val source = SourceSnapshot(page)
+            val known = JSONObject().also { row.put("knownGeometryControl", it) }
+            val recognized = polarityRecognize(context, models, page, geometry, known, owners)
+            val matches = recognized.indices.map { recognized[it].text == expected[it] }
+            known.put("rawUtf8ExactMatches", JSONArray(matches))
+                .put("syntheticActualTexts", JSONArray(recognized.map { it.text }))
+            known.put("qualityPassed", matches.all { it })
+            val parent = TextLine(listOf(Pt(100f, 50f), Pt(340f, 50f), Pt(340f, 110f), Pt(100f, 110f)), 1f)
+            val bounds = paddedBounds(parent, page)
+            row.put("parentQuad", JSONArray(parent.quad.map { JSONArray(listOf(it.x, it.y)) }))
+                .put("neighborKnownQuad", JSONArray(geometry.last().quad.map { JSONArray(listOf(it.x, it.y)) }))
+                .put("beforeAnyLiveFetch", true).put("syntheticImagesSaved", false)
+            val variants = JSONArray().also { row.put("variants", it) }
+            val inverted = invertedOpaqueCopy(page)
+            try {
+                for ((name, input) in listOf("original" to page, "inverted" to inverted)) {
+                    val variant = JSONObject().put("variant", name).also { variants.put(it) }
+                    val children = redetectRegion(context, models, input, bounds, variant, owners)
+                    variant.put(
+                        "rawUtf8ExpectedMatches",
+                        JSONArray(
+                            children.map { child ->
+                                JSONArray(expected.map { child.text == it })
+                            },
+                        ),
+                    )
+                    variant.put("parentMutation", false).put("childJoin", false).put("coverageClaimed", false)
+                }
+            } finally {
+                inverted.recycle()
+            }
+            source.verify(page)
+            return matches.all { it }
+        } finally {
+            page.recycle()
+        }
+    }
+
+    private fun paddedBounds(parent: TextLine, page: Bitmap): IntArray = intArrayOf(
+        (floor(parent.quad.minOf { it.x }).toInt() - 8).coerceAtLeast(0),
+        (floor(parent.quad.minOf { it.y }).toInt() - 8).coerceAtLeast(0),
+        (ceil(parent.quad.maxOf { it.x }).toInt() + 8).coerceAtMost(page.width),
+        (ceil(parent.quad.maxOf { it.y }).toInt() + 8).coerceAtMost(page.height),
+    )
+
+    private fun bboxIntersection(first: TextLine, second: TextLine): Double {
+        val width = minOf(first.quad.maxOf { it.x }, second.quad.maxOf { it.x }) -
+            maxOf(first.quad.minOf { it.x }, second.quad.minOf { it.x })
+        val height = minOf(first.quad.maxOf { it.y }, second.quad.maxOf { it.y }) -
+            maxOf(first.quad.minOf { it.y }, second.quad.minOf { it.y })
+        return width.coerceAtLeast(0f).toDouble() * height.coerceAtLeast(0f).toDouble()
+    }
+
+    private suspend fun redetectRegion(
+        context: Context,
+        models: Models,
+        page: Bitmap,
+        bounds: IntArray,
+        row: JSONObject,
+        owners: MutableList<Any>,
+    ): List<TextLine> {
+        val (left, top, right, bottom) = bounds
+        val width = right - left
+        val height = bottom - top
+        check(width in 1..512 && height in 1..160 && width.toLong() * height <= 81_920)
+        val source = SourceSnapshot(page)
+        val crop = Bitmap.createBitmap(page, left, top, width, height)
+        try {
+            val cropSource = SourceSnapshot(crop)
+            val cfg = DetectorConfig()
+            check(cfg.dbnetInputSize == 1024)
+            row.put("cropBounds", JSONArray(bounds.toList())).put("sourcePaddingPixels", 8)
+                .put("cropWidth", width).put("cropHeight", height).put("dbnetInputSize", cfg.dbnetInputSize)
+                .put("calculatedScale", cfg.dbnetInputSize.toDouble() / maxOf(width, height))
+                .put("nativeInputObserved", false).put("dbBinThreshold", cfg.dbBinThreshold.toDouble())
+                .put("dbBoxThreshold", cfg.dbBoxThreshold.toDouble()).put("dbUnclipRatio", cfg.dbUnclipRatio.toDouble())
+            idle(context)
+            val started = SystemClock.elapsedRealtimeNanos()
+            val children = Detector(models.file("dbnet_detect.ncnn.param").path, cfg).also { owners.add(it) }
+                .use { detector ->
+                    val detection = detector.detect(crop)
+                    try {
+                        row.put("detectorCalls", 1).put("detectedChildCount", detection.lines.size)
+                        check(detection.lines.size <= 12)
+                        row.put(
+                            "localQuads",
+                            JSONArray(
+                                detection.lines.map { line ->
+                                    JSONArray(line.quad.map { JSONArray(listOf(it.x, it.y)) })
+                                },
+                            ),
+                        )
+                        detection.lines.map { line ->
+                            check(line.quad.all { it.x in 0f..width.toFloat() && it.y in 0f..height.toFloat() })
+                            TextLine(line.quad.map { Pt(it.x + left, it.y + top) }, line.score)
+                        }
+                    } finally {
+                        detection.textMask.recycle()
+                    }
+                }
+            row.put("detectAndModelLifecycleMs", elapsed(started))
+            cropSource.verify(crop)
+            val output = if (children.isEmpty()) {
+                row.put("recognizeCalls", 0).put("traceExecuted", false).put("lines", JSONArray())
+                emptyList()
+            } else {
+                row.put("traceExecuted", true)
+                polarityRecognize(context, models, page, children, row, owners)
+            }
+            source.verify(page)
+            row.put("sourcePixelsMetadataUnchanged", true).put("localMaskRecycled", true)
+                .put("coordinateTransform", "crop-origin-only")
+            return output
+        } finally {
+            if (crop !== page) crop.recycle()
+        }
     }
 
     private suspend fun neutralPolarity(
