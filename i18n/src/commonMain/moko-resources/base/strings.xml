@@ -1596,7 +1596,7 @@
     <string name="reader_processing_record_saved_snapshot">Result and page totals recorded at the time of processing.</string>
     <string name="reader_processing_record_time">Recorded: %1$s</string>
     <string name="reader_processing_record_translated">Translation was applied.</string>
-    <string name="reader_processing_record_partial">Some regions remain unresolved.</string>
+    <string name="reader_processing_record_partial">Some OCR groups still have unread lines.</string>
     <string name="reader_processing_record_no_text">No text was detected; the original was kept.</string>
     <string name="reader_processing_record_ocr_kept">Recognition results met conditions for keeping the original.</string>
     <string name="reader_processing_record_response_kept">Translation results met conditions for keeping the original.</string>
@@ -1609,6 +1609,10 @@
     <string name="reader_processing_record_ocr_kept_lines">Lines kept by recognition policy: %1$d</string>
     <string name="reader_processing_record_response_kept_regions">Regions kept by translation result conditions: %1$d</string>
     <string name="reader_processing_record_pending_regions">Unresolved regions: %1$d</string>
+    <string name="reader_processing_record_unrecognized_lines">Unrecognized lines: %1$d</string>
+    <string name="reader_processing_record_held_recognized_lines">Recognized lines held in unresolved groups: %1$d</string>
+    <string name="reader_processing_record_pending_ocr_unavailable">This record does not include an OCR line breakdown.</string>
+    <string name="reader_processing_record_pending_ocr_explanation">Regions with an unrecognized line retain their original text, including lines already recognized. This record reflects the saved result and may differ from a later retry.</string>
     <string name="reader_chapter_list">Chapters</string>
     <string name="reader_translate_this_chapter">Translate this chapter</string>
     <string name="reader_stop_chapter_translate">Stop translating this chapter</string>

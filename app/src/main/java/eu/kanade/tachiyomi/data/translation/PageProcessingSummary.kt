@@ -28,9 +28,18 @@ data class PageProcessingCounts(
     val pendingRegions: Int,
 )
 
+/** Numeric observations of unresolved groups, never an explanation of why recognition was empty. */
+@Serializable
+data class PageProcessingPendingOcr(val unrecognizedLines: Int, val heldRecognizedLines: Int)
+
 /** Only immutable scalars escape inference: no recognized/translated text, geometry or bitmaps. */
 @Serializable
-data class PageProcessingOutcome(val reason: PageProcessingReason, val counts: PageProcessingCounts? = null) {
+data class PageProcessingOutcome(
+    val reason: PageProcessingReason,
+    val counts: PageProcessingCounts? = null,
+    /** Null means that this saved observation has no breakdown; it must never be displayed as zero. */
+    val pendingOcr: PageProcessingPendingOcr? = null,
+) {
     companion object {
         /** Missing/inconsistent custom results must not be explained using a free-form reason. */
         fun fromProgress(
@@ -80,7 +89,16 @@ data class PageProcessingOutcome(val reason: PageProcessingReason, val counts: P
                 responseFiltered > 0 -> PageProcessingReason.RESPONSE_FILTERED
                 else -> return unknown
             }
-            return PageProcessingOutcome(reason, counts)
+            val pendingOcr = if (pending > 0) {
+                val pendingLines = progress.regions.filter { it.state == RegionState.OCR_PENDING }.flatMap { it.lines }
+                PageProcessingPendingOcr(
+                    unrecognizedLines = pendingLines.count { it.text.isBlank() && !it.intentionallyKept },
+                    heldRecognizedLines = pendingLines.count { it.text.isNotBlank() && !it.intentionallyKept },
+                )
+            } else {
+                null
+            }
+            return PageProcessingOutcome(reason, counts, pendingOcr)
         }
     }
 }

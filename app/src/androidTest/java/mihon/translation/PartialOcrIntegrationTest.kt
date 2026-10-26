@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Build
+import android.os.Bundle
 import android.os.Process
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -448,6 +449,157 @@ class PartialOcrIntegrationTest {
                     borrowedMask?.recycle()
                     original.recycle()
                 }
+            }
+        }
+    }
+
+    @Test
+    fun nativeRepeatedMissingColumnRemainsPartialUntilLaterResumeRecoversWithoutResendingTargets() = runBlocking<Unit> {
+        check(context.packageName == "app.yomitori.yakuyomi.audit") {
+            "Repeated native OCR resume regression requires the isolated audit installation"
+        }
+        // The same native models and root-owned idle preflight as the closed-balloon test apply.
+        // Blank availability is controlled after real OCR; this does not reproduce a model defect.
+        FixtureTranslationServer().use { server ->
+            nativePipeline(force = Force.RIGHT_VERTICAL_ONE_LINE, server = server, forcedOcrCalls = 2) {
+                    pipeline,
+                    ocr,
+                ->
+                val input = InstrumentationRegistry.getInstrumentation().context.assets
+                    .open("native-quality/vertical-punctuation.png").use { it.readBytes() }
+                val inputHash = MessageDigest.getInstance("SHA-256").digest(input)
+                    .joinToString("") { "%02x".format(it.toInt() and 255) }
+                assertEquals("281ffb1cc92aa692bddf6ea1429ecbb32a3ea6cfc974c09329154abd628010f3", inputHash)
+                val original = requireNotNull(BitmapFactory.decodeByteArray(input, 0, input.size))
+                val originalHash = digest(original)
+                var first: PageResult.Partial? = null
+                var stillPending: PageResult.Partial? = null
+                var finished: PageResult.Translated? = null
+                var borrowedMask: Bitmap? = null
+                try {
+                    val partial = partial(pipeline.translatePage(original))
+                    first = partial
+                    val before = requireNotNull(partial.analysis.progress)
+                    assertEquals(2, before.regions.size)
+                    val completed = before.regions.single { it.state == RegionState.TRANSLATED }
+                    val pending = before.regions.single { it.state == RegionState.OCR_PENDING }
+                    assertEquals("少し待って、ください。", source(completed))
+                    assertEquals(listOf("「明日もよろしく", ""), pending.lines.map { it.text })
+                    assertEquals(1, pending.lines.count { it.text.isBlank() && !it.intentionallyKept })
+                    assertEquals(listOf(pending.id), before.pendingRegionIds)
+                    val forcedQuad = requireNotNull(ocr.forcedQuad)
+                    assertEquals(forcedQuad, pending.lines.single { it.text.isBlank() }.quad)
+                    assertEquals(1, ocr.calls)
+                    assertEquals(1, server.requests.size)
+                    assertEquals(listOf(source(completed)), texts(server.requests.single()))
+                    val firstPixelsHash = digest(partial.page)
+                    val firstMaskHash = digest(partial.analysis.mask)
+                    assertFalse(original.sameAs(partial.page))
+                    assertTrue(maskedPixels(partial.analysis.mask, pending) > 0)
+
+                    val payload = OcrProgressCodec.encode(before)
+                    val restored = OcrProgressCodec.decode(payload, original.width, original.height)
+                    val mask = requireNotNull(partial.analysis.mask.copy(Bitmap.Config.ARGB_8888, false))
+                    borrowedMask = mask
+                    val borrowedMaskHash = digest(mask)
+                    val borrowed = PageAnalysis(mask, restored.toTextRegions(), restored)
+                    val unresolved = partial(pipeline.resumePage(original, borrowed))
+                    stillPending = unresolved
+                    val middle = requireNotNull(unresolved.analysis.progress)
+                    assertEquals(
+                        "The explicit retry must retain the same pending group and readable lines",
+                        before,
+                        middle,
+                    )
+                    assertEquals(listOf(pending.id), middle.pendingRegionIds)
+                    assertEquals(completed, middle.regions[completed.id])
+                    assertEquals(2, ocr.calls)
+                    assertEquals(listOf(forcedQuad), ocr.lastInputQuads)
+                    assertEquals("No newly complete group means no additional LLM request", 1, server.requests.size)
+                    assertEquals(firstPixelsHash, digest(unresolved.page))
+                    assertEquals(firstMaskHash, digest(unresolved.analysis.mask))
+                    assertEquals(originalHash, digest(original))
+                    assertEquals(borrowedMaskHash, digest(mask))
+                    assertFalse(mask.isRecycled)
+                    assertNotSame(mask, unresolved.analysis.mask)
+                    assertEquals(payload, OcrProgressCodec.encode(requireNotNull(borrowed.progress)))
+                    val middlePixelsHash = digest(unresolved.page)
+                    val middleMaskHash = digest(unresolved.analysis.mask)
+                    val middlePayload = OcrProgressCodec.encode(middle)
+
+                    val translated = translated(pipeline.resumePage(original, unresolved.analysis))
+                    finished = translated
+                    val after = requireNotNull(translated.analysis?.progress)
+                    assertFalse(after.hasPending)
+                    assertEquals(before.regions.map { it.id }, after.regions.map { it.id })
+                    assertEquals(completed, after.regions[completed.id])
+                    val resolved = after.regions[pending.id]
+                    assertEquals(RegionState.TRANSLATED, resolved.state)
+                    assertEquals("「明日もよろしくお願いします。」", source(resolved))
+                    assertEquals(
+                        pending.copy(
+                            state = resolved.state,
+                            lines = resolved.lines,
+                            translatedText = resolved.translatedText,
+                        ),
+                        resolved,
+                    )
+                    assertEquals(3, ocr.calls)
+                    assertEquals(listOf(forcedQuad), ocr.lastInputQuads)
+                    assertEquals(2, server.requests.size)
+                    assertEquals(listOf(source(resolved)), texts(server.requests.last()))
+                    assertEquals(1, JSONArray(server.requests.last()).length())
+                    assertEquals(1, JSONArray(server.requests.last()).getJSONObject(0).getInt("id"))
+                    assertEquals(originalHash, digest(original))
+                    assertEquals(firstPixelsHash, digest(partial.page))
+                    assertEquals(firstMaskHash, digest(partial.analysis.mask))
+                    assertEquals(middlePixelsHash, digest(unresolved.page))
+                    assertEquals(middleMaskHash, digest(unresolved.analysis.mask))
+                    assertEquals(middleMaskHash, digest(requireNotNull(translated.analysis).mask))
+                    assertNotSame(unresolved.analysis.mask, requireNotNull(translated.analysis).mask)
+                    assertEquals(borrowedMaskHash, digest(mask))
+                    assertFalse(mask.isRecycled)
+                    assertFalse(unresolved.analysis.mask.isRecycled)
+                    assertEquals(payload, OcrProgressCodec.encode(requireNotNull(partial.analysis.progress)))
+                    assertEquals(middlePayload, OcrProgressCodec.encode(requireNotNull(unresolved.analysis.progress)))
+                    assertNull(server.failure)
+                } finally {
+                    release(first)
+                    release(stillPending)
+                    release(finished)
+                    borrowedMask?.recycle()
+                    original.recycle()
+                }
+                assertTrue(requireNotNull(first).page.isRecycled)
+                assertTrue(requireNotNull(first).analysis.mask.isRecycled)
+                assertTrue(requireNotNull(stillPending).page.isRecycled)
+                assertTrue(requireNotNull(stillPending).analysis.mask.isRecycled)
+                assertTrue(requireNotNull(finished).page.isRecycled)
+                assertTrue(requireNotNull(requireNotNull(finished).analysis).mask.isRecycled)
+                assertTrue(requireNotNull(borrowedMask).isRecycled)
+                assertTrue(original.isRecycled)
+                InstrumentationRegistry.getInstrumentation().sendStatus(
+                    2,
+                    Bundle().apply {
+                        putString(
+                            "repeatedMissingColumnEvidence",
+                            JSONObject()
+                                .put("realNativeOcr", true).put("forcedBlankRecognizerCalls", 2)
+                                .put("recognizerCalls", ocr.calls).put("nativeForwardCallsMeasured", false)
+                                .put("scriptedLoopbackHttp", true).put("realExternalServer", false)
+                                .put("actualReaderActivity", false).put("pendingRegionCountAfterFirstResume", 1)
+                                .put("middleResumeRequests", 0).put("logicalHttpBatches", server.requests.size)
+                                .put("queryCounts", JSONArray(server.requests.map { JSONArray(it).length() }))
+                                .put("originalPixelsUnchanged", true).put("borrowedMasksUnchanged", true)
+                                .put("earlierTargetsAndGeometryUnchanged", true)
+                                .put("finalCompletion", true).put("finalPageResult", "TRANSLATED")
+                                .put("completionScope", "engine progress; no persisted completion marker")
+                                .put("ownedDirectoryPrefixes", JSONArray()).put("ownedFilesCreated", 0)
+                                .put("ownedResultBitmapsRecycled", true).put("modelFailureReproduced", false)
+                                .toString(),
+                        )
+                    },
+                )
             }
         }
     }
@@ -1383,6 +1535,7 @@ class PartialOcrIntegrationTest {
         force: Force = Force.ONE_LINE,
         server: FixtureTranslationServer? = null,
         translator: Translator? = null,
+        forcedOcrCalls: Int = 1,
         block: suspend (Pipeline, ForcedFirstOcr) -> Unit,
     ) {
         assertTrue("Native OCR requires an ARM64 process", Process.is64Bit())
@@ -1397,7 +1550,7 @@ class PartialOcrIntegrationTest {
         Detector(model("dbnet_detect")).use { detector ->
             Ocr(model("ocr_48px_ctc"), alphabet).use { nativeOcr ->
                 Inpainter(model("mit_aot_fixed512"), InpainterConfig(method = "boxfill")).use { inpainter ->
-                    val ocr = ForcedFirstOcr(nativeOcr, force)
+                    val ocr = ForcedFirstOcr(nativeOcr, force, forcedOcrCalls)
                     val activeTranslator = translator ?: LlmTranslator(
                         "",
                         TranslatorConfig(
@@ -1410,15 +1563,19 @@ class PartialOcrIntegrationTest {
                             sampleTarget = "",
                         ),
                     )
-                    val pipeline = Pipeline(
-                        detector,
-                        ocr,
-                        activeTranslator,
-                        inpainter,
-                        EngineConfig(render = RenderConfig(orientation = TextOrientation.HORIZONTAL)),
-                    )
-                    pipeline.warmUp()
-                    block(pipeline, ocr)
+                    try {
+                        val pipeline = Pipeline(
+                            detector,
+                            ocr,
+                            activeTranslator,
+                            inpainter,
+                            EngineConfig(render = RenderConfig(orientation = TextOrientation.HORIZONTAL)),
+                        )
+                        pipeline.warmUp()
+                        block(pipeline, ocr)
+                    } finally {
+                        if (translator == null) (activeTranslator as LlmTranslator).close()
+                    }
                 }
             }
         }
@@ -1427,7 +1584,15 @@ class PartialOcrIntegrationTest {
     private enum class Force { NONE, ONE_LINE, ALL, RIGHT_VERTICAL_ONE_LINE }
 
     /** Deliberately controls only OCR availability; all recognized text comes from the real model. */
-    private class ForcedFirstOcr(private val native: Ocr, private val force: Force) : OcrRecognizer {
+    private class ForcedFirstOcr(
+        private val native: Ocr,
+        private val force: Force,
+        private val forcedOcrCalls: Int = 1,
+    ) : OcrRecognizer {
+        init {
+            require(forcedOcrCalls == 1 || (forcedOcrCalls == 2 && force == Force.RIGHT_VERTICAL_ONE_LINE))
+        }
+
         override val intentionalFilterContext get() = native.intentionalFilterContext
         var calls = 0
             private set
@@ -1464,6 +1629,12 @@ class PartialOcrIntegrationTest {
                     forcedQuad = missing.quad.toList()
                     missing.text = ""
                 }
+            } else if (calls <= forcedOcrCalls) {
+                val missing = lines.single()
+                check(missing.quad == requireNotNull(forcedQuad)) {
+                    "Repeated blank must target only the original missing column"
+                }
+                missing.text = ""
             }
             return ignored
         }

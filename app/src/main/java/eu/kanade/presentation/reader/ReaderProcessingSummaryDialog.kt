@@ -91,6 +91,32 @@ fun ReaderProcessingSummaryDialog(
                             ),
                         )
                         Text(stringResource(MR.strings.reader_processing_record_pending_regions, counts.pendingRegions))
+                        if (details.outcome.reason == PageProcessingReason.PARTIAL && counts.pendingRegions > 0) {
+                            val pendingOcr = details.outcome.pendingOcr
+                            if (pendingOcr != null) {
+                                Text(
+                                    stringResource(
+                                        MR.strings.reader_processing_record_unrecognized_lines,
+                                        pendingOcr.unrecognizedLines,
+                                    ),
+                                )
+                                Text(
+                                    stringResource(
+                                        MR.strings.reader_processing_record_held_recognized_lines,
+                                        pendingOcr.heldRecognizedLines,
+                                    ),
+                                )
+                            } else {
+                                Text(
+                                    text = stringResource(MR.strings.reader_processing_record_pending_ocr_unavailable),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Text(
+                                text = stringResource(MR.strings.reader_processing_record_pending_ocr_explanation),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
                     }
                 }
             }

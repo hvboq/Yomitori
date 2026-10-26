@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.data.translation.OcrProgressCodec
 import eu.kanade.tachiyomi.data.translation.OriginalMaterial
 import eu.kanade.tachiyomi.data.translation.PageProcessingCounts
 import eu.kanade.tachiyomi.data.translation.PageProcessingDetails
+import eu.kanade.tachiyomi.data.translation.PageProcessingPendingOcr
 import eu.kanade.tachiyomi.data.translation.PageProcessingReason
 import eu.kanade.tachiyomi.data.translation.PageProcessingSummaryCodec
 import eu.kanade.tachiyomi.data.translation.PageTranslator
@@ -316,8 +317,24 @@ class PageProcessingSummaryIntegrationTest {
 
     @Test(timeout = 30_000)
     fun resumedRecordUsesFinalPageCountsAndPreservesAnEarlierSuccessfulTarget(): Unit = runBlocking {
-        val first = progress(RegionState.TRANSLATED, RegionState.OCR_PENDING)
-        val final = progress(RegionState.TRANSLATED, RegionState.TRANSLATED)
+        val initial = progress(RegionState.TRANSLATED, RegionState.OCR_PENDING)
+        val unread = initial.regions[1].lines.single()
+        val first = initial.copy(
+            regions = listOf(
+                initial.regions[0],
+                initial.regions[1].copy(lines = listOf(unread, unread.copy(text = "neutral held source"))),
+            ),
+        )
+        val final = first.copy(
+            regions = listOf(
+                first.regions[0],
+                first.regions[1].copy(
+                    state = RegionState.TRANSLATED,
+                    lines = listOf(unread.copy(text = "neutral recognized source"), first.regions[1].lines[1]),
+                    translatedText = "neutral target 1",
+                ),
+            ),
+        )
         withFixture(ScriptedEngine(Kind.PARTIAL, first, final)) { fixture ->
             val partialOutcome = fixture.translateDetailed()
             assertEquals(PageTranslator.SinglePageResult.PARTIAL, partialOutcome.result)
@@ -328,8 +345,13 @@ class PageProcessingSummaryIntegrationTest {
             assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
             val partial = requireNotNull(fixture.readWithoutMutation())
             assertEquals(PageProcessingReason.PARTIAL, partial.outcome.reason)
-            assertEquals(PageProcessingCounts(2, 2, 0, 0, 0, 1, 1), partial.outcome.counts)
+            assertEquals(PageProcessingCounts(3, 2, 0, 0, 0, 1, 1), partial.outcome.counts)
+            assertEquals(PageProcessingPendingOcr(1, 1), partial.outcome.pendingOcr)
             val partialSummary = fixture.summary.readBytes()
+            val partialRecord = requireNotNull(PageProcessingSummaryCodec.decode(partialSummary))
+            assertEquals(pending.original.sha256, partialRecord.binding.sourceSha256)
+            assertEquals(pending.outputSha256, partialRecord.binding.displaySha256)
+            assertEquals(pending.revision, partialRecord.binding.journalRevision)
             val completedOutcome = fixture.translateDetailed()
             assertEquals(PageTranslator.SinglePageResult.TRANSLATED, completedOutcome.result)
             assertNull(completedOutcome.failureCode)
@@ -342,7 +364,8 @@ class PageProcessingSummaryIntegrationTest {
             assertArrayEquals(fixture.initialBytes, fixture.original.readBytes())
             val details = requireNotNull(fixture.readWithoutMutation())
             assertEquals(PageProcessingReason.TRANSLATED, details.outcome.reason)
-            assertEquals(PageProcessingCounts(2, 2, 0, 0, 0, 2, 0), details.outcome.counts)
+            assertEquals(PageProcessingCounts(3, 2, 0, 0, 0, 2, 0), details.outcome.counts)
+            assertNull(details.outcome.pendingOcr)
             assertFalse(partialSummary.contentEquals(fixture.summary.readBytes()))
             assertTrue(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
             assertEquals(1, fixture.engine.freshCalls)

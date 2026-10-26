@@ -48,10 +48,133 @@ class PageProcessingSummaryTest {
             region(3, RegionState.OCR_PENDING),
         )
         outcome(progress(*regions), 4) shouldBe
-            PageProcessingOutcome(PageProcessingReason.PARTIAL, PageProcessingCounts(4, 4, 1, 1, 1, 1, 1))
+            PageProcessingOutcome(
+                PageProcessingReason.PARTIAL,
+                PageProcessingCounts(4, 4, 1, 1, 1, 1, 1),
+                PageProcessingPendingOcr(1, 0),
+            )
         outcome(progress(*regions.take(3).toTypedArray()), 3) shouldBe
             PageProcessingOutcome(PageProcessingReason.TRANSLATED, PageProcessingCounts(3, 3, 1, 1, 1, 1, 0))
         outcome(progress(region(0, RegionState.TRANSLATED)), null).counts?.detectedLines shouldBe null
+    }
+
+    @Test
+    fun `pending OCR observations count unread and held lines without including intentional exclusions`() {
+        val pending = mixedPendingProgress()
+        val result = outcome(pending, 7)
+        result shouldBe PageProcessingOutcome(
+            PageProcessingReason.PARTIAL,
+            PageProcessingCounts(7, 3, 3, 1, 0, 1, 1),
+            PageProcessingPendingOcr(2, 1),
+        )
+        outcome(pending, null).pendingOcr shouldBe PageProcessingPendingOcr(2, 1)
+        val saved = record(result)
+        val bytes = PageProcessingSummaryCodec.encode(saved)
+        PageProcessingSummaryCodec.decode(bytes) shouldBe saved
+        val envelope = Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject
+        envelope["schemaVersion"] shouldBe JsonPrimitive(2)
+        for (text in listOf("private source", "private target", "already recognized", "intentionally excluded")) {
+            bytes.toString(Charsets.UTF_8).contains(text) shouldBe false
+        }
+        PageProcessingPendingOcr::class.java.declaredFields.filterNot { Modifier.isStatic(it.modifiers) }
+            .map { it.name }.toSet() shouldBe setOf("unrecognizedLines", "heldRecognizedLines")
+    }
+
+    @Test
+    fun `v1 canonical snapshots retain an unknown breakdown and exact read only page binding`() {
+        // Fixed v1 bytes and digest are independent of the current writer and its defaults.
+        val bytes = LEGACY_PARTIAL_V1.toByteArray(Charsets.UTF_8)
+        digest(bytes) shouldBe "ecbbcb4a8e25d7f0159d8aa9b4c76eb40c9d851a22239a178aedc9418e1ef3af"
+        val saved = record(
+            PageProcessingOutcome(PageProcessingReason.PARTIAL, PageProcessingCounts(2, 2, 0, 0, 0, 1, 1)),
+        )
+        PageProcessingSummaryCodec.decode(bytes) shouldBe saved
+        saved.outcome.pendingOcr shouldBe null
+        val files = mutableMapOf(PageProcessingSummaryCodec.exactName(PAGE_NAME) to bytes)
+        val store = store(files)
+        repeat(2) { store.read(PAGE_NAME, binding()) shouldBe saved }
+        val mismatches = listOf(
+            binding().copy(sourceSha256 = "9".repeat(64)),
+            binding().copy(displaySha256 = "9".repeat(64)),
+            binding().copy(journalRevision = "22222222-2222-2222-2222-222222222222"),
+            binding().copy(sourceTokenSha256 = "9".repeat(64)),
+            binding().copy(contextSha256 = "9".repeat(64)),
+        )
+        for (mismatch in mismatches) {
+            store.read(PAGE_NAME, mismatch) shouldBe null
+        }
+        files.keys shouldBe setOf(PageProcessingSummaryCodec.exactName(PAGE_NAME))
+        files.getValue(PageProcessingSummaryCodec.exactName(PAGE_NAME)).contentEquals(bytes) shouldBe true
+        PageProcessingSummaryCodec.decode(" $LEGACY_PARTIAL_V1".toByteArray()) shouldBe null
+        PageProcessingSummaryCodec.decode(
+            LEGACY_PARTIAL_V1.replace("063f7c2c", "163f7c2c").toByteArray(),
+        ) shouldBe null
+        PageProcessingSummaryCodec.decode(
+            resign(bytes) { legacy ->
+                nested(legacy, "outcome") { oldOutcome ->
+                    nested(oldOutcome, "counts") { it["pendingRegions"] = JsonPrimitive(0) }
+                }
+            },
+        ) shouldBe null
+        PageProcessingSummaryCodec.decode(
+            resign(bytes) { legacy ->
+                nested(legacy, "outcome") { it["pendingOcr"] = JsonPrimitive("invented") }
+            },
+        ) shouldBe null
+        val current = PageProcessingSummaryCodec.encode(saved)
+        (current.contentEquals(bytes)) shouldBe false
+        PageProcessingSummaryCodec.decode(current) shouldBe saved
+    }
+
+    @Test
+    fun `pending OCR observations reject impossible or freeform counters even with valid checksums`() {
+        val saved = record(outcome(mixedPendingProgress(), 7))
+        val bytes = PageProcessingSummaryCodec.encode(saved)
+        val invalid: List<Pair<String, JsonPrimitive>> = listOf(
+            "unrecognizedLines" to JsonPrimitive(-1),
+            "unrecognizedLines" to JsonPrimitive(0),
+            "unrecognizedLines" to JsonPrimitive(MAX_SUMMARY_LINES + 1),
+            "heldRecognizedLines" to JsonPrimitive(-1),
+            "heldRecognizedLines" to JsonPrimitive(2),
+            "heldRecognizedLines" to JsonPrimitive(MAX_SUMMARY_LINES + 1),
+            "cause" to JsonPrimitive("private server response"),
+        )
+        for ((field, value) in invalid) {
+            withClue("pending field $field value $value") {
+                PageProcessingSummaryCodec.decode(
+                    resign(bytes) { record ->
+                        nested(record, "outcome") { result ->
+                            nested(result, "pendingOcr") { it[field] = value }
+                        }
+                    },
+                ) shouldBe null
+            }
+        }
+        val noLineTotal = saved.copy(
+            outcome = saved.outcome.copy(counts = saved.outcome.counts!!.copy(detectedLines = null)),
+        )
+        shouldThrow<IllegalArgumentException> {
+            PageProcessingSummaryCodec.encode(
+                noLineTotal.copy(
+                    outcome = noLineTotal.outcome.copy(pendingOcr = PageProcessingPendingOcr(MAX_SUMMARY_LINES, 1)),
+                ),
+            )
+        }
+        shouldThrow<IllegalArgumentException> {
+            PageProcessingSummaryCodec.encode(
+                noLineTotal.copy(
+                    outcome = noLineTotal.outcome.copy(pendingOcr = PageProcessingPendingOcr(MAX_SUMMARY_LINES, 0)),
+                ),
+            )
+        }
+        shouldThrow<IllegalArgumentException> {
+            val notPending = record().outcome.copy(pendingOcr = PageProcessingPendingOcr(1, 0))
+            PageProcessingSummaryCodec.encode(record(notPending))
+        }
+        val unknown = record(
+            PageProcessingOutcome(PageProcessingReason.UNKNOWN, pendingOcr = PageProcessingPendingOcr(1, 0)),
+        )
+        shouldThrow<IllegalArgumentException> { PageProcessingSummaryCodec.encode(unknown) }
     }
 
     @Test
@@ -97,7 +220,7 @@ class PageProcessingSummaryTest {
         }
         PageProcessingOutcome::class.java.declaredFields.filterNot { Modifier.isStatic(it.modifiers) }
             .map { it.name }.toSet() shouldBe
-            setOf("reason", "counts")
+            setOf("reason", "counts", "pendingOcr")
         (bytes.size < PageProcessingSummaryCodec.MAX_BYTES) shouldBe true
         PageProcessingSummaryCodec.decode(bytes) shouldBe record(result)
         val unknown = record(PageProcessingOutcome(PageProcessingReason.UNKNOWN))
@@ -144,7 +267,7 @@ class PageProcessingSummaryTest {
         PageProcessingSummaryCodec.decode("[]".toByteArray()) shouldBe null
         PageProcessingSummaryCodec.decode("null".toByteArray()) shouldBe null
         PageProcessingSummaryCodec.decode(
-            text.replace("\"schemaVersion\":1", "\"schemaVersion\":2").toByteArray(),
+            text.replace("\"schemaVersion\":2", "\"schemaVersion\":3").toByteArray(),
         ) shouldBe null
     }
 
@@ -304,6 +427,24 @@ class PageProcessingSummaryTest {
 
     private fun progress(vararg regions: RegionProgress) = PageProgress(100, 100, regions.toList())
 
+    private fun mixedPendingProgress(): PageProgress {
+        val unread = region(1, RegionState.OCR_PENDING)
+        val line = unread.lines.single()
+        return progress(
+            region(0, RegionState.TRANSLATED),
+            unread.copy(
+                lines = listOf(
+                    line,
+                    line.copy(text = " \n"),
+                    line.copy(text = "already recognized"),
+                    line.copy(intentionallyKept = true),
+                    line.copy(text = "intentionally excluded", intentionallyKept = true),
+                ),
+            ),
+            region(2, RegionState.INTENTIONALLY_KEPT, policyKept = true),
+        )
+    }
+
     private fun region(id: Int, state: RegionState, policyKept: Boolean = false, text: String = "private source") =
         RegionProgress(
             id = id,
@@ -361,5 +502,18 @@ class PageProcessingSummaryTest {
 
     private companion object {
         const val PAGE_NAME = "private-page.001.png"
+        const val LEGACY_PARTIAL_V1 =
+            "{\"schemaVersion\":1,\"record\":{\"binding\":{\"pageNameSha256\":" +
+                "\"8980eba6cb7f7edea5de67a8beffe792461a7d555b962f110d14f5fede4e92c9\",\"sourceSha256\":" +
+                "\"1111111111111111111111111111111111111111111111111111111111111111\",\"displaySha256\":" +
+                "\"2222222222222222222222222222222222222222222222222222222222222222\",\"sourceTokenSha256\":" +
+                "\"3333333333333333333333333333333333333333333333333333333333333333\",\"journalRevision\":" +
+                "\"11111111-1111-1111-1111-111111111111\",\"contextSha256\":" +
+                "\"4444444444444444444444444444444444444444444444444444444444444444\"},\"outcome\":{\"reason\":" +
+                "\"PARTIAL\",\"counts\":{\"detectedLines\":2,\"regions\":2,\"ocrPolicyKeptLines\":0," +
+                "\"ocrPolicyKeptRegions\":0,\"responseFilteredRegions\":0,\"translatedRegions\":1," +
+                "\"pendingRegions\":1}}," +
+                "\"recordedAtEpochMs\":1700000000000},\"checksumSha256\":" +
+                "\"063f7c2cd434bc8529a7cecd51350501eb46a0af78eb95488ce93d9cdef06896\"}"
     }
 }

@@ -25,7 +25,10 @@ import dev.icerock.moko.resources.StringResource
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.translation.CompletionManifestCodec
 import eu.kanade.tachiyomi.data.translation.PageProcessingDetails
+import eu.kanade.tachiyomi.data.translation.PageProcessingOutcome
+import eu.kanade.tachiyomi.data.translation.PageProcessingPendingOcr
 import eu.kanade.tachiyomi.data.translation.PageProcessingReason
+import eu.kanade.tachiyomi.data.translation.PageProcessingSummaryCodec
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.TranslationBusy
 import eu.kanade.tachiyomi.data.translation.TranslationCache
@@ -54,8 +57,20 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
+import li.joye.yakuyomi.engine.OcrLineProgress
 import li.joye.yakuyomi.engine.PageAnalysis
 import li.joye.yakuyomi.engine.PageProgress
+import li.joye.yakuyomi.engine.PageResult
+import li.joye.yakuyomi.engine.PageStats
+import li.joye.yakuyomi.engine.Pt
+import li.joye.yakuyomi.engine.RegionProgress
+import li.joye.yakuyomi.engine.RegionState
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -138,6 +153,64 @@ class ProcessingSummaryReaderUiTest {
                 fileHashes(fixture.file),
             )
         }
+    }
+
+    @Test(timeout = 120_000)
+    fun pendingOcrBreakdownAndLegacyUnknownUseTheRealPageMenuWithoutInference(): Unit = runBlocking {
+        withFixture(archive = false) { fixture ->
+            val expected = fixture.preparePartialOcrPages()
+            val before = fileHashes(fixture.file)
+            ActivityScenario.launch<ReaderActivity>(fixture.intent()).use { scenario ->
+                val pages = ready(scenario, archive = false)
+                for (index in pages.indices) {
+                    openPageActions(scenario, pages[index])
+                    click(MR.strings.reader_processing_record)
+                    val details = checkNotNull(awaitSummary(scenario).details)
+                    assertEquals(expected[index], details)
+                    assertEquals(PageProcessingReason.PARTIAL, details.outcome.reason)
+                    assertLabel(MR.strings.reader_processing_record_partial)
+                    if (index == 0) {
+                        assertEquals(PageProcessingPendingOcr(2, 1), details.outcome.pendingOcr)
+                        assertLabelText(
+                            context.stringResource(MR.strings.reader_processing_record_unrecognized_lines, 2),
+                        )
+                        assertLabelText(
+                            context.stringResource(MR.strings.reader_processing_record_held_recognized_lines, 1),
+                        )
+                    } else {
+                        assertNull("A v1 record has no observed OCR line breakdown", details.outcome.pendingOcr)
+                        val unavailable = context.stringResource(
+                            MR.strings.reader_processing_record_pending_ocr_unavailable,
+                        )
+                        val zeroLabels = listOf(
+                            context.stringResource(MR.strings.reader_processing_record_unrecognized_lines, 0),
+                            context.stringResource(MR.strings.reader_processing_record_held_recognized_lines, 0),
+                        )
+                        for (zero in zeroLabels) {
+                            checkOnlineReaderAction(context.packageName, unavailable, zero, false, beforeClick = {})
+                        }
+                    }
+                    assertLabel(MR.strings.reader_processing_record_pending_ocr_explanation)
+                    click(MR.strings.action_ok)
+                    awaitNoDialog(scenario)
+                }
+            }
+            assertEquals(
+                "Reading partial diagnostics must not rewrite any fixture file",
+                before,
+                fileHashes(fixture.file),
+            )
+        }
+        emitOnlineReaderFlow(
+            "pendingOcrReaderUiEvidence",
+            JSONObject().put("passed", true).put("actualPageMenu", true)
+                .put("knownUnrecognizedLines", 2).put("knownHeldRecognizedLines", 1)
+                .put("legacyV1RecordRead", true).put("legacyBreakdownAbsent", true)
+                .put("legacyZeroCountsNotShown", true).put("filesUnchanged", true)
+                .put("scriptedOptionalRecordsSeeded", true)
+                .put("inferenceStarted", false).put("serverRequests", 0)
+                .put("settingsAndFixtureCleanupVerified", true).put("rawPreferencesRequireIndependentHostCheck", true),
+        )
     }
 
     @Test(timeout = 120_000)
@@ -389,6 +462,112 @@ class ProcessingSummaryReaderUiTest {
             assertTrue(translator.isPageTranslated(directory, "002.png"))
             assertNull(translator.getPageProcessingDetails(directory, "002.png"))
             return details
+        }
+
+        suspend fun preparePartialOcrPages(): List<PageProcessingDetails> {
+            val directory = checkNotNull(UniFile.fromFile(file))
+            val translator = PageTranslator(context)
+            for (name in listOf("001.png", "002.png")) {
+                val source = image()
+                val output = image()
+                val mask = Bitmap.createBitmap(WIDTH, HEIGHT, Bitmap.Config.ALPHA_8)
+                val quad = listOf(Pt(0f, 0f), Pt(16f, 0f), Pt(16f, 16f), Pt(0f, 16f))
+                fun line(text: String) = OcrLineProgress(quad, 1f, "h", text)
+                val progress = PageProgress(
+                    WIDTH,
+                    HEIGHT,
+                    listOf(
+                        RegionProgress(
+                            0,
+                            RegionState.TRANSLATED,
+                            listOf(line("neutral recognized source")),
+                            "h",
+                            translatedText = "neutral saved target",
+                        ),
+                        RegionProgress(
+                            1,
+                            RegionState.OCR_PENDING,
+                            listOf(line(""), line(" "), line("neutral held line")),
+                            "h",
+                        ),
+                    ),
+                ).also { it.validateFor(WIDTH, HEIGHT) }
+                val partial = PageResult.Partial(
+                    output,
+                    PageStats(
+                        progress.regions.sumOf { it.lines.size },
+                        progress.regions.size,
+                        progress.regions.count { it.state == RegionState.TRANSLATED },
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                    PageAnalysis(mask, progress.toTextRegions(), progress),
+                )
+                try {
+                    assertEquals(4, partial.stats.lines)
+                    assertTrue(
+                        translator.persistLivePage(
+                            directory,
+                            checkNotNull(UniFile.fromFile(File(file, name))),
+                            source,
+                            partial.page,
+                            partial.analysis,
+                            "boxfill",
+                        ),
+                    )
+                    // persistLivePage is a compatibility API with zero statistics, so its
+                    // nonempty diagnostic correctly stays UNKNOWN. This UI-only fixture seeds
+                    // the optional record from explicit scripted stats, retaining the real
+                    // page/original/journal binding and the codec's canonical checksum. Actual
+                    // Detailed-result persistence is covered by the separate storage regression.
+                    val summary = File(File(file, ".yakuyomi"), PageProcessingSummaryCodec.exactName(name))
+                    val stored = checkNotNull(PageProcessingSummaryCodec.decode(summary.readBytes()))
+                    assertEquals(PageProcessingReason.UNKNOWN, stored.outcome.reason)
+                    val seeded = stored.copy(
+                        outcome = PageProcessingOutcome.fromProgress(partial.analysis.progress, partial.stats.lines),
+                    )
+                    assertEquals(PageProcessingReason.PARTIAL, seeded.outcome.reason)
+                    summary.writeBytes(PageProcessingSummaryCodec.encode(seeded))
+                    assertEquals(
+                        stored.binding,
+                        checkNotNull(PageProcessingSummaryCodec.decode(summary.readBytes())).binding,
+                    )
+                } finally {
+                    source.recycle()
+                    output.recycle()
+                    mask.recycle()
+                }
+                val details = checkNotNull(translator.getPageProcessingDetails(directory, name))
+                assertEquals(PageProcessingReason.PARTIAL, details.outcome.reason)
+                assertEquals(PageProcessingPendingOcr(2, 1), details.outcome.pendingOcr)
+                assertEquals(1, checkNotNull(details.outcome.counts).pendingRegions)
+                assertFalse(
+                    "A partial result cannot authorize page completion",
+                    translator.isPageTranslated(directory, name),
+                )
+            }
+            // Keep the actual page/journal bindings, but use the frozen v1 outcome fields/checksum.
+            val legacyFile = File(File(file, ".yakuyomi"), PageProcessingSummaryCodec.exactName("002.png"))
+            val current = Json.parseToJsonElement(legacyFile.readText()).jsonObject
+            val record = current.getValue("record").jsonObject
+            val legacyOutcome = JsonObject(record.getValue("outcome").jsonObject - "pendingOcr")
+            val legacyRecord = JsonObject(record + ("outcome" to legacyOutcome))
+            val legacyBytes = buildJsonObject {
+                put("schemaVersion", 1)
+                put("record", legacyRecord)
+                put("checksumSha256", sha(legacyRecord.toString().toByteArray(Charsets.UTF_8)))
+            }.toString().toByteArray(Charsets.UTF_8)
+            assertNull(checkNotNull(PageProcessingSummaryCodec.decode(legacyBytes)).outcome.pendingOcr)
+            legacyFile.writeBytes(legacyBytes)
+            return listOf("001.png", "002.png").map { name ->
+                checkNotNull(translator.getPageProcessingDetails(directory, name))
+            }.also {
+                assertEquals(PageProcessingPendingOcr(2, 1), it[0].outcome.pendingOcr)
+                assertNull(it[1].outcome.pendingOcr)
+            }
         }
     }
 
