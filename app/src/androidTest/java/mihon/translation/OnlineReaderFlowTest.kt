@@ -18,6 +18,7 @@ import eu.kanade.tachiyomi.data.translation.model.TranslationItem
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.ReaderActivity
 import eu.kanade.tachiyomi.ui.reader.loader.HttpPageLoader
+import eu.kanade.tachiyomi.ui.reader.loader.OnlineTranslatedPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.TranslatingPageLoader
 import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
 import kotlinx.coroutines.NonCancellable
@@ -195,7 +196,7 @@ class OnlineReaderFlowTest {
                                     waitFor(60000) {
                                         checkBackgroundFailure()
                                         activity.viewModel.state.value.viewerChapters?.currChapter?.let {
-                                            it.pageLoader is HttpPageLoader && it.pages?.size == 2 &&
+                                            it.pageLoader is OnlineTranslatedPageLoader && it.pages?.size == 2 &&
                                                 it.pages!!.all { page -> page.status == Page.State.Ready }
                                         } == true
                                     }
@@ -226,7 +227,7 @@ class OnlineReaderFlowTest {
                                     }
                                     assertEquals(2, activity.viewModel.state.value.currentPage)
                                     val loader = activity.viewModel.state.value.viewerChapters!!.currChapter.pageLoader
-                                    assertTrue(loader is HttpPageLoader)
+                                    assertTrue(loader is OnlineTranslatedPageLoader)
                                     screenshot(output, "02-downloading-page2.png")
                                     server.releaseDownload()
                                 }
@@ -332,6 +333,7 @@ class OnlineReaderFlowTest {
                                     SystemClock.sleep(1500)
                                     val loader = reopened.viewModel.state.value.viewerChapters!!.currChapter.pageLoader
                                     assertFalse(loader is HttpPageLoader)
+                                    assertFalse(loader is OnlineTranslatedPageLoader)
                                     assertTrue(translations.queueState.value.none { it.chapter.id == chapter.id })
                                     assertEquals(0, TranslationBusy.active.value)
                                     assertEquals(1, cache.getTranslatedCount(manga))
@@ -396,7 +398,7 @@ class OnlineReaderFlowTest {
         lateinit var startLabel: String
         lateinit var stopLabel: String
         scenario.onActivity {
-            startLabel = it.stringResource(MR.strings.reader_translate_this_chapter)
+            startLabel = it.stringResource(MR.strings.reader_download_translate_chapter)
             stopLabel = it.stringResource(MR.strings.reader_stop_chapter_translate)
             it.viewModel.openPageDialog(it.viewModel.state.value.viewerChapters!!.currChapter.pages!![1])
         }

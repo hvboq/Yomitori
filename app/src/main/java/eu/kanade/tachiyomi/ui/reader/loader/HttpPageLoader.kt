@@ -19,6 +19,7 @@ import tachiyomi.core.common.util.lang.launchIO
 import tachiyomi.core.common.util.lang.withIOContext
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.InputStream
 import java.util.concurrent.PriorityBlockingQueue
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
@@ -61,6 +62,13 @@ internal class HttpPageLoader(
     }
 
     override var isLocal: Boolean = false
+
+    /** Open the cached network original, never a stream replaced by a display decorator. */
+    fun openOriginalStream(page: ReaderPage): InputStream? {
+        if (isRecycled || page.status != Page.State.Ready) return null
+        val imageUrl = page.imageUrl ?: return null
+        return chapterCache.getImageFile(imageUrl).inputStream()
+    }
 
     /**
      * Returns the page list for a chapter. It tries to return the page list from the local cache,

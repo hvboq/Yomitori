@@ -199,8 +199,9 @@ internal class OnlineReaderFixtureServer(private val pages: List<ByteArray>) : C
                     }
                     return
                 }
-                val imageIndex = Regex("/image/([12])\\.png").matchEntire(path)
-                    ?.groupValues?.get(1)?.toInt()?.minus(1)
+                val imageIndex = Regex("/image/([1-9][0-9]*)\\.png").matchEntire(path)
+                    ?.groupValues?.get(1)?.toIntOrNull()?.minus(1)
+                    ?.takeIf { index -> index in pages.indices }
                 val body: ByteArray
                 val type: String
                 if (path == "/chapter" || path == "/chapter-b") {

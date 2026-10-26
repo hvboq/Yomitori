@@ -74,6 +74,7 @@ import eu.kanade.tachiyomi.data.nightread.NightAvailability
 import eu.kanade.tachiyomi.data.notification.NotificationReceiver
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.databinding.ReaderActivityBinding
+import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.ui.base.activity.BaseActivity
 import eu.kanade.tachiyomi.ui.main.MainActivity
@@ -83,7 +84,9 @@ import eu.kanade.tachiyomi.ui.reader.ReaderViewModel.SetAsCoverResult.Success
 import eu.kanade.tachiyomi.ui.reader.loader.DirectoryPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.DownloadPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.HttpPageLoader
+import eu.kanade.tachiyomi.ui.reader.loader.OnlineTranslatedPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.TranslatingPageLoader
+import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.model.ViewerChapters
@@ -432,7 +435,7 @@ class ReaderActivity : BaseActivity() {
             // 選單開啟時隱藏，避免疊到頂部 app bar 的返回鈕／章名（選單開著時章資訊已在 app bar）；
             // 這是「選單收起」狀態下的常駐進度。Surface 不可點 ⇒ 觸控穿透、不影響點擊切換選單。
             if (!state.menuVisible) {
-                state.liveTranslateProgress?.let { progress ->
+                (state.onlinePageProgress ?: state.liveTranslateProgress)?.let { progress ->
                     ReaderLiveTranslateIndicator(
                         translating = !progress.queued,
                         done = progress.done,
@@ -498,18 +501,21 @@ class ReaderActivity : BaseActivity() {
             }
             is ReaderViewModel.Dialog.PageActions -> {
                 val page = dialog.page
+                val actualPage = (page as? InsertPage)?.parent ?: page
+                val online = actualPage.chapter.pageLoader as? OnlineTranslatedPageLoader
                 // Single-page operations require the exact loose-file URI, including local sources.
                 // Archive entries have no such URI and must use safe whole-chapter translation.
-                val pageOnDisk = page.uri != null &&
+                val pageOnDisk = actualPage.uri != null &&
                     (
                         page.chapter.pageLoader is DownloadPageLoader ||
                             page.chapter.pageLoader is TranslatingPageLoader ||
-                            page.chapter.pageLoader is DirectoryPageLoader
+                            page.chapter.pageLoader is DirectoryPageLoader ||
+                            online?.resolvePage(actualPage) != null
                         )
                 // 夜讀項（日常／夜讀切換已移到常駐懸浮鈕，這裡不再重複）：先過夜讀表層總開關；再要求頁圖在鬆散資料夾
                 // （已下載／即時翻／本機來源目錄章；壓縮檔章、線上章＝UNSUPPORTED）。
                 val nightCapable = nightReadEnabled &&
-                    (pageOnDisk || page.chapter.pageLoader is DirectoryPageLoader) &&
+                    online == null && (pageOnDisk || page.chapter.pageLoader is DirectoryPageLoader) &&
                     state.nightAvailability != NightAvailability.UNSUPPORTED
                 // 「為這一話產生夜讀版」（沒有夜讀版）／「重新產生夜讀版」（只有舊版單檔）：不在夜讀佇列時才給。
                 val nightGenerate = nightCapable && state.nightProgress == null &&
@@ -525,7 +531,8 @@ class ReaderActivity : BaseActivity() {
                 // 只有舊版單檔的章已經由上面的「重新產生夜讀版」涵蓋，這裡只給可切檔位的章。
                 val nightUpdate = nightRegenerate && state.nightOutdated
                 // 線上章（還沒下載）：同樣給「為這一話產生夜讀版」，按了問要不要先下載（ReaderViewModel.requestOnlineChapterNight）
-                val nightOnline = nightReadEnabled && page.chapter.pageLoader is HttpPageLoader &&
+                val onlineChapter = page.chapter.pageLoader is HttpPageLoader || online != null
+                val nightOnline = nightReadEnabled && onlineChapter &&
                     state.nightProgress == null
                 ReaderPageActionsDialog(
                     onDismissRequest = onDismissRequest,
@@ -535,7 +542,12 @@ class ReaderActivity : BaseActivity() {
                     // 只有已下載章（頁圖在磁碟、可能留有重繪素材）才顯示「重繪」鈕；線上/封存頁無素材，不給此選項。
                     onReRender = { viewModel.openReRenderDialog(page) }.takeIf { pageOnDisk },
                     // 「翻譯這頁」：只在已下載章提供（單頁進引擎翻、就地覆蓋）；線上章本里程碑先不給。
-                    onTranslatePage = viewModel::translateThisPage.takeIf { pageOnDisk },
+                    onTranslatePage = viewModel::translateThisPage.takeIf {
+                        pageOnDisk || (online != null && actualPage.status == Page.State.Ready)
+                    },
+                    onStopPageTranslate = viewModel::stopPageTranslate.takeIf { online != null },
+                    isPageTranslating = online != null && actualPage.chapter === state.currentChapter &&
+                        state.onlinePageProgress != null && state.onlinePageIndex == actualPage.index,
                     onToggleOriginal = viewModel::toggleOriginalPreview.takeIf { pageOnDisk },
                     onShowProcessingRecord = viewModel::openPageProcessingRecord.takeIf { pageOnDisk },
                     isOriginalPreview = page.isOriginalPreview,
@@ -543,6 +555,7 @@ class ReaderActivity : BaseActivity() {
                     onStartChapterTranslate = viewModel::startChapterTranslate,
                     onStopChapterTranslate = viewModel::stopChapterTranslate,
                     isChapterTranslating = state.liveTranslateProgress != null || state.translationDownloadPending,
+                    chapterTranslateRequiresDownload = onlineChapter,
                     onStartChapterNightRender = { viewModel.startChapterNightRender() }.takeIf { nightGenerate }
                         ?: viewModel::requestOnlineChapterNight.takeIf { nightOnline },
                     nightLegacy = state.nightAvailability == NightAvailability.LEGACY,

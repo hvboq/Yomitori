@@ -41,6 +41,7 @@ import eu.kanade.tachiyomi.ui.reader.loader.DirectoryPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.DownloadPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.HttpPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.NightPageSource
+import eu.kanade.tachiyomi.ui.reader.loader.OnlineTranslatedPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.TranslatingPageLoader
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
@@ -60,12 +61,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -82,6 +85,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import logcat.LogPriority
 import tachiyomi.core.common.preference.toggle
 import tachiyomi.core.common.util.lang.launchIO
@@ -107,6 +111,8 @@ import tachiyomi.source.local.io.Format
 import tachiyomi.source.local.isLocal
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.getValue
@@ -326,6 +332,24 @@ class ReaderViewModel @JvmOverloads constructor(
     private val translationStopVersions = mutableMapOf<Long, Long>()
     private val pendingTranslationIntentRevision = MutableStateFlow(0L)
 
+    private data class OnlinePageSelection(
+        val page: ReaderPage,
+        val retryVersion: Long = 0L,
+        val refreshVersion: Long = 0L,
+    )
+
+    private val selectedOnlinePage = MutableStateFlow<OnlinePageSelection?>(null)
+    private var onlinePageRetryVersion = 0L
+    private var onlinePageRefreshVersion = 0L
+    private val stoppedOnlinePages = mutableSetOf<Pair<Long, Int>>()
+
+    @Volatile
+    private var activeOnlinePageLoader: OnlineTranslatedPageLoader? = null
+
+    @Volatile
+    private var activeOnlinePageChapter: ReaderChapter? = null
+    private var onlinePageProgressJob: Job? = null
+
     /**
      * 線上章的夜讀（[OnlineNightPrompt]）：[nightDownloadAskedIds]＝這次閱讀已經問過「要先下載嗎？」的章（打開夜讀模式時
      * 每話只問一次）；[nightDownloadRequestedIds]＝已經按了「下載」、還有一條在等它下載完的章（不再問、改提示下載中）。
@@ -350,11 +374,13 @@ class ReaderViewModel @JvmOverloads constructor(
             }
             .launchIn(viewModelScope)
 
+        observeOnlinePageTranslation()
+
         // 即時翻譯「啟動」：只有**正在讀的當前章**（viewerChapters.currChapter）才觸發翻譯——
         // 修「讀第 N 話卻把預取的 N±1 話也自動下載/翻譯」的 bug。預取/相鄰章只 loadChapter（建 loader、載頁），
         // **永不**成為 currChapter，故下面這條永不對它們觸發。每次當前章改變（換章 / 開章）各觸發一次：
         //  - 當前章是「已下載 + 已包 TranslatingPageLoader」→ [TranslatingPageLoader.onActivated] 把整章插隊排入翻譯佇列。
-        //  - 當前章是「線上（未下載）且符合即時翻條件」→ [triggerOnlineLiveTranslate] 下載該章、完成後重載進已下載路徑。
+        // Online translation is driven by selectedOnlinePage, never by loading a chapter.
         // 兩者都冪等（loader 端 enqueued 旗標 / VM 端 onlineTriggeredChapterIds 去重），重複進同一章不會重觸發。
         state.map { it.viewerChapters?.currChapter }
             .distinctUntilChanged()
@@ -555,6 +581,8 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     override fun onCleared() {
+        selectedOnlinePage.value = null
+        activeOnlinePageLoader?.stop()
         val currentChapters = state.value.viewerChapters
         if (currentChapters != null) {
             currentChapters.unref()
@@ -569,6 +597,8 @@ class ReaderViewModel @JvmOverloads constructor(
      * trigger deletion of the downloaded chapters.
      */
     fun onActivityFinish() {
+        selectedOnlinePage.value = null
+        activeOnlinePageLoader?.stop()
         deletePendingChapters()
     }
 
@@ -656,19 +686,10 @@ class ReaderViewModel @JvmOverloads constructor(
         }
     }
 
-    /**
-     * 當「正在讀的當前章」被設為 active（換章 / 開章）時呼叫——即時翻譯的**唯一**觸發點。
-     * **只對 currChapter 觸發**（呼叫端是 init 區塊觀察 `viewerChapters.currChapter` 的 flow）→ 預取/相鄰章
-     * （永不是 currChapter）絕不被觸發，修「讀第 N 話卻自動下載/翻譯 N±1 話」的 bug。
-     *
-     * 兩條路徑（互斥）：
-     *  - 已被包成 [TranslatingPageLoader]（＝已下載 + 符合即時翻條件、見 [ChapterLoader.shouldTranslateLive]）：
-     *    呼叫 [TranslatingPageLoader.onActivated] 把整章插隊排入翻譯佇列（冪等）。
-     *  - 否則為原生 loader（線上未下載 / 不符即時翻的已下載章）：若是**線上**且符合即時翻 gate → 走
-     *    [triggerOnlineLiveTranslate]（下載 + 完成後重載進已下載路徑）。已下載但不符（已翻/分類排除）→ 不做事。
-     */
+    /** Activate whole-chapter work only for stored loaders; HTTP work is selected-page-only. */
     private suspend fun onCurrentChapterActivated(chapter: ReaderChapter) {
         val pageLoader = chapter.pageLoader
+        if (pageLoader is OnlineTranslatedPageLoader) return
         if (pageLoader is TranslatingPageLoader) {
             // 已下載 + 已包裝：整章插隊排入翻譯佇列（冪等；loader 內 enqueued 旗標去重）。
             synchronized(onlineTranslationLock) {
@@ -678,8 +699,136 @@ class ReaderViewModel @JvmOverloads constructor(
             prefetchNextChapters(chapter)
             return
         }
-        // Native loaders: local files enqueue directly; only HttpSource chapters may download.
+        // Local Directory/Archive chapters retain their managed whole-chapter path.
         maybeTriggerOnlineLiveTranslate(chapter)
+    }
+
+    private data class OnlinePagePlan(
+        val selection: OnlinePageSelection?,
+        val masterEnabled: Boolean,
+        val liveEnabled: Boolean,
+        val currentChapter: ReaderChapter?,
+        val wholeChapterBusy: Boolean,
+    )
+
+    /** Only the selected online page may start inference; image prefetch never reaches this flow. */
+    private fun observeOnlinePageTranslation() {
+        viewModelScope.launchIO {
+            var deliveredManualVersion = 0L
+            try {
+                combine(
+                    selectedOnlinePage,
+                    translationPreferences.translationMasterEnabled.changes(),
+                    translationPreferences.liveTranslate.changes(),
+                    state.map {
+                        it.currentChapter to (it.translationDownloadPending || it.liveTranslateProgress != null)
+                    }.distinctUntilChanged(),
+                ) { selection, master, live, chapter ->
+                    OnlinePagePlan(selection, master, live, chapter.first, chapter.second)
+                }.collectLatest { plan ->
+                    val selection = plan.selection
+                    val page = selection?.page
+                    val online = page?.takeIf {
+                        it.chapter === plan.currentChapter || selection.retryVersion > 0L
+                    }
+                        ?.chapter?.pageLoader as? OnlineTranslatedPageLoader
+                    if (activeOnlinePageLoader !== online) {
+                        // A non-cooperative native call must drain before a different chapter's
+                        // loader can start. Cancelling a selection cannot skip this ownership handoff.
+                        withContext(NonCancellable) { activeOnlinePageLoader?.stopAndJoin() }
+                        onlinePageProgressJob?.cancel()
+                        activeOnlinePageLoader = online
+                        activeOnlinePageChapter = page?.chapter.takeIf { online != null }
+                        mutableState.update { it.copy(onlinePageProgress = null, onlinePageIndex = null) }
+                        if (online != null) observeOnlinePageProgress(online)
+                    }
+                    if (online == null) return@collectLatest
+
+                    val chapterId = page.chapter.chapter.id
+                    val manuallyRequested = selection.retryVersion > 0L
+                    val stopped = synchronized(onlineTranslationLock) {
+                        chapterId != null &&
+                            (chapterId in stoppedTranslationChapters || (chapterId to page.index) in stoppedOnlinePages)
+                    }
+                    val automaticallyAllowed = if (plan.liveEnabled && !plan.wholeChapterBusy && !stopped) {
+                        try {
+                            loader?.engineReady() == true && loader?.autoTranslateAllowed() == true
+                        } catch (error: Exception) {
+                            if (error is CancellationException) throw error
+                            logcat(LogPriority.WARN, error) { "Checking selected-page translation eligibility failed" }
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                    val translate = plan.masterEnabled && (manuallyRequested || automaticallyAllowed)
+                    val retry = manuallyRequested && selection.retryVersion != deliveredManualVersion
+                    if (translate && retry) {
+                        deliveredManualVersion = selection.retryVersion
+                        val context = Injekt.get<Application>()
+                        if (!TranslationEngineConfig.modelsResolvable(context)) {
+                            online.select(page, translate = false)
+                            eventChannel.send(
+                                Event.TranslateModelsUnavailable(TranslationEngineConfig.modelsOutdated(context)),
+                            )
+                            return@collectLatest
+                        }
+                        eventChannel.send(Event.TranslatePageStarted)
+                    }
+                    online.select(page, translate = translate, explicitRetry = retry && translate)
+                }
+            } finally {
+                withContext(NonCancellable) { activeOnlinePageLoader?.stopAndJoin() }
+                onlinePageProgressJob?.cancel()
+                activeOnlinePageLoader = null
+                activeOnlinePageChapter = null
+            }
+        }
+    }
+
+    private fun observeOnlinePageProgress(online: OnlineTranslatedPageLoader) {
+        onlinePageProgressJob = online.progress.onEach { progress ->
+            // A cancelled old observer must not clear a new loader's current progress.
+            if (activeOnlinePageLoader !== online) return@onEach
+            val selection = selectedOnlinePage.value
+            if (progress == null || selection == null ||
+                getCurrentChapter() !== activeOnlinePageChapter ||
+                selection.page.index != progress.pageIndex
+            ) {
+                mutableState.update { it.copy(onlinePageProgress = null, onlinePageIndex = null) }
+                return@onEach
+            }
+            val active = progress.stage == OnlineTranslatedPageLoader.Stage.WAITING_IMAGE ||
+                progress.stage == OnlineTranslatedPageLoader.Stage.CAPTURING ||
+                progress.stage == OnlineTranslatedPageLoader.Stage.TRANSLATING
+            mutableState.update {
+                it.copy(
+                    onlinePageIndex = progress.pageIndex.takeIf { active },
+                    onlinePageProgress = if (active) {
+                        LiveTranslateProgress(
+                            done = 0,
+                            total = 1,
+                            queued = progress.stage != OnlineTranslatedPageLoader.Stage.TRANSLATING,
+                        )
+                    } else {
+                        null
+                    },
+                )
+            }
+            if (progress.stage == OnlineTranslatedPageLoader.Stage.FAILED ||
+                (progress.stage == OnlineTranslatedPageLoader.Stage.FINISHED && selection.retryVersion > 0L)
+            ) {
+                val event = when (progress.result) {
+                    PageTranslator.SinglePageResult.TRANSLATED -> Event.TranslatePageResult(true)
+                    PageTranslator.SinglePageResult.PARTIAL -> Event.TranslatePagePartial
+                    PageTranslator.SinglePageResult.NO_ORIGINAL -> Event.TranslatePageNoOriginal
+                    PageTranslator.SinglePageResult.SOURCE_AMBIGUOUS -> Event.TranslatePageSourceAmbiguous
+                    PageTranslator.SinglePageResult.TOO_LARGE -> Event.TranslatePageTooLarge
+                    else -> Event.TranslatePageResult(false)
+                }
+                eventChannel.trySend(event)
+            }
+        }.launchIn(viewModelScope)
     }
 
     /**
@@ -725,8 +874,8 @@ class ReaderViewModel @JvmOverloads constructor(
     }
 
     /**
-     * Automatic translation for native loaders. Local Directory/Archive chapters enqueue directly;
-     * HTTP chapters download first. Both share master/live/engine/source/category gates and the
+     * Automatic translation for native local loaders. Directory/Archive chapters enqueue directly.
+     * HTTP pages use the separate selected-page flow. Both share master/live/source/category gates and the
      * per-session activation latch; explicit Stop invalidates an activation waiting on those gates.
      */
     private suspend fun maybeTriggerOnlineLiveTranslate(chapter: ReaderChapter) {
@@ -743,7 +892,9 @@ class ReaderViewModel @JvmOverloads constructor(
                     pendingTranslationIntentRevision.update { it + 1 }
                 }
             }
-        } else if (source !is HttpSource) {
+        } else {
+            // Online pages are selected individually. Opening an HTTP chapter must never mark
+            // or enqueue the complete chapter in DownloadManager.
             return
         }
         val stopVersion = synchronized(onlineTranslationLock) {
@@ -762,64 +913,28 @@ class ReaderViewModel @JvmOverloads constructor(
 
         val domainChapter = chapter.chapter.toDomainChapter() ?: return
         if (translationManager.isTranslated(manga, domainChapter)) return
-        if (source is LocalSource) {
-            val format = runCatching { source.getFormat(chapter.chapter) }.getOrNull()
-            if (format !is Format.Directory && format !is Format.Archive) return
-            synchronized(onlineTranslationLock) {
-                if (chapterId in stoppedTranslationChapters ||
-                    (translationStopVersions[chapterId] ?: 0L) != stopVersion ||
-                    getCurrentChapter()?.chapter?.id != chapterId ||
-                    !translationPreferences.translationMasterEnabled.get() ||
-                    !translationPreferences.liveTranslate.get() ||
-                    !onlineTriggeredChapterIds.add(chapterId)
-                ) {
-                    return
-                }
-                translationManager.translate(
-                    manga,
-                    listOf(domainChapter),
-                    atFront = true,
-                    method = translationManager.liveInpaintMethod(),
-                )
-            }
-            return
-        }
-
-        // 必須是「線上、尚未下載」才走此路徑（已下載章由 TranslatingPageLoader 路徑處理）。
-        val isDownloaded = downloadManager.isChapterDownloaded(
-            chapter.chapter.name,
-            chapter.chapter.scanlator,
-            chapter.chapter.url,
-            manga.title,
-            manga.source,
-            skipCache = true,
-        )
-        if (isDownloaded) return
-
+        val format = runCatching { source.getFormat(chapter.chapter) }.getOrNull()
+        if (format !is Format.Directory && format !is Format.Archive) return
         synchronized(onlineTranslationLock) {
-            if ((translationStopVersions[chapterId] ?: 0L) != stopVersion ||
+            if (chapterId in stoppedTranslationChapters ||
+                (translationStopVersions[chapterId] ?: 0L) != stopVersion ||
+                getCurrentChapter()?.chapter?.id != chapterId ||
+                !translationPreferences.translationMasterEnabled.get() ||
+                !translationPreferences.liveTranslate.get() ||
                 !onlineTriggeredChapterIds.add(chapterId)
             ) {
                 return
             }
-            triggerOnlineLiveTranslate(chapter)
+            translationManager.translate(
+                manga,
+                listOf(domainChapter),
+                atFront = true,
+                method = translationManager.liveInpaintMethod(),
+            )
         }
     }
 
-    /**
-     * 線上即時翻的可靠實作＝**下載該章 → 完成後重載進已下載路徑**（取代舊版「同 session 串流改指」的不可靠做法）：
-     *  1. [TranslationManager.markForTranslate]：標記下載完要翻（讓 [eu.kanade.tachiyomi.data.download.Downloader]
-     *     繞過「下載時翻譯」總開關）；同時保證即使使用者中途離開、下載完成後章仍會被翻 + 持久化。
-     *  2. [DownloadManager.downloadChapters]：觸發下載（autoStart）。
-     *  3. **有界輪詢** [DownloadProvider.findChapterDir] 偵測章目錄出現（＝下載完成、rename 後的權威信號，比
-     *     statusFlow 可靠、無漏接）；綁在 viewModelScope，使用者離開 reader（VM cleared）即取消。
-     *  4. 章目錄出現（且為鬆散資料夾）且**該章仍是當前章**（使用者沒換走）→ [reloadCurrentChapterPreservingPage]：
-     *     重載當前章保留閱讀位置。重載後章已下載 → [ChapterLoader.shouldTranslateLive] 把它包成 [TranslatingPageLoader]
-     *     → 隨後 currChapter flow 再次觸發 [onCurrentChapterActivated] → [TranslatingPageLoader.onActivated] 排入翻譯、
-     *     走可靠的已下載換頁路徑。
-     *
-     * CBZ（isFile）即時翻本里程碑不支援 → 停止輪詢、維持線上原圖（下載仍會完成、退出重進可讀已翻 CBZ）。
-     */
+    /** Explicit whole-chapter request only: download, await publication, then reload stored pages. */
     private fun triggerOnlineLiveTranslate(chapter: ReaderChapter, explicitRetry: Boolean = false) {
         val manga = manga ?: return
         if (sourceManager.getOrStub(manga.source) !is HttpSource) return
@@ -892,7 +1007,7 @@ class ReaderViewModel @JvmOverloads constructor(
                     waited += ONLINE_DOWNLOAD_POLL_MS
                 }
                 OnlineDownloadPoll.Step.RELOAD -> {
-                    if (chapter.pageLoader is HttpPageLoader) {
+                    if (chapter.hasOnlinePages()) {
                         reloadCurrentChapterPreservingPage()
                     } else {
                         refreshNightAvailability(chapter)
@@ -1044,6 +1159,17 @@ class ReaderViewModel @JvmOverloads constructor(
         // 夜讀換檔位的「這頁沒差異」提示看的是畫面上看得到的頁（分割頁的半頁＝parent 那個檔）
         visibleNightPages = visible?.map { (it as? InsertPage)?.parent ?: it }
 
+        val actualPage = (page as? InsertPage)?.parent ?: page
+        if (actualPage.chapter.pageLoader is OnlineTranslatedPageLoader) {
+            // Split halves share a source authority. Repeated callbacks must not cancel a
+            // manual request, but selecting either half must activate its actual page.
+            if (selectedOnlinePage.value?.page !== actualPage) {
+                selectedOnlinePage.value = OnlinePageSelection(actualPage)
+            }
+        } else {
+            selectedOnlinePage.value = null
+        }
+
         // InsertPage doesn't change page progress
         if (page is InsertPage) {
             return
@@ -1051,7 +1177,6 @@ class ReaderViewModel @JvmOverloads constructor(
 
         // 即時翻譯：頁剛變成當前頁 → 若已翻好就補換譯圖（修「預載的相鄰頁在 off-screen 翻好、變當前頁卻卡原圖」）。
         (page.chapter.pageLoader as? TranslatingPageLoader)?.refreshSelected(page)
-
         val selectedChapter = page.chapter
         val pages = selectedChapter.pages ?: return
 
@@ -1485,19 +1610,29 @@ class ReaderViewModel @JvmOverloads constructor(
         val page = (selected as? InsertPage)?.parent ?: selected
         if (page.uri == null) return
         when (page.chapter.pageLoader) {
-            is DownloadPageLoader, is TranslatingPageLoader, is DirectoryPageLoader -> Unit
+            is DownloadPageLoader, is TranslatingPageLoader, is DirectoryPageLoader,
+            is OnlineTranslatedPageLoader,
+            -> Unit
             else -> return
         }
         val request = Dialog.ProcessingSummary()
         mutableState.update { it.copy(dialog = request) }
         viewModelScope.launchIO {
+            val online = page.chapter.pageLoader as? OnlineTranslatedPageLoader
+            val retained = online?.retainPage(page)
             val details = try {
-                resolveDownloadedPageFile(page)?.let { (directory, name) ->
-                    pageTranslator.getPageProcessingDetails(directory, name)
+                if (online != null && retained == null) {
+                    null
+                } else {
+                    resolveDownloadedPageFile(page)?.let { (directory, name) ->
+                        pageTranslator.getPageProcessingDetails(directory, name)
+                    }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 null
+            } finally {
+                retained?.close()
             }
             mutableState.update {
                 // A dismissed dialog or a later page action owns the slot once this request is gone.
@@ -1521,21 +1656,55 @@ class ReaderViewModel @JvmOverloads constructor(
         }
         if (page.status != Page.State.Ready) return
         viewModelScope.launchIO {
+            val online = page.chapter.pageLoader as? OnlineTranslatedPageLoader
+            val retained = online?.retainPage(page)
             try {
+                if (online != null && retained == null) {
+                    eventChannel.send(Event.OriginalPreviewUnavailable)
+                    return@launchIO
+                }
                 val target = resolveDownloadedPageFile(page)
                 val original = target?.let { pageTranslator.originalForPreview(it.first, it.second) }
                 if (original == null) {
                     eventChannel.send(Event.OriginalPreviewUnavailable)
                     return@launchIO
                 }
-                val context = Injekt.get<Application>()
                 withUIContext {
-                    page.showOriginalPreview { requireNotNull(context.contentResolver.openInputStream(original.uri)) }
+                    page.showOriginalPreview { openRetainedOriginalPreview(page, original.uri) }
                 }
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 eventChannel.send(Event.OriginalPreviewUnavailable)
+            } finally {
+                retained?.close()
             }
+        }
+    }
+
+    private fun openRetainedOriginalPreview(page: ReaderPage, uri: Uri): InputStream {
+        val online = page.chapter.pageLoader as? OnlineTranslatedPageLoader
+        val retained = online?.retainPage(page)
+        check(online == null || retained != null) { "Online original is no longer available" }
+        try {
+            val stream = requireNotNull(Injekt.get<Application>().contentResolver.openInputStream(uri))
+            if (retained == null) return stream
+            return object : FilterInputStream(stream) {
+                private var closed = false
+
+                @Synchronized
+                override fun close() {
+                    if (closed) return
+                    closed = true
+                    try {
+                        super.close()
+                    } finally {
+                        retained.close()
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            retained?.close()
+            throw error
         }
     }
 
@@ -1614,7 +1783,7 @@ class ReaderViewModel @JvmOverloads constructor(
         val id = chapter.chapter.id ?: return false
         val action = OnlineNightPrompt.decide(
             trigger = trigger,
-            online = chapter.pageLoader is HttpPageLoader,
+            online = chapter.hasOnlinePages(),
             nightEnabled = translationPreferences.nightReadEnabled.get(),
             asked = id in nightDownloadAskedIds,
             requested = id in nightDownloadRequestedIds,
@@ -1716,6 +1885,9 @@ class ReaderViewModel @JvmOverloads constructor(
      * 已下載章（含即時翻包裝 [TranslatingPageLoader]）＝下載夾（與 [reRenderPage] 同源）。線上／封存章 → null。
      * 夜讀版存在章節夾的 `.yakuyomi/` 下，所以這是夜讀查找的根。
      */
+    private fun ReaderChapter.hasOnlinePages(): Boolean =
+        pageLoader is HttpPageLoader || pageLoader is OnlineTranslatedPageLoader
+
     private fun resolveChapterDir(chapter: ReaderChapter): UniFile? {
         val manga = manga ?: return null
         return when (val pageLoader = chapter.pageLoader) {
@@ -1816,33 +1988,42 @@ class ReaderViewModel @JvmOverloads constructor(
      * lost. Keep the existing fallback when the chapter directory or page cannot be resolved.
      */
     fun openReRenderDialog(page: ReaderPage) {
+        val actualPage = (page as? InsertPage)?.parent ?: page
         viewModelScope.launchIO {
-            val target = try {
-                resolveDownloadedPageFile(page)
-            } catch (e: Throwable) {
-                if (e is CancellationException) throw e
-                logcat(LogPriority.WARN, e) { "查重繪素材失敗" }
-                null
-            }
-            var allowReRender = true
-            if (target != null) {
-                allowReRender = pageTranslator.hasReRenderMaterials(target.first, target.second)
-                if (!allowReRender) {
-                    val hasOriginal = try {
-                        pageTranslator.originalForPreview(target.first, target.second) != null
-                    } catch (e: Throwable) {
-                        if (e is CancellationException) throw e
-                        logcat(LogPriority.WARN, e) { "Checking saved original for restoration failed" }
-                        false
-                    }
-                    if (!hasOriginal) {
-                        closeDialog()
-                        eventChannel.send(Event.ReRenderNoMaterials)
-                        return@launchIO
+            val online = actualPage.chapter.pageLoader as? OnlineTranslatedPageLoader
+            online?.retainPage(actualPage).use { retained ->
+                if (online != null && retained == null) {
+                    closeDialog()
+                    eventChannel.send(Event.ReRenderNoMaterials)
+                    return@launchIO
+                }
+                val target = try {
+                    resolveDownloadedPageFile(actualPage)
+                } catch (e: Throwable) {
+                    if (e is CancellationException) throw e
+                    logcat(LogPriority.WARN, e) { "查重繪素材失敗" }
+                    null
+                }
+                var allowReRender = true
+                if (target != null) {
+                    allowReRender = pageTranslator.hasReRenderMaterials(target.first, target.second)
+                    if (!allowReRender) {
+                        val hasOriginal = try {
+                            pageTranslator.originalForPreview(target.first, target.second) != null
+                        } catch (e: Throwable) {
+                            if (e is CancellationException) throw e
+                            logcat(LogPriority.WARN, e) { "Checking saved original for restoration failed" }
+                            false
+                        }
+                        if (!hasOriginal) {
+                            closeDialog()
+                            eventChannel.send(Event.ReRenderNoMaterials)
+                            return@launchIO
+                        }
                     }
                 }
+                mutableState.update { it.copy(dialog = Dialog.ReRenderMethod(actualPage, allowReRender)) }
             }
-            mutableState.update { it.copy(dialog = Dialog.ReRenderMethod(page, allowReRender)) }
         }
     }
 
@@ -1851,11 +2032,16 @@ class ReaderViewModel @JvmOverloads constructor(
      * Returns null when the chapter directory or exact child file no longer exists. Performs IO.
      */
     private fun resolveDownloadedPageFile(page: ReaderPage): Pair<UniFile, String>? {
-        val chapter = page.chapter
+        val actualPage = (page as? InsertPage)?.parent ?: page
+        val chapter = actualPage.chapter
+        (chapter.pageLoader as? OnlineTranslatedPageLoader)?.let { online ->
+            val stored = online.resolvePage(actualPage) ?: return null
+            return stored.chapterDir to (stored.pageFile.name ?: return null)
+        }
         // DirectoryPageLoader owns the real local chapter. Archives deliberately have no loose
         // page URI and cannot use destructive single-page operations or original-file preview.
         val chapterDir = resolveChapterDir(chapter)?.takeIf { it.isDirectory } ?: return null
-        val fileUri = ((page as? InsertPage)?.parent ?: page).uri ?: return null
+        val fileUri = actualPage.uri ?: return null
         val name = chapterDir.listFiles()
             ?.firstOrNull { it.isFile && it.uri == fileUri }
             ?.name
@@ -2003,16 +2189,21 @@ class ReaderViewModel @JvmOverloads constructor(
         val chapter = page.chapter
 
         viewModelScope.launchIO {
+            val online = page.chapter.pageLoader as? OnlineTranslatedPageLoader
+            val retained = online?.retainPage(page)
+
             // A failed write can restore the original file, so the visible holder must reload it too.
             suspend fun finish(ok: Boolean) {
                 withUIContext { page.reload() }
                 eventChannel.send(Event.ReRenderResult(ok))
             }
 
-            // 提示「重繪中…」。不再把頁面設成載入態 → 處理期間維持原圖、好了才就地換、不閃黑邊。
-            eventChannel.send(Event.ReRenderStarted)
-
             try {
+                eventChannel.send(Event.ReRenderStarted)
+                if (online != null && retained == null) {
+                    finish(false)
+                    return@launchIO
+                }
                 val target = resolveDownloadedPageFile(page)
                 if (target == null) {
                     finish(false)
@@ -2022,7 +2213,13 @@ class ReaderViewModel @JvmOverloads constructor(
 
                 // 覆寫前先問這章有沒有夜讀版（覆寫會刪掉這頁的夜讀檔，事後問會漏掉「只有這頁有」的章）
                 val hadNight = translationManager.chapterHasNightBeforePage(chapterDir)
-                val ok = pageTranslator.reRenderPage(chapterDir, pageFileName, method)
+                val ok = if (online != null) {
+                    online.withPageOperation(page) { stored ->
+                        pageTranslator.reRenderPage(stored.chapterDir, stored.pageFile.name!!, method)
+                    }
+                } else {
+                    pageTranslator.reRenderPage(chapterDir, pageFileName, method)
+                }
                 // 補排夜讀放在 finish 前：finish 會等 UI 收事件，使用者這時退出 reader 的話後面的程式碼不會跑
                 if (ok) {
                     withUIContext { page.clearOriginalPreview() }
@@ -2033,6 +2230,16 @@ class ReaderViewModel @JvmOverloads constructor(
                 if (e is CancellationException) throw e
                 logcat(LogPriority.ERROR, e) { "重繪當頁失敗" }
                 finish(false)
+            } finally {
+                retained?.close()
+                if (online != null && !online.isRecycled) {
+                    synchronized(onlineTranslationLock) {
+                        val latest = selectedOnlinePage.value
+                        if (latest != null && latest.page !== page && latest.page.chapter.pageLoader === online) {
+                            selectedOnlinePage.value = latest.copy(refreshVersion = ++onlinePageRefreshVersion)
+                        }
+                    }
+                }
             }
         }
     }
@@ -2043,25 +2250,28 @@ class ReaderViewModel @JvmOverloads constructor(
      * 自己的 scope 上跑、馬上返回，reader 關掉也照樣排。做完由 init 觀察 [TranslationManager.nightChapterDone] 那條重掃／重畫。
      */
     private fun requeueNightAfterPage(manga: Manga, chapter: ReaderChapter, hadNight: Boolean) {
+        if (chapter.pageLoader is OnlineTranslatedPageLoader) return
         val domainChapter = chapter.chapter.toDomainChapter() ?: return
         translationManager.queueNightAfterPage(manga, domainChapter, hadNight)
     }
 
     /**
-     * 「翻譯這頁」（reader 頁動作對話框 → 已下載章）：對 [page] 解析下載章目錄 + 頁檔（與 [reRenderPage] 同源），
-     * 透過 [PageTranslator.translateSinglePage] 翻單頁、就地覆蓋落地，成功後刷新該頁顯示譯圖。
-     *
-     * 與佇列共用引擎鎖 + manifest 鎖（[PageTranslator.translateSinglePage] 內走 [eu.kanade.tachiyomi.data.translation.TranslationEngineService]
-     * 的 Mutex + manifestMutex）→ 不會與背景整章翻併發壞檔。§11：失敗/略過留原圖、只提示。
-     *
-     * 流程同 [reRenderPage]：先把該頁設 [Page.State.Queue]（轉圈圈當「翻譯中」）+ toast，背景翻完不論成敗都
-     * [PageLoader.retryPage] 刷新（成功＝譯圖、失敗＝原圖），再 toast 成敗。線上章不提供此鈕（呼叫端 gate）。
+     * Translate one file-backed page. Online pages use their selected-page controller so image
+     * prefetch, native cancellation and private-cache ownership remain serialized. Stored pages
+     * keep the existing shared engine/source/manifest transaction and refresh path.
      */
     fun translateThisPage() {
         val selected = (state.value.dialog as? Dialog.PageActions)?.page ?: return
         val page = (selected as? InsertPage)?.parent ?: selected
         closeDialog()
         if (!translationPreferences.translationMasterEnabled.get()) return // 硬總開關：關時不翻、不載引擎
+        if (page.chapter.pageLoader is OnlineTranslatedPageLoader) {
+            synchronized(onlineTranslationLock) {
+                page.chapter.chapter.id?.let { stoppedOnlinePages.remove(it to page.index) }
+                selectedOnlinePage.value = OnlinePageSelection(page, ++onlinePageRetryVersion)
+            }
+            return
+        }
         val manga = manga ?: return
         val chapter = page.chapter
         val method = translationPreferences.inpaintMethod.get()
@@ -2118,24 +2328,35 @@ class ReaderViewModel @JvmOverloads constructor(
         }
     }
 
-    /**
-     * 「開始翻譯這話」（reader 頁動作對話框，當前章**未**在翻譯佇列時顯示）——手動觸發，與自動（讀到當前章）
-     * 共用同一條可靠路徑：
-     *  - **已下載**：直接把當前章插隊排入翻譯佇列（已包 [TranslatingPageLoader] → [TranslatingPageLoader.restartTranslation]；
-     *    否則 [TranslationManager.translate] `atFront=true`）。
-     *  - **線上（未下載）**：走與自動相同的 [triggerOnlineLiveTranslate]——下載該章、完成後重載進已下載路徑、再排入翻譯。
-     *    （取代舊版只 markForTranslate + 下載、同 session 不顯示的做法 → 手動線上翻也會在本 session 顯示。）
-     *    手動是明確意圖 → 不過自動的 liveTranslate/分類 gate；但仍登記 [onlineTriggeredChapterIds] 與自動互斥去重。
-     *
-     * 排入後 reader 角落即時翻指示器（[State.liveTranslateProgress]，併流自 [TranslationManager.queueState]）會自動亮起，
-     * 故無需在此另外更新 UI。toast 提示「已開始」。
-     */
+    /** Stop only the selected online page; unrelated batch translations/downloads are untouched. */
+    fun stopPageTranslate() {
+        val selected = (state.value.dialog as? Dialog.PageActions)?.page ?: selectedOnlinePage.value?.page ?: return
+        val page = (selected as? InsertPage)?.parent ?: selected
+        closeDialog()
+        val online = page.chapter.pageLoader as? OnlineTranslatedPageLoader ?: return
+        synchronized(onlineTranslationLock) {
+            page.chapter.chapter.id?.let { stoppedOnlinePages.add(it to page.index) }
+            selectedOnlinePage.value = OnlinePageSelection(page)
+        }
+        online.stop()
+        mutableState.update { it.copy(onlinePageProgress = null, onlinePageIndex = null) }
+    }
+
+    /** Explicit whole-chapter translation; online sources first download the entire chapter. */
     fun startChapterTranslate() {
         closeDialog()
         if (!translationPreferences.translationMasterEnabled.get()) return // 硬總開關：關時不翻、不送「已開始」假回饋
         val manga = manga ?: return
         val readerChapter = getCurrentChapter() ?: return
         val domainChapter = readerChapter.chapter.toDomainChapter() ?: return
+
+        if (readerChapter.pageLoader is OnlineTranslatedPageLoader) {
+            selectedOnlinePage.value?.page?.takeIf { it.chapter === readerChapter }?.let { page ->
+                synchronized(onlineTranslationLock) { stoppedOnlinePages.add(domainChapter.id to page.index) }
+            }
+            activeOnlinePageLoader?.stop()
+            selectedOnlinePage.value = null
+        }
 
         val stopVersion = synchronized(onlineTranslationLock) {
             stoppedTranslationChapters.remove(domainChapter.id)
@@ -2183,7 +2404,7 @@ class ReaderViewModel @JvmOverloads constructor(
                         if ((translationStopVersions[domainChapter.id] ?: 0L) != stopVersion) return@launchIO
                     }
                     // A timed-out download poll may have left this reader using its HTTP loader.
-                    if (readerChapter.pageLoader is HttpPageLoader) reloadCurrentChapterPreservingPage()
+                    if (readerChapter.hasOnlinePages()) reloadCurrentChapterPreservingPage()
                     synchronized(onlineTranslationLock) {
                         if ((translationStopVersions[domainChapter.id] ?: 0L) != stopVersion) return@launchIO
                         // Explicit retries must bypass the loader's one-time automatic activation latch.
@@ -2309,6 +2530,9 @@ class ReaderViewModel @JvmOverloads constructor(
          * 由 [translationManager] 的佇列與當前章 id 併流算得（見 init 區塊）。
          */
         val liveTranslateProgress: LiveTranslateProgress? = null,
+        /** One selected online page; never a whole-chapter download or translation queue. */
+        val onlinePageProgress: LiveTranslateProgress? = null,
+        val onlinePageIndex: Int? = null,
         /** Pending online translation download; used for Stop, never as translated-page progress. */
         val translationDownloadPending: Boolean = false,
         /** 引擎是否正在載入（~100MB）：reader 角落指示器顯示「引擎載入中…」（[eu.kanade.presentation.reader.ReaderLiveTranslateIndicator]）。 */

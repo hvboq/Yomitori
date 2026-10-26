@@ -64,6 +64,9 @@ fun ReaderPageActionsDialog(
     onRegenerateChapterNight: (() -> Unit)? = null,
     /** 「更新夜讀版」（這章有舊規則產生的頁；只重做那些頁）；null＝不顯示。 */
     onUpdateChapterNight: (() -> Unit)? = null,
+    onStopPageTranslate: (() -> Unit)? = null,
+    isPageTranslating: Boolean = false,
+    chapterTranslateRequiresDownload: Boolean = false,
 ) {
     var showSetCoverDialog by remember { mutableStateOf(false) }
 
@@ -134,8 +137,15 @@ fun ReaderPageActionsDialog(
                 modifier = Modifier.padding(top = MaterialTheme.padding.small),
                 horizontalArrangement = Arrangement.spacedBy(MaterialTheme.padding.small),
             ) {
-                if (onTranslatePage != null) {
-                    // 翻譯這頁（已下載章）：單頁進引擎翻、就地覆蓋。線上章不提供（呼叫端傳 null）。
+                if (isPageTranslating && onStopPageTranslate != null) {
+                    ActionButton(
+                        modifier = Modifier.weight(1f),
+                        title = stringResource(MR.strings.reader_stop_page_translate),
+                        icon = Icons.Outlined.Close,
+                        onClick = onStopPageTranslate,
+                    )
+                } else if (onTranslatePage != null) {
+                    // Stored pages and the selected online page share the single-page action.
                     ActionButton(
                         modifier = Modifier.weight(1f),
                         title = stringResource(MR.strings.reader_translate_this_page),
@@ -157,7 +167,13 @@ fun ReaderPageActionsDialog(
                     if (onStartChapterTranslate != null) {
                         ActionButton(
                             modifier = Modifier.weight(1f),
-                            title = stringResource(MR.strings.reader_translate_this_chapter),
+                            title = stringResource(
+                                if (chapterTranslateRequiresDownload) {
+                                    MR.strings.reader_download_translate_chapter
+                                } else {
+                                    MR.strings.reader_translate_this_chapter
+                                },
+                            ),
                             icon = Icons.Filled.PlayArrow,
                             onClick = onStartChapterTranslate,
                         )

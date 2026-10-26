@@ -1175,6 +1175,153 @@ class PageTranslator(private val context: Context) {
         pageName in readDonePages(chapterDir)
     }.getOrDefault(false)
 
+    /**
+     * Read-only eviction authority for one private online-cache page. The cache must hold its
+     * ownership monitor and exclude all stream/work leases until deletion is finished. A busy
+     * page lock, pending/corrupt authority or an unproven display always retains the entry.
+     * Processing summaries are optional explanations and are never deletion authority here.
+     */
+    fun canDiscardOnlinePage(
+        chapterDir: UniFile,
+        pageFileName: String,
+        expectedSourceSha256: String,
+        expectedSourceBytes: Long,
+        expectedDisplaySha256: String? = null,
+    ): Boolean {
+        val digestPattern = Regex("[a-f0-9]{64}")
+        if (pageFileName.isBlank() || pageFileName == "." || pageFileName == ".." ||
+            pageFileName.any { it == '/' || it == '\\' || it.code < 32 || it.code == 127 } ||
+            !digestPattern.matches(expectedSourceSha256) || expectedSourceBytes !in 1..MAX_PAGE_BYTES.toLong() ||
+            (expectedDisplaySha256 != null && !digestPattern.matches(expectedDisplaySha256))
+        ) {
+            return false
+        }
+        val page = runCatching {
+            chapterDir.findFile(pageFileName)?.takeIf { it.isFile && it.name == pageFileName }
+        }.getOrNull() ?: return false
+        val lock = pageLock(page)
+        if (!lock.tryLock()) return false
+        return try {
+            fun matches(file: UniFile?, sha256: String, length: Long? = null, mask: Pair<Int, Int>? = null): Boolean {
+                if (file == null || !file.isFile || file.length() !in 1..MAX_PAGE_BYTES.toLong()) return false
+                if (length != null && file.length() != length) return false
+                val input = context.contentResolver.openInputStream(file.uri) ?: return false
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                val header = ByteArray(33)
+                var headerLength = 0
+                var bytes = 0L
+                input.use { source ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = source.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        bytes += read
+                        if (bytes > MAX_PAGE_BYTES) return false
+                        val keep = minOf(read, header.size - headerLength)
+                        if (keep > 0) {
+                            buffer.copyInto(header, headerLength, 0, keep)
+                            headerLength += keep
+                        }
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                if (bytes != file.length() || (length != null && bytes != length)) return false
+                if (digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) } != sha256) return false
+                if (mask != null) {
+                    if (headerLength != header.size || !header.copyOfRange(0, 8).contentEquals(CAPTURE_PNG_SIGNATURE) ||
+                        !header.copyOfRange(12, 16).contentEquals(byteArrayOf(73, 72, 68, 82))
+                    ) {
+                        return false
+                    }
+                    fun intAt(offset: Int): Int = (0..3).fold(0) { value, index ->
+                        (value shl 8) or (header[offset + index].toInt() and 255)
+                    }
+                    if (intAt(8) != 13 || intAt(16) != mask.first || intAt(20) != mask.second) return false
+                }
+                return true
+            }
+
+            if (chapterImages(chapterDir).map { it.name } != listOf(pageFileName)) return false
+            val materials = chapterDir.findFile(MATERIALS_DIR)
+            if (materials == null) {
+                readDonePages(chapterDir) // Reject an unreadable/corrupt completion ledger even for an untouched page.
+                if (expectedDisplaySha256 != null && expectedDisplaySha256 != expectedSourceSha256) return false
+                return matches(page, expectedSourceSha256, expectedSourceBytes)
+            }
+            if (!materials.isDirectory || materials.name != MATERIALS_DIR) return false
+            val names = materials.listFiles()?.map { it.name ?: return false }?.toSet() ?: return false
+            // Explicit recapture archives and interrupted writes remain recoverable evidence.
+            if (names.any { it.startsWith("capture-") || it.endsWith(".wip") || it.endsWith(".tmp") }) return false
+            val epoch = capturedStore(chapterDir)?.sourceEpoch(pageFileName) // Read-only; never recover here.
+            materials.findFile(NightSourceRevision.fileName(pageFileName))?.let { revisionFile ->
+                val revision = NightSourceRevision.read(revisionFile)
+                if (!revision.committed || revision.capturedEpoch != epoch) return false
+            }
+            val prefix = "partial-${PartialPageStore.sha256(pageFileName.toByteArray(Charsets.UTF_8))}-"
+            if (names.any { it.startsWith("partial-") && !it.startsWith(prefix) }) return false
+            val journalNames = PartialPageStore.artifactNames(pageFileName, names)
+            if (names.any { it.startsWith(prefix) && it !in journalNames } ||
+                journalNames.any { it.substringBeforeLast('.') + ".commit" !in journalNames }
+            ) {
+                return false
+            }
+            val journal = partialStore(chapterDir)?.currentStateInfo(pageFileName)
+            if (journal == null && names.any { it.startsWith(prefix) }) return false
+            if (journal != null) {
+                if (!journal.complete || journal.original.sha256 != expectedSourceSha256 ||
+                    journal.original.length != expectedSourceBytes
+                ) {
+                    return false
+                }
+                val progress = OcrProgressCodec.decode(journal.progressPayload, journal.width, journal.height)
+                if (progress.hasPending) return false
+                journal.safeContextPayload?.let(StoredTranslationContext::decode)
+                if (!matches(materials.findFile(journal.original.name), expectedSourceSha256, expectedSourceBytes) ||
+                    !matches(page, journal.outputSha256, journal.outputLength.toLong()) ||
+                    !matches(
+                        materials.findFile(journal.outputSnapshotName),
+                        journal.outputSha256,
+                        journal.outputLength.toLong(),
+                    ) ||
+                    !matches(
+                        materials.findFile(journal.rawMaskSnapshotName),
+                        journal.rawMaskSha256,
+                        journal.rawMaskLength.toLong(),
+                        journal.width to journal.height,
+                    )
+                ) {
+                    return false
+                }
+                journal.initialBaseline?.let { baseline ->
+                    if (!matches(
+                            materials.findFile(checkNotNull(journal.initialBaselineSnapshotName)),
+                            baseline.sha256,
+                            baseline.length.toLong(),
+                        )
+                    ) {
+                        return false
+                    }
+                }
+                if (expectedDisplaySha256 != null && expectedDisplaySha256 != journal.outputSha256) return false
+            } else {
+                if (expectedDisplaySha256 == null) return false
+                val original = OriginalMaterial.resolve(pageFileName, names)?.let { materials.findFile(it.name) }
+                if (!matches(original ?: page, expectedSourceSha256, expectedSourceBytes) ||
+                    !matches(page, expectedDisplaySha256)
+                ) {
+                    return false
+                }
+            }
+            val done = readDonePages(chapterDir)
+            pageFileName in done && done.all { it == pageFileName }
+        } catch (_: Exception) {
+            false
+        } finally {
+            lock.unlock()
+        }
+    }
+
     /** UI-only metadata status: partial output can be visible without completing every OCR group. */
     fun hasDisplayableTranslation(chapterDir: UniFile, pageName: String): Boolean = runCatching {
         capturedStore(chapterDir)?.sourceEpoch(pageName)

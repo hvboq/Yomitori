@@ -122,12 +122,12 @@ class ChapterLoader(
             source is StubSource -> error(context.stringResource(MR.strings.source_not_installed, source.toString()))
             else -> error(context.stringResource(MR.strings.loader_not_implemented_error))
         }
-        // 即時翻譯：符合條件（**只含已下載章**）就把 base loader 包進 [TranslatingPageLoader]（整章排入翻譯佇列、
-        // loader 只當顯示層）；否則照常用 base。線上（未下載）章**不**包裝（走原生 [HttpPageLoader]、顯示線上原圖、
-        // 不自動下載/翻譯）；線上的即時翻改由 [eu.kanade.tachiyomi.ui.reader.ReaderViewModel] 對「正在讀的章」
-        // 下載 + 完成後重載進此已下載路徑（reload 後章變已下載 → 此處才包裝）。
-        // TranslatingPageLoader 需 manga/source/downloadProvider 解析下載章目錄與逐頁檔（查 manifest + 換頁）、
-        // 並需 translationManager 把整章排入受管理佇列（背景翻、清單顯示翻譯中、可暫停/取消/重試）。
+        // HTTP image prefetch remains HTTP-only. The wrapper may capture/translate only a page
+        // explicitly selected by ReaderViewModel, and never registers a downloaded chapter.
+        if (base is HttpPageLoader) {
+            return OnlineTranslatedPageLoader(base, chapter, manga, context)
+        }
+        // Complete downloaded chapters retain the managed whole-chapter translation path.
         return if (shouldTranslateLive(chapter, isDownloaded)) {
             TranslatingPageLoader(base, chapter, manga, source, downloadProvider, translationManager)
         } else {
@@ -144,9 +144,7 @@ class ChapterLoader(
      *  - 章**尚未**整章翻好（[TranslationManager.isTranslated]）；已翻好的章交給 [DownloadPageLoader] 直接吐已覆蓋的譯圖，
      *    不必再即時翻一次（省 ~100MB 引擎 + 每頁推論）。
      *
-     * **線上路徑（未下載）改走「下載 + 重載」**：未下載章**不再**包進 [TranslatingPageLoader]（舊版的同 session
-     * 串流改指不可靠）。線上的即時翻改由 [eu.kanade.tachiyomi.ui.reader.ReaderViewModel] 處理——只對「正在讀的章」
-     * 觸發下載，下載完成後重載該章（章變已下載 → 此處才包進 [TranslatingPageLoader] 走可靠的已下載路徑）。
+     * Online pages use [OnlineTranslatedPageLoader] instead; this gate never starts a download.
      *
      * **分類過濾邏輯**抽成共用 helper [categoryAllowed]，與 [ReaderViewModel] 的線上判定共用同一份語義。
      */

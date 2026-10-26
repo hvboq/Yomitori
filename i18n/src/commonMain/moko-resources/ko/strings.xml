@@ -963,6 +963,13 @@
     <string name="hitomi_dpi_bypass">DPI 우회</string>
     <string name="hitomi_dpi_bypass_summary">네트워크에서 Hitomi 접속이 차단될 때 우회 연결을 사용합니다. 변경은 새 요청부터 적용됩니다. 끈 상태에서도 암호화 DNS는 사용합니다.</string>
     <string name="reader_show_original">원문 보기</string>
+    <string name="reader_translate_this_page">이 페이지 번역</string>
+    <string name="reader_stop_page_translate">이 페이지 번역 중지</string>
+    <string name="reader_download_translate_chapter">전체 챕터 다운로드·번역</string>
+    <string name="reader_translate_this_chapter">이 챕터 전체 번역</string>
+    <string name="reader_stop_chapter_translate">이 챕터 번역 중지</string>
+    <string name="reader_translate_chapter_started">이 챕터 번역을 시작했습니다.</string>
+    <string name="reader_translate_chapter_stopped">이 챕터 번역을 중지했습니다.</string>
     <string name="reader_show_translation">번역 보기</string>
     <string name="reader_original_preview_summary">저장된 번역을 유지하며 원문과 비교합니다.</string>
     <string name="reader_original_preview_unavailable">이 페이지에 읽을 수 있는 원본이 저장되어 있지 않습니다.</string>

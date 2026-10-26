@@ -1584,6 +1584,8 @@
     <string name="reader_translating">Translating</string>
     <string name="reader_translating_queued">Translation queued</string>
     <string name="reader_translate_this_page">Translate this page</string>
+    <string name="reader_stop_page_translate">Stop translating this page</string>
+    <string name="reader_download_translate_chapter">Download and translate entire chapter</string>
     <string name="reader_show_original">Show original</string>
     <string name="reader_show_translation">Show translation</string>
     <string name="reader_original_preview_summary">Compare with the original while keeping the saved translation.</string>
