@@ -310,7 +310,7 @@ class ReaderActivity : BaseActivity() {
                         toast(stringResource(MR.strings.reader_translating_page))
                     }
                     is ReaderViewModel.Event.TranslatePageResult -> {
-                        // 翻譯當頁結果：成功＝頁已覆蓋（holder 已自動刷新）；失敗/略過＝原圖保留不動（§11）。
+                        // 翻譯當頁結果：成功＝頁已覆蓋（holder 已自動刷新）；失敗與正常保留原文分開提示。
                         val res = if (event.success) {
                             MR.strings.reader_translate_page_done
                         } else {
@@ -320,6 +320,9 @@ class ReaderActivity : BaseActivity() {
                     }
                     ReaderViewModel.Event.TranslatePagePartial -> {
                         toast(stringResource(MR.strings.reader_translate_page_partial))
+                    }
+                    ReaderViewModel.Event.TranslatePageSkipped -> {
+                        toast(stringResource(MR.strings.reader_translate_page_skipped))
                     }
                     ReaderViewModel.Event.ChapterTranslateStarted -> {
                         toast(stringResource(MR.strings.reader_translate_chapter_started))

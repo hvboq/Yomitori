@@ -424,7 +424,7 @@
     <string name="quickstart_setup_title">Three things to get ready</string>
     <string name="quickstart_setup_body">1. Pick a provider and paste your API key.\nSettings → Translation → Provider. Default is DeepSeek; OpenAI, Gemini, Groq, Qwen, OpenRouter and self-hosted (Sakura / custom) also work. Paste the key from your provider\'s dashboard — it is encrypted on this device. For a self-hosted or custom provider, also fill in the API base.\n\n2. Get the models (detector, OCR, text-removal).\nSettings → Translation → Models → Download models (about 250 MB, verified). Or bring your own: drop the model files into the models folder in your storage location. The Model status row shows a check or cross for each.\n\n3. Pick your languages.\nDefault is Japanese → Traditional Chinese (Taiwan). Change the target or source any time.</string>
     <string name="quickstart_workflows_title">Two ways to translate</string>
-    <string name="quickstart_workflows_body">Translate on download — turn on Translate chapters on download. Every chapter you download is then translated automatically in the background, and the page images are replaced in place. Best when you download ahead and read later.\n\nLive (read-as-you-go) — turn on Live translation, a separate switch. When you open an unread chapter it is translated in the background and pages swap in as they become ready (a Translating X/Y pill shows at the top-left). Opening an undownloaded chapter downloads it first, then translates. Use Live translation categories to limit it to, or exclude, certain library categories.\n\nThe two switches are independent: use either, both, or neither — and both sit under the master Enable translation switch at the top of the page. Turn that off and nothing translates.</string>
+    <string name="quickstart_workflows_body">Translate on download — turn on Translate chapters on download. Chapters you download are then translated automatically in the background, and the page images are replaced in place. Best when you download ahead and read later.\n\nLive translation — turn on Live translation, a separate switch. Online chapters translate the current page as you read and display the result when ready. Downloaded and local chapters process saved pages in the background. Use Live translation categories to include or exclude library categories. Set up a translation server and on-device models first.\n\nEntire chapter — in an online reader, long-press a page and choose Download and translate entire chapter to download every page before translating the chapter. Downloaded and local chapters can use Translate this chapter to process their saved pages.\n\nThe two automatic switches are independent: use either, both, or neither. Both are controlled by the master Enable translation switch at the top of the page.</string>
     <string name="quickstart_manual_title">By hand, and keeping it tidy</string>
     <string name="quickstart_manual_body">Manual translate — on a manga\'s chapter list, downloaded chapters show a translate button. The icon spins while running, turns the accent color when done, and red on error. Long-press to multi-select, then tap Translate in the bottom bar.\n\nQueue — the Queue tab in the bottom navigation bar lists every translation and night-page job with its status. Pause or resume, cancel, or retry failed chapters there.\n\nRe-render — already translated a chapter but want cleaner text removal? Change the method in Settings (you will be asked to update existing chapters), or long-press a page → Text removal. No re-OCR or re-translation needed.</string>
     <string name="quickstart_action_done">Got it</string>
@@ -1440,7 +1440,7 @@
     <string name="pref_translation_on_download">Translate chapters on download</string>
     <string name="pref_translation_on_download_summary">Detection / OCR / text removal run on-device; translation uses a cloud LLM</string>
     <string name="pref_translation_live">Live translation (as you read)</string>
-    <string name="pref_translation_live_summary">Translates an unread chapter page by page and swaps pages in; needs an API key + models, separate from translate-on-download</string>
+    <string name="pref_translation_live_summary">Online chapters translate the current page as you read. Downloaded and local chapters process saved pages in the background. Set up a translation server and on-device models first.</string>
     <string name="pref_translation_live_categories">Live translation categories</string>
     <string name="pref_translation_live_categories_message">Include categories = translate only those; exclude = skip them; none = all</string>
     <string name="pref_translation_live_inpaint_method">Live text removal</string>
@@ -1622,8 +1622,9 @@
     <string name="reader_translate_page_too_large">This page is too large to translate (over 40 megapixels). The original is kept</string>
     <string name="reader_translating_page">Translating this page…</string>
     <string name="reader_translate_page_done">Page translated</string>
-    <string name="reader_translate_page_failed">Translation failed (skipped or error)</string>
+    <string name="reader_translate_page_failed">Page translation failed</string>
     <string name="reader_translate_page_partial">Some text could not be recognized. Saved translations are preserved; retry to finish this page.</string>
+    <string name="reader_translate_page_skipped">Page processed. The original was kept.</string>
     <string name="reader_translate_chapter_started">Started translating this chapter</string>
     <string name="reader_translate_chapter_stopped">Stopped translating this chapter</string>
     <!-- Yakuyomi: re-render -->

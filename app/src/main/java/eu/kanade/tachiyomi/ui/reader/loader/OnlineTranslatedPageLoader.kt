@@ -383,7 +383,8 @@ internal class OnlineTranslatedPageLoader(
                             runCatching { cacheStore.recordCompletion(hit.entry) }
                         }
                         if (result == PageTranslator.SinglePageResult.TRANSLATED ||
-                            result == PageTranslator.SinglePageResult.PARTIAL
+                            result == PageTranslator.SinglePageResult.PARTIAL ||
+                            result == PageTranslator.SinglePageResult.SKIPPED
                         ) {
                             withContext(Dispatchers.Main.immediate) {
                                 if (isCurrent(request)) request.page.clearOriginalPreview()
@@ -392,6 +393,7 @@ internal class OnlineTranslatedPageLoader(
                         val final = when (result) {
                             PageTranslator.SinglePageResult.TRANSLATED,
                             PageTranslator.SinglePageResult.PARTIAL,
+                            PageTranslator.SinglePageResult.SKIPPED,
                             -> Stage.FINISHED
                             else -> if (translator.isPageTranslated(stored.chapterDir, stored.pageFile.name!!)) {
                                 Stage.FINISHED

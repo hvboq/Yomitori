@@ -38,6 +38,49 @@ import java.util.concurrent.atomic.AtomicInteger
 @RunWith(AndroidJUnit4::class)
 class OnlineSelectedPageLoaderTest {
     @Test
+    fun skippedAttemptFinishesWithoutCompletionAndDoesNotAutomaticallyRepeat() = runBlocking {
+        OnlineSelectedPageFixture.run { fixture ->
+            val calls = CopyOnWriteArrayList<Int>()
+            val session = fixture.session(count = 2) { index, _ ->
+                calls += index
+                PageTranslator.SinglePageResult.SKIPPED
+            }
+            val loader = session.loader
+            val pages = session.pages
+            val load = launch(Dispatchers.IO) { loader.loadPage(pages[0]) }
+            try {
+                pages.forEach { ready(it) }
+                for (index in listOf(0, 1, 0, 1, 0)) {
+                    loader.select(pages[index], translate = true)
+                    finished(loader, index, PageTranslator.SinglePageResult.SKIPPED)
+                    OnlineSelectedPageFixture.settled(loader)
+                    val stored = checkNotNull(loader.resolvePage(pages[index]))
+                    val directory = File(checkNotNull(stored.chapterDir.uri.path))
+                    val original = OnlineSelectedPageFixture.original(index)
+                    assertArrayEquals(original, File(directory, "source.bin").readBytes())
+                    assertArrayEquals(original, File(checkNotNull(stored.pageFile.uri.path)).readBytes())
+                    assertArrayEquals(original, checkNotNull(pages[index].stream).invoke().use { it.readBytes() })
+                    assertFalse(
+                        "A normal skipped attempt is not a translated completion ledger",
+                        PageTranslator(fixture.context).isPageTranslated(stored.chapterDir, stored.pageFile.name!!),
+                    )
+                }
+                assertEquals("Terminal skipped attempts must survive automatic revisits", listOf(0, 1), calls.toList())
+                loader.select(pages[0], translate = true, explicitRetry = true)
+                finished(loader, 0, PageTranslator.SinglePageResult.SKIPPED)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(
+                    "Only an explicit user retry may start another attempt here",
+                    listOf(0, 1, 0),
+                    calls.toList(),
+                )
+            } finally {
+                load.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
     fun httpPrefetchNeverProcessesUnselectedPagesAndCompletedReselectionDoesNotRepeat() = runBlocking {
         OnlineSelectedPageFixture.run { fixture ->
             val calls = CopyOnWriteArrayList<Int>()
@@ -450,7 +493,11 @@ class OnlineSelectedPageLoaderTest {
         if (state is Page.State.Error) throw AssertionError("Scripted page image failed: $state")
     }
 
-    private suspend fun finished(loader: OnlineTranslatedPageLoader, pageIndex: Int) {
+    private suspend fun finished(
+        loader: OnlineTranslatedPageLoader,
+        pageIndex: Int,
+        expectedResult: PageTranslator.SinglePageResult = PageTranslator.SinglePageResult.TRANSLATED,
+    ) {
         val state = withTimeout(10000) {
             loader.progress.first {
                 it != null && it.pageIndex == pageIndex &&
@@ -461,7 +508,7 @@ class OnlineSelectedPageLoaderTest {
             }
         }
         assertEquals(OnlineTranslatedPageLoader.Stage.FINISHED, checkNotNull(state).stage)
-        assertEquals(PageTranslator.SinglePageResult.TRANSLATED, state.result)
+        assertEquals(expectedResult, state.result)
     }
 
     private suspend fun await(condition: () -> Boolean) = withTimeout(5000) {

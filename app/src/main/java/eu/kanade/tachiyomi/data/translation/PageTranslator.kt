@@ -271,6 +271,7 @@ class PageTranslator(private val context: Context) {
         val materialsWarning: String? = null,
         val displayChanged: Boolean = false,
         val failureCode: TranslationFailureCode? = null,
+        val skipped: Boolean = false,
     )
 
     private fun PageAttempt.chapterFailureCode(): TranslationFailureCode? = failureCode ?: when (kind) {
@@ -822,7 +823,14 @@ class PageTranslator(private val context: Context) {
                 safeContextPayload,
                 PageProcessingOutcome.fromProgress(analysis?.progress, stats.lines, skipped),
             )
-            PageAttempt(if (partial) AttemptKind.PARTIAL else AttemptKind.TRANSLATED, stats, error, warning, true)
+            PageAttempt(
+                if (partial) AttemptKind.PARTIAL else AttemptKind.TRANSLATED,
+                stats,
+                error,
+                warning,
+                true,
+                skipped = skipped,
+            )
         }
     }
 
@@ -1099,8 +1107,8 @@ class PageTranslator(private val context: Context) {
      * have an independently writable page URI.
      *
      * @param method 去字法原始字串（boxfill / auto_whole / auto_tile）；預設＝目前全域偏好。傳給引擎、也存進素材。
-     * @return [SinglePageResult.TRANSLATED]＝翻成功並已覆蓋落地；[SinglePageResult.NOT_TRANSLATED]＝略過/失敗/解析不到檔
-     *   （原圖未動）；[SinglePageResult.NO_ORIGINAL]＝這頁已處理、沒有保留原圖，不能證明頁檔仍是未翻譯原文，
+     * @return [SinglePageResult.TRANSLATED]＝翻成功並已覆蓋落地；[SinglePageResult.SKIPPED]＝處理成功但保留或復原原文；
+     *   [SinglePageResult.NOT_TRANSLATED]＝失敗或解析不到檔；[SinglePageResult.NO_ORIGINAL]＝這頁已處理、沒有保留原圖，不能證明頁檔仍是未翻譯原文，
      *   拒絕再翻（什麼都不動）；[SinglePageResult.TOO_LARGE]＝頁圖超過像素上限（[PageSizeCap]），沒翻、原圖未動。
      * 整段算進 [TranslationBusy]（夜讀讓路）。
      */
@@ -1108,16 +1116,25 @@ class PageTranslator(private val context: Context) {
         chapterDir: UniFile,
         pageFileName: String,
         method: String = translationPreferences.inpaintMethod.get(),
-    ): SinglePageResult = TranslationBusy.track { translateSinglePageImpl(chapterDir, pageFileName, method) }
+    ): SinglePageResult = translateSinglePageDetailed(chapterDir, pageFileName, method).result
+
+    /** The current attempt's result and actual storage mutation, independent of optional summaries. */
+    suspend fun translateSinglePageDetailed(
+        chapterDir: UniFile,
+        pageFileName: String,
+        method: String = translationPreferences.inpaintMethod.get(),
+    ): SinglePageOutcome = TranslationBusy.track { translateSinglePageImpl(chapterDir, pageFileName, method) }
 
     private suspend fun translateSinglePageImpl(
         chapterDir: UniFile,
         pageFileName: String,
         method: String,
-    ): SinglePageResult {
-        if (!TranslationEngineConfig.modelsResolvable(context)) return SinglePageResult.NOT_TRANSLATED
+    ): SinglePageOutcome {
+        if (!TranslationEngineConfig.modelsResolvable(context)) {
+            return SinglePageOutcome(SinglePageResult.NOT_TRANSLATED, displayChanged = false)
+        }
         val page = chapterImages(chapterDir).firstOrNull { it.name == pageFileName }
-            ?: return SinglePageResult.NOT_TRANSLATED
+            ?: return SinglePageOutcome(SinglePageResult.NOT_TRANSLATED, displayChanged = false)
         val attempt = translateStoredPage(chapterDir, page, method, true, true, false) { false }
         // Persisted partials already recorded their diagnostic under the page lock. Repeating
         // that write here could replace a newer completion/failure with an old pending message.
@@ -1126,15 +1143,21 @@ class PageTranslator(private val context: Context) {
                 pageLock(page).withLock { recordSinglePageError(chapterDir, pageFileName, reason) }
             }
         }
-        return when (attempt.kind) {
-            AttemptKind.TRANSLATED, AttemptKind.ALREADY_DONE -> SinglePageResult.TRANSLATED
+        val result = when (attempt.kind) {
+            AttemptKind.TRANSLATED -> if (attempt.skipped) SinglePageResult.SKIPPED else SinglePageResult.TRANSLATED
+            AttemptKind.ALREADY_DONE -> SinglePageResult.TRANSLATED
+            AttemptKind.SKIPPED -> SinglePageResult.SKIPPED
             AttemptKind.PARTIAL -> SinglePageResult.PARTIAL
             AttemptKind.NO_ORIGINAL -> SinglePageResult.NO_ORIGINAL
             AttemptKind.SOURCE_AMBIGUOUS -> SinglePageResult.SOURCE_AMBIGUOUS
             AttemptKind.TOO_LARGE -> SinglePageResult.TOO_LARGE
             else -> SinglePageResult.NOT_TRANSLATED
         }
+        return SinglePageOutcome(result, attempt.displayChanged)
     }
+
+    /** A completed call's outcome; displayChanged does not grant translated-completion authority. */
+    data class SinglePageOutcome(val result: SinglePageResult, val displayChanged: Boolean)
 
     /** [translateSinglePage] 的結果。 */
     enum class SinglePageResult {
@@ -1144,7 +1167,10 @@ class PageTranslator(private val context: Context) {
         /** Safe groups are displayed; unresolved OCR groups remain resumable and not completed. */
         PARTIAL,
 
-        /** 略過（無字）／失敗（網路、引擎）／找不到檔：原圖未動。 */
+        /** This attempt successfully kept/restored the source; it does not assert translated completion. */
+        SKIPPED,
+
+        /** 失敗（網路、引擎）／找不到檔。 */
         NOT_TRANSLATED,
 
         /** 已處理但沒有保留原圖，無法證明頁檔仍是原文：拒絕再翻，什麼都沒動。 */

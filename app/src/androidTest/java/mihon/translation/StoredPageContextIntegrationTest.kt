@@ -624,7 +624,7 @@ class StoredPageContextIntegrationTest {
                 override fun close() = Unit
             }
             fixture.select(english)
-            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            assertEquals("SKIPPED", fixture.translate().name)
             assertEquals(1, calls)
             val completed = requireNotNull(fixture.store.load(PAGE))
             assertEquals(pending.revision, completed.baseRevision)
@@ -1221,8 +1221,8 @@ class StoredPageContextIntegrationTest {
             override fun close() = Unit
         }
         fixture.select(freshEngine)
-        // The previous branch returned NOT_TRANSLATED here and retained the old target/context.
-        assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+        // A kept result must replace the old target/context without claiming a new translation.
+        assertEquals("SKIPPED", fixture.translate().name)
         assertEquals(1, fullCalls)
         assertEquals(0, resumeCalls)
         val replacement = requireNotNull(fixture.store.load(PAGE))

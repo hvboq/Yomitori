@@ -821,6 +821,7 @@ class ReaderViewModel @JvmOverloads constructor(
                 val event = when (progress.result) {
                     PageTranslator.SinglePageResult.TRANSLATED -> Event.TranslatePageResult(true)
                     PageTranslator.SinglePageResult.PARTIAL -> Event.TranslatePagePartial
+                    PageTranslator.SinglePageResult.SKIPPED -> Event.TranslatePageSkipped
                     PageTranslator.SinglePageResult.NO_ORIGINAL -> Event.TranslatePageNoOriginal
                     PageTranslator.SinglePageResult.SOURCE_AMBIGUOUS -> Event.TranslatePageSourceAmbiguous
                     PageTranslator.SinglePageResult.TOO_LARGE -> Event.TranslatePageTooLarge
@@ -2299,7 +2300,8 @@ class ReaderViewModel @JvmOverloads constructor(
                 val (chapterDir, pageFileName) = target
                 // 覆寫前先問這章有沒有夜讀版（同 reRenderPage）
                 val hadNight = translationManager.chapterHasNightBeforePage(chapterDir)
-                when (pageTranslator.translateSinglePage(chapterDir, pageFileName, method)) {
+                val outcome = pageTranslator.translateSinglePageDetailed(chapterDir, pageFileName, method)
+                when (outcome.result) {
                     PageTranslator.SinglePageResult.TRANSLATED -> {
                         withUIContext { page.clearOriginalPreview() }
                         requeueNightAfterPage(manga, chapter, hadNight) // finish 前：見 reRenderPage
@@ -2309,6 +2311,14 @@ class ReaderViewModel @JvmOverloads constructor(
                         withUIContext { page.clearOriginalPreview() }
                         requeueNightAfterPage(manga, chapter, hadNight)
                         finish(false, Event.TranslatePagePartial)
+                    }
+                    PageTranslator.SinglePageResult.SKIPPED -> {
+                        // Only a stored source restoration invalidated the display and its Night image.
+                        if (outcome.displayChanged) {
+                            withUIContext { page.clearOriginalPreview() }
+                            requeueNightAfterPage(manga, chapter, hadNight)
+                        }
+                        eventChannel.send(Event.TranslatePageSkipped)
                     }
                     PageTranslator.SinglePageResult.NOT_TRANSLATED -> finish(false)
                     // 已翻過、沒有原圖素材（只存夜讀素材的頁）：什麼都沒動，說清楚為什麼不翻、別冒充「翻譯失敗」
@@ -2654,11 +2664,14 @@ class ReaderViewModel @JvmOverloads constructor(
         /** 開始翻譯當頁（IO 約需數秒）：給 UI 提示「翻譯中…」；頁面同時會顯示 per-page 轉圈圈。 */
         data object TranslatePageStarted : Event
 
-        /** 翻譯當頁結果（true＝成功覆蓋並刷新／false＝略過/失敗），給 UI 提示。 */
+        /** 翻譯當頁結果（true＝成功覆蓋並刷新／false＝失敗），給 UI 提示。 */
         data class TranslatePageResult(val success: Boolean) : Event
 
         /** Saved successful regions remain visible while unread regions can be retried. */
         data object TranslatePagePartial : Event
+
+        /** The current attempt safely kept/restored the source without applying a translation. */
+        data object TranslatePageSkipped : Event
 
         /** 已把當前章排入翻譯（已下載＝排佇列／線上＝觸發下載 + 標記待翻），給 UI 提示「已開始」。 */
         data object ChapterTranslateStarted : Event

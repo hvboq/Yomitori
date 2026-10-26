@@ -17,6 +17,7 @@ import dev.icerock.moko.resources.StringResource
 import eu.kanade.domain.base.BasePreferences
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.translation.OcrProgressCodec
+import eu.kanade.tachiyomi.data.translation.PageProcessingReason
 import eu.kanade.tachiyomi.data.translation.PageTranslator
 import eu.kanade.tachiyomi.data.translation.PartialPageStore
 import eu.kanade.tachiyomi.data.translation.TranslationBusy
@@ -221,6 +222,42 @@ class PartialReaderIntegrationTest {
                     assertFalse(partialBytes.contentEquals(finalBytes))
                     assertArrayEquals(finalBytes, streamBytes(page))
                     compareOriginal(scenario, page, engine.originalBytes, finalBytes)
+
+                    // This local/manual branch restores a previously translated display from
+                    // its protected source. Skipped is neutral, while its existing completed
+                    // storage journal remains authoritative for the finished reanalysis.
+                    val skippedReload = page.reloadFlow.value
+                    expectToast(activity.stringResource(MR.strings.reader_translate_page_skipped), engine) {
+                        pageAction(scenario, page, MR.strings.reader_translate_this_page)
+                    }
+                    waitFor("local skipped reanalysis restored the same reader") {
+                        engine.failure.get()?.let { throw AssertionError("Scripted skipped reanalysis failed", it) }
+                        page.status == Page.State.Ready && page.reloadFlow.value > skippedReload &&
+                            TranslationBusy.active.value == 0
+                    }
+                    assertSame(loader, page.chapter.pageLoader)
+                    assertEquals(1, activity.viewModel.state.value.currentPage)
+                    assertEquals(2, engine.translateCalls.get())
+                    assertEquals(1, engine.resumeCalls.get())
+                    assertArrayEquals(engine.originalBytes, File(directory, ".yakuyomi/001.orig.png").readBytes())
+                    val restoredBytes = streamBytes(page)
+                    val restored = checkNotNull(BitmapFactory.decodeByteArray(restoredBytes, 0, restoredBytes.size))
+                    val original = checkNotNull(
+                        BitmapFactory.decodeByteArray(engine.originalBytes, 0, engine.originalBytes.size),
+                    )
+                    try {
+                        assertArrayEquals(pixelDigest(original), pixelDigest(restored))
+                    } finally {
+                        original.recycle()
+                        restored.recycle()
+                    }
+                    val skipped = checkNotNull(journal(directory).load("001.png", recover = false))
+                    assertTrue(skipped.complete)
+                    assertTrue(OcrProgressCodec.decode(skipped.progressPayload, WIDTH, HEIGHT).noTextDetected)
+                    assertFalse(translator.hasDisplayableTranslation(chapterDir, "001.png"))
+                    val details = checkNotNull(translator.getPageProcessingDetails(chapterDir, "001.png"))
+                    assertEquals(PageProcessingReason.NO_TEXT, details.outcome.reason)
+                    assertEquals(0, checkNotNull(details.outcome.counts).translatedRegions)
                 }
                 assertArrayEquals(engine.originalBytes, File(directory, ".yakuyomi/001.orig.png").readBytes())
                 assertTrue(manager.queueState.value.isEmpty())
@@ -228,6 +265,7 @@ class PartialReaderIntegrationTest {
                 assertFalse(manager.isPendingTranslate(chapter.id))
                 report.put("partialAndCompleteToastsObserved", true).put("reopenedPendingWithoutInference", true)
                     .put("sameReopenedPageAndLoaderCompleted", true).put("originalComparisonPreserved", true)
+                    .put("preservedSourceSkipAnnouncedNeutrallyAndRestoredOriginalPixels", true)
                     .put("translateCalls", engine.translateCalls.get()).put("resumeCalls", engine.resumeCalls.get())
             }
         } catch (failure: Throwable) {
@@ -371,12 +409,18 @@ class PartialReaderIntegrationTest {
     }
 
     private fun expectToast(label: String, engine: ScriptedEngine, action: () -> Unit) {
+        val resultLabels = setOf(
+            context.stringResource(MR.strings.reader_translate_page_partial),
+            context.stringResource(MR.strings.reader_translate_page_done),
+            context.stringResource(MR.strings.reader_translate_page_skipped),
+            context.stringResource(MR.strings.reader_translate_page_failed),
+        )
         val event = try {
             instrumentation.uiAutomation.executeAndWaitForEvent(
                 { action() },
                 { observed ->
                     observed.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED &&
-                        observed.text.any { it.toString() == label }
+                        observed.text.any { it.toString() in resultLabels }
                 },
                 12000,
             )
@@ -386,8 +430,16 @@ class PartialReaderIntegrationTest {
             }
             throw AssertionError("The actual reader did not announce its operation result toast", failure)
         }
-        @Suppress("DEPRECATION")
-        event.recycle()
+        try {
+            assertEquals(
+                "The first manual result notice must identify the actual outcome",
+                setOf(label),
+                event.text.map { it.toString() }.filter { it in resultLabels }.toSet(),
+            )
+        } finally {
+            @Suppress("DEPRECATION")
+            event.recycle()
+        }
     }
 
     private fun compareOriginal(
@@ -438,9 +490,15 @@ class PartialReaderIntegrationTest {
         }
 
         override suspend fun translatePage(page: Bitmap): PageResult = checked {
-            assertEquals(1, translateCalls.incrementAndGet())
             assertArrayEquals(originalPixels, pixelDigest(page))
-            PageResult.Partial(render(page, complete = false), stats(1), resultAnalysis(firstProgress))
+            when (translateCalls.incrementAndGet()) {
+                1 -> PageResult.Partial(render(page, complete = false), stats(1), resultAnalysis(firstProgress))
+                2 -> {
+                    val noText = PageProgress(WIDTH, HEIGHT, emptyList(), noTextDetected = true)
+                    PageResult.Skipped("No text detected", PageStats(0, 0, 0, 0, 0, 0, 0, 0), resultAnalysis(noText))
+                }
+                else -> error("Unexpected repeated local manual inference")
+            }
         }
 
         override suspend fun resumePage(original: Bitmap, analysis: PageAnalysis): PageResult = checked {

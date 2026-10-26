@@ -55,6 +55,70 @@ import java.util.UUID
 @RunWith(AndroidJUnit4::class)
 class PageProcessingSummaryIntegrationTest {
     @Test(timeout = 30_000)
+    fun manualSkippedResultDistinguishesNoTextAndKeptSourceWithoutInventingCompletion(): Unit = runBlocking {
+        val cases = listOf(
+            PageProgress(SIZE, SIZE, emptyList(), noTextDetected = true) to PageProcessingReason.NO_TEXT,
+            progress(RegionState.INTENTIONALLY_KEPT, policyIds = setOf(0)) to PageProcessingReason.OCR_POLICY_KEPT,
+            progress(RegionState.INTENTIONALLY_KEPT) to PageProcessingReason.RESPONSE_FILTERED,
+        )
+        for ((finalProgress, reason) in cases) {
+            withFixture(ScriptedEngine(Kind.SKIPPED, finalProgress)) { fixture ->
+                // The outcome is from this attempt, independently of its optional saved summary.
+                // Its result must remain distinct from translated completion and actual failure.
+                val outcome = fixture.translateDetailed()
+                assertEquals("SKIPPED", outcome.result.name)
+                assertFalse(
+                    "Fresh unchanged classification must not invalidate the display or Night image",
+                    outcome.displayChanged,
+                )
+                assertArrayEquals(fixture.initialBytes, fixture.page.readBytes())
+                if (fixture.original.exists()) assertArrayEquals(fixture.initialBytes, fixture.original.readBytes())
+                assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+                assertFalse(fixture.translator.isChapterTranslated(fixture.chapter))
+                assertTrue(fixture.completionUnion().isEmpty())
+                assertNull(fixture.store.load(PAGE))
+                val details = requireNotNull(fixture.readWithoutMutation())
+                assertEquals(reason, details.outcome.reason)
+                val counts = requireNotNull(details.outcome.counts)
+                assertEquals(0, counts.translatedRegions)
+                assertEquals(0, counts.pendingRegions)
+                assertEquals(1, fixture.engine.freshCalls)
+                assertEquals(0, fixture.engine.resumeCalls)
+                fixture.engine.assertReturnedBitmapsRecycled()
+            }
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun manualSkipDoesNotRequireAnOptionalSummaryAndLaterFailureCannotReuseItsOutcome(): Unit = runBlocking {
+        val noText = PageProgress(SIZE, SIZE, emptyList(), noTextDetected = true)
+        withFixture(ScriptedEngine(Kind.SKIPPED, noText)) { fixture ->
+            check(fixture.summary.mkdir())
+            val sentinel = File(fixture.summary, "owned-sentinel").apply { writeText("neutral summary obstruction") }
+            val sentinelBytes = sentinel.readBytes()
+            assertEquals("SKIPPED", fixture.translate().name)
+            assertNull(fixture.readWithoutMutation())
+            assertArrayEquals(sentinelBytes, sentinel.readBytes())
+            assertTrue(sentinel.delete() && fixture.summary.delete())
+
+            assertEquals("SKIPPED", fixture.translate().name)
+            assertEquals(PageProcessingReason.NO_TEXT, requireNotNull(fixture.readWithoutMutation()).outcome.reason)
+            fixture.engine.selectFresh(Kind.FAILED, null, "Korean")
+            val failedOutcome = fixture.translateDetailed()
+            assertEquals(PageTranslator.SinglePageResult.NOT_TRANSLATED, failedOutcome.result)
+            assertFalse("A failed attempt must not claim a display write", failedOutcome.displayChanged)
+            assertArrayEquals(fixture.initialBytes, fixture.page.readBytes())
+            if (fixture.original.exists()) assertArrayEquals(fixture.initialBytes, fixture.original.readBytes())
+            assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
+            assertTrue(fixture.completionUnion().isEmpty())
+            assertNull(fixture.store.load(PAGE))
+            assertEquals(3, fixture.engine.freshCalls)
+            assertEquals(0, fixture.engine.resumeCalls)
+            fixture.engine.assertReturnedBitmapsRecycled()
+        }
+    }
+
+    @Test(timeout = 30_000)
     fun freshSkippedReasonsKeepExactSourceAndReadsNeverStartInferenceOrWriteFiles(): Unit = runBlocking {
         val cases = listOf(
             PageProgress(SIZE, SIZE, emptyList(), noTextDetected = true) to
@@ -132,7 +196,12 @@ class PageProcessingSummaryIntegrationTest {
                 val priorRecord = requireNotNull(PageProcessingSummaryCodec.decode(fixture.summary.readBytes()))
                 fixture.engine.selectFresh(Kind.SKIPPED, finalProgress, "English")
 
-                assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+                val restoredOutcome = fixture.translateDetailed()
+                assertEquals("SKIPPED", restoredOutcome.result.name)
+                assertTrue(
+                    "Restoring the preserved source must invalidate its former display and Night image",
+                    restoredOutcome.displayChanged,
+                )
 
                 assertPixels(Color.WHITE, fixture.page.readBytes())
                 assertArrayEquals(fixture.initialBytes, preserved)
@@ -166,7 +235,7 @@ class PageProcessingSummaryIntegrationTest {
                 if (preserveOriginal) {
                     assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
                     fixture.engine.selectFresh(Kind.SKIPPED, progress(RegionState.TRANSLATED), "English")
-                    assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+                    assertEquals("SKIPPED", fixture.translate().name)
                     assertPixels(Color.WHITE, fixture.page.readBytes())
                     assertArrayEquals(fixture.initialBytes, fixture.original.readBytes())
                 } else {
@@ -192,7 +261,9 @@ class PageProcessingSummaryIntegrationTest {
         val first = progress(RegionState.TRANSLATED, RegionState.OCR_PENDING)
         val final = progress(RegionState.TRANSLATED, RegionState.TRANSLATED)
         withFixture(ScriptedEngine(Kind.PARTIAL, first, final)) { fixture ->
-            assertEquals(PageTranslator.SinglePageResult.PARTIAL, fixture.translate())
+            val partialOutcome = fixture.translateDetailed()
+            assertEquals(PageTranslator.SinglePageResult.PARTIAL, partialOutcome.result)
+            assertTrue(partialOutcome.displayChanged)
             val pending = requireNotNull(fixture.store.load(PAGE))
             assertFalse(pending.complete)
             assertFalse(fixture.translator.isPageTranslated(fixture.chapter, PAGE))
@@ -200,7 +271,9 @@ class PageProcessingSummaryIntegrationTest {
             assertEquals(PageProcessingReason.PARTIAL, partial.outcome.reason)
             assertEquals(PageProcessingCounts(2, 2, 0, 0, 0, 1, 1), partial.outcome.counts)
             val partialSummary = fixture.summary.readBytes()
-            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, fixture.translate())
+            val completedOutcome = fixture.translateDetailed()
+            assertEquals(PageTranslator.SinglePageResult.TRANSLATED, completedOutcome.result)
+            assertTrue(completedOutcome.displayChanged)
             val completed = requireNotNull(fixture.store.load(PAGE))
             assertTrue(completed.complete)
             assertEquals(pending.revision, completed.baseRevision)
@@ -430,6 +503,8 @@ class PageProcessingSummaryIntegrationTest {
 
         suspend fun translate() = translator.translateSinglePage(chapter, PAGE, METHOD)
 
+        suspend fun translateDetailed() = translator.translateSinglePageDetailed(chapter, PAGE, METHOD)
+
         suspend fun readWithoutMutation(): PageProcessingDetails? {
             val before = hashes()
             val calls = engine.freshCalls to engine.resumeCalls
@@ -474,7 +549,7 @@ class PageProcessingSummaryIntegrationTest {
         }
     }
 
-    private enum class Kind { SKIPPED, TRANSLATED, PARTIAL }
+    private enum class Kind { SKIPPED, TRANSLATED, PARTIAL, FAILED }
 
     private class ScriptedEngine(
         private var firstKind: Kind,
@@ -530,6 +605,7 @@ class PageProcessingSummaryIntegrationTest {
                 Kind.SKIPPED -> PageResult.Skipped("No text detected", stats, analysis)
                 Kind.TRANSLATED -> PageResult.Translated(ownedImage(Color.GREEN), stats, analysis)
                 Kind.PARTIAL -> PageResult.Partial(ownedImage(Color.BLUE), stats, requireNotNull(analysis))
+                Kind.FAILED -> PageResult.Failed("Neutral scripted current-attempt failure")
             }
         }
 

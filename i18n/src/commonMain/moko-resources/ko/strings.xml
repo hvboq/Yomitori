@@ -954,11 +954,12 @@
     <string name="pref_translation_inpaint_boxfill">빠르게 채우기</string>
     <string name="pref_translation_inpaint_auto_whole">AI 배경 복원</string>
     <string name="pref_translation_live">읽는 중 자동 번역</string>
-    <string name="pref_translation_live_summary">챕터를 다운로드한 뒤 순서대로 번역하고 리더에 표시합니다. 번역 서버와 기기 내 모델을 먼저 설정하세요.</string>
+    <string name="pref_translation_live_summary">온라인 챕터는 현재 읽는 페이지만 번역합니다. 다운로드한 챕터와 로컬 챕터는 저장된 페이지를 백그라운드에서 처리합니다. 번역 서버와 기기 내 모델을 먼저 설정하세요.</string>
     <string name="pref_translation_keep_materials">재식자 자료 보관</string>
     <string name="pref_translation_keep_materials_summary">OCR과 번역을 반복하지 않고 다시 그릴 수 있도록 마스크와 문자 영역을 저장합니다. 원본 페이지 파일은 항상 별도로 보존합니다.</string>
     <string name="pref_translation_quickstart">번역 시작 안내</string>
     <string name="pref_translation_quickstart_summary">모델 다운로드와 번역 서버 설정 방법</string>
+    <string name="quickstart_workflows_body">다운로드 후 번역 — 다운로드 후 번역 스위치를 켜면 사용자가 다운로드한 챕터를 백그라운드에서 자동 번역하고 페이지에 적용합니다. 미리 다운로드한 뒤 읽을 때 사용할 수 있습니다.\n\n읽는 중 자동 번역 — 별도의 읽는 중 자동 번역 스위치를 켜세요. 온라인 챕터는 현재 선택한 페이지를 번역해 준비되면 리더에 표시합니다. 다운로드한 챕터와 로컬 챕터는 저장된 페이지를 백그라운드에서 처리합니다. 자동 번역 카테고리로 포함하거나 제외할 서재 카테고리를 선택할 수 있습니다. 번역 서버와 기기 내 모델을 먼저 설정하세요.\n\n전체 챕터 — 온라인 리더에서 페이지를 길게 누르고 전체 챕터 다운로드·번역을 선택하면 모든 페이지를 다운로드한 뒤 챕터를 번역합니다. 다운로드한 챕터와 로컬 챕터는 이 챕터 전체 번역으로 저장된 페이지를 처리할 수 있습니다.\n\n두 자동 번역 스위치는 각각 사용할 수 있으며, 설정 상단의 번역 사용 스위치가 두 기능을 함께 제어합니다.</string>
     <string name="engine_unavailable">기기 내 모델, 서버 주소, 번역 모델 이름과 API 키를 확인하세요. 인증 없는 직접 설정 서버는 키를 비워 둘 수 있습니다.</string>
     <string name="hitomi_dpi_bypass">DPI 우회</string>
     <string name="hitomi_dpi_bypass_summary">네트워크에서 Hitomi 접속이 차단될 때 우회 연결을 사용합니다. 변경은 새 요청부터 적용됩니다. 끈 상태에서도 암호화 DNS는 사용합니다.</string>
@@ -993,6 +994,8 @@
     <string name="reader_processing_record_response_kept_regions">번역 결과 조건으로 원문 유지: %1$d개 영역</string>
     <string name="reader_processing_record_pending_regions">미해결 영역: %1$d개</string>
     <string name="reader_translate_page_partial">일부 글자를 인식하지 못했습니다. 성공한 번역은 저장했으며 다시 시도해 이 페이지를 마칠 수 있습니다.</string>
+    <string name="reader_translate_page_skipped">페이지 처리를 마쳤습니다. 원문을 유지했습니다.</string>
+    <string name="reader_translate_page_failed">페이지 번역에 실패했습니다.</string>
     <string name="reader_translate_page_source_ambiguous">번역 기록이 없어 저장된 원본이 현재 페이지의 원본인지 확인할 수 없습니다. 재식자 메뉴에서 원본을 복원한 뒤 번역을 다시 시도하세요.</string>
     <string name="pref_translation_live_inpaint_method">읽는 중 원문 제거</string>
     <string name="pref_translation_live_inpaint_summary">AI 배경 복원은 원문 뒤의 배경을 복원합니다. 빠른 채우기는 단색 배경에서 처리 시간을 줄이는 데 적합합니다.</string>

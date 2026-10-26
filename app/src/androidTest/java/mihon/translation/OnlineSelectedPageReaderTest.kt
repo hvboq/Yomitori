@@ -13,6 +13,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityEvent
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -27,6 +28,7 @@ import eu.kanade.tachiyomi.data.translation.TranslationEngineService
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.ReaderActivity
 import eu.kanade.tachiyomi.ui.reader.ReaderViewModel
+import eu.kanade.tachiyomi.ui.reader.loader.OnlineSelectedPageFixture
 import eu.kanade.tachiyomi.ui.reader.loader.OnlineTranslatedPageLoader
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
@@ -90,6 +92,7 @@ class OnlineSelectedPageReaderTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context get() = instrumentation.targetContext
     private val renderChecks = JSONArray()
+    private val resultNoticeChecks = JSONArray()
 
     @Test(timeout = 300_000)
     fun currentPageMenusTranslateStopAndRefreshWithoutDownloadingTheChapter() = runBlocking<Unit> {
@@ -105,6 +108,7 @@ class OnlineSelectedPageReaderTest {
             .put("inference", "scripted engine; no native OCR or remote translation server")
             .put("navigation", "real reader controller; long-press and action clicks use actual UI")
             .put("renderChecks", renderChecks)
+            .put("manualResultNotices", resultNoticeChecks)
         var primaryFailure: Throwable? = null
         var prepared = false
         val unrelatedPendingId = Long.MIN_VALUE + 1964
@@ -220,12 +224,15 @@ class OnlineSelectedPageReaderTest {
                 dismissDialog(activity)
 
                 val firstReload = pages[0].reloadFlow.value
-                pageAction(
-                    scenario,
-                    pages[0],
-                    MR.strings.reader_translate_this_page,
-                    MR.strings.reader_stop_page_translate,
-                )
+                // Consume this earlier manual result before later actions can observe its queued toast.
+                expectResultToast(MR.strings.reader_translate_page_done, fake, pages[0]) {
+                    pageAction(
+                        scenario,
+                        pages[0],
+                        MR.strings.reader_translate_this_page,
+                        MR.strings.reader_stop_page_translate,
+                    )
+                }
                 awaitTranslated(loader, pages[0], translator, firstReload)
                 awaitRendered(scenario, pages[0], translated = true)
                 assertEquals(listOf(0), fake.inputPages.toList())
@@ -291,12 +298,15 @@ class OnlineSelectedPageReaderTest {
 
                 // A user retry overrides Stop, still using the same reader, page and loader.
                 val secondReload = pages[1].reloadFlow.value
-                pageAction(
-                    scenario,
-                    pages[1],
-                    MR.strings.reader_translate_this_page,
-                    MR.strings.reader_stop_page_translate,
-                )
+                // Consume this earlier manual result before later actions can observe its queued toast.
+                expectResultToast(MR.strings.reader_translate_page_done, fake, pages[1]) {
+                    pageAction(
+                        scenario,
+                        pages[1],
+                        MR.strings.reader_translate_this_page,
+                        MR.strings.reader_stop_page_translate,
+                    )
+                }
                 awaitTranslated(loader, pages[1], translator, secondReload)
                 awaitRendered(scenario, pages[1], translated = true)
                 assertEquals(listOf(0, 1, 1), fake.inputPages.toList())
@@ -333,6 +343,65 @@ class OnlineSelectedPageReaderTest {
                 scenario.onActivity { assertSame("Reader Activity must remain alive", activity, it) }
                 assertSame(loader, readerChapter.pageLoader)
                 assertNoWholeChapterWork(activity)
+
+                // A genuine engine Skipped result is a normal manual outcome, even though this
+                // fresh forced attempt deliberately creates no translated-completion manifest.
+                select(scenario, pages[4])
+                awaitStored(loader, pages[4])
+                expectResultToast(MR.strings.reader_translate_page_skipped, fake, pages[4]) {
+                    pageAction(
+                        scenario,
+                        pages[4],
+                        MR.strings.reader_translate_this_page,
+                        MR.strings.reader_stop_page_translate,
+                    )
+                }
+                awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.SKIPPED)
+                assertUnchangedPage(loader, pages[4], translator, originals[4])
+                awaitRendered(scenario, pages[4], translated = false)
+                assertProcessingReason(scenario, pages[4], PageProcessingReason.NO_TEXT)
+                assertEquals(6, fake.calls.get())
+
+                // Real reader selections with live mode enabled must reuse the terminal skipped
+                // attempt. A normal no-text outcome must not become an automatic retry loop.
+                scope.set(scope.preferences.liveTranslate, true)
+                select(scenario, pages[3])
+                awaitPageTerminal(loader, pages[3], PageTranslator.SinglePageResult.TRANSLATED)
+                awaitRendered(scenario, pages[3], translated = true)
+                select(scenario, pages[4])
+                awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.SKIPPED)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals("Automatic revisit must not repeat a finished skipped attempt", 6, fake.calls.get())
+
+                // Explicit retry remains available and a policy-kept result is also neutral.
+                expectResultToast(MR.strings.reader_translate_page_skipped, fake, pages[4]) {
+                    pageAction(
+                        scenario,
+                        pages[4],
+                        MR.strings.reader_translate_this_page,
+                        MR.strings.reader_stop_page_translate,
+                    )
+                }
+                awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.SKIPPED)
+                assertUnchangedPage(loader, pages[4], translator, originals[4])
+                assertProcessingReason(scenario, pages[4], PageProcessingReason.OCR_POLICY_KEPT)
+
+                // A later real failure on that same source must not borrow the saved kept summary
+                // or its earlier neutral toast. The first result notice must be the failure notice.
+                expectResultToast(MR.strings.reader_translate_page_failed, fake, pages[4]) {
+                    pageAction(
+                        scenario,
+                        pages[4],
+                        MR.strings.reader_translate_this_page,
+                        MR.strings.reader_stop_page_translate,
+                    )
+                }
+                awaitPageTerminal(loader, pages[4], PageTranslator.SinglePageResult.NOT_TRANSLATED)
+                assertUnchangedPage(loader, pages[4], translator, originals[4])
+                awaitRendered(scenario, pages[4], translated = false)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(listOf(0, 1, 1, 2, 3, 4, 4, 4), fake.inputPages.toList())
+                assertNoWholeChapterWork(activity)
                 val imageRequests = server.requests.filter { it.startsWith("/image/") }
                 assertTrue("The last page remains navigable", "/image/$PAGE_COUNT.png" in imageRequests)
                 assertTrue("Selected-page translation must not fetch an entire chapter", imageRequests.size < 64)
@@ -341,6 +410,9 @@ class OnlineSelectedPageReaderTest {
                     .put("sameReaderRenderedManualAndAutomaticResults", true)
                     .put("originalAndProcessingRecordMenuVerified", true)
                     .put("cancelledSelectionResultDiscarded", true)
+                    .put("manualNoTextAndPolicyKeptNeutralNotFailure", true)
+                    .put("actualFailureNotInferredFromPriorSummary", true)
+                    .put("automaticSkippedRevisitWithoutAnotherInference", true)
             }
             report.put("functionalStagesPassed", true)
         } catch (failure: Throwable) {
@@ -443,6 +515,151 @@ class OnlineSelectedPageReaderTest {
                     page.reloadFlow.value > reload && page.status == Page.State.Ready &&
                     TranslationBusy.active.value == 0
             } == true
+        }
+    }
+
+    private fun awaitPageTerminal(
+        loader: OnlineTranslatedPageLoader,
+        page: ReaderPage,
+        result: PageTranslator.SinglePageResult,
+    ) {
+        val stage = if (result == PageTranslator.SinglePageResult.NOT_TRANSLATED) {
+            OnlineTranslatedPageLoader.Stage.FAILED
+        } else {
+            OnlineTranslatedPageLoader.Stage.FINISHED
+        }
+        waitFor("selected page terminal outcome $result") {
+            loader.progress.value?.let {
+                it.pageIndex == page.index && it.stage == stage && it.result == result &&
+                    TranslationBusy.active.value == 0 && page.status == Page.State.Ready
+            } == true
+        }
+    }
+
+    private fun assertUnchangedPage(
+        loader: OnlineTranslatedPageLoader,
+        page: ReaderPage,
+        translator: PageTranslator,
+        original: ByteArray,
+    ) {
+        val stored = checkNotNull(loader.resolvePage(page))
+        val directory = File(checkNotNull(stored.chapterDir.uri.path))
+        assertArrayEquals(original, File(directory, "source.bin").readBytes())
+        assertArrayEquals(original, stored.pageFile.openInputStream().use { it.readBytes() })
+        assertArrayEquals(original, stream(page))
+        assertFalse(translator.isPageTranslated(stored.chapterDir, stored.pageFile.name!!))
+        assertFalse(translator.isChapterTranslated(stored.chapterDir))
+    }
+
+    private fun assertProcessingReason(
+        scenario: ActivityScenario<ReaderActivity>,
+        page: ReaderPage,
+        reason: PageProcessingReason,
+    ) {
+        pageAction(scenario, page, MR.strings.reader_processing_record, MR.strings.reader_stop_page_translate)
+        lateinit var activity: ReaderActivity
+        scenario.onActivity { activity = it }
+        waitFor("saved skipped processing details") {
+            (activity.viewModel.state.value.dialog as? ReaderViewModel.Dialog.ProcessingSummary)
+                ?.let { !it.isLoading && it.details != null } == true
+        }
+        val details = checkNotNull(
+            (activity.viewModel.state.value.dialog as ReaderViewModel.Dialog.ProcessingSummary).details,
+        )
+        assertEquals(reason, details.outcome.reason)
+        val counts = checkNotNull(details.outcome.counts)
+        assertEquals(0, counts.translatedRegions)
+        assertEquals(0, counts.pendingRegions)
+        val label = when (reason) {
+            PageProcessingReason.NO_TEXT -> MR.strings.reader_processing_record_no_text
+            PageProcessingReason.OCR_POLICY_KEPT -> MR.strings.reader_processing_record_ocr_kept
+            else -> error("Unexpected scripted skipped reason")
+        }
+        checkAction(label, MR.strings.reader_translate_this_page, false)
+        dismissProcessingRecordDialog(activity)
+    }
+
+    private fun expectResultToast(
+        label: StringResource,
+        engine: SelectedPageEngine,
+        page: ReaderPage,
+        action: () -> Unit,
+    ) {
+        val expected = context.stringResource(label)
+        val results = setOf(
+            context.stringResource(MR.strings.reader_translate_page_skipped),
+            context.stringResource(MR.strings.reader_translate_page_failed),
+            context.stringResource(MR.strings.reader_translate_page_done),
+            context.stringResource(MR.strings.reader_translate_page_partial),
+        )
+        val startedLabel = context.stringResource(MR.strings.reader_translating_page)
+        val observedNotices = JSONArray()
+        val check = JSONObject().put("expectedLabel", expected).put("pageIndex", page.index)
+            .put("actionStartedUptimeMs", SystemClock.uptimeMillis()).put("matched", false)
+            .put("observedNotices", observedNotices)
+        resultNoticeChecks.put(check)
+        fun recordState(key: String) {
+            val progress = (page.chapter.pageLoader as? OnlineTranslatedPageLoader)?.progress?.value
+            check.put(
+                key,
+                JSONObject().put("calls", engine.calls.get()).put("active", engine.active.get())
+                    .put("busy", TranslationBusy.active.value)
+                    .put("pageStatus", page.status.javaClass.simpleName)
+                    .put("loaderPageIndex", progress?.pageIndex ?: JSONObject.NULL)
+                    .put("loaderStage", progress?.stage?.name ?: JSONObject.NULL)
+                    .put("loaderResult", progress?.result?.name ?: JSONObject.NULL),
+            )
+        }
+        recordState("beforeAction")
+        val event = try {
+            instrumentation.uiAutomation.executeAndWaitForEvent(
+                { action() },
+                { observed ->
+                    if (observed.eventType != AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+                        false
+                    } else {
+                        // Only known public fixture notices are recorded. Other accessibility text
+                        // must not enter the report, and an unexpected result must still fail.
+                        val allowed = observed.text.map { it.toString() }
+                            .filter { it in results || it == startedLabel }.toSet()
+                        if (allowed.isNotEmpty() && observedNotices.length() < 16) {
+                            val packageName = observed.packageName?.toString().orEmpty()
+                            observedNotices.put(
+                                JSONObject().put("eventTimeUptimeMs", observed.eventTime)
+                                    .put("receivedUptimeMs", SystemClock.uptimeMillis())
+                                    .put(
+                                        "package",
+                                        packageName.takeIf { it == context.packageName || it == "android" } ?: "OTHER",
+                                    )
+                                    .put("packageSha256", sha(packageName.toByteArray()))
+                                    .put("allowedLabels", JSONArray(allowed.toList()))
+                                    .put("calls", engine.calls.get()).put("active", engine.active.get()),
+                            )
+                        }
+                        allowed.any { it in results }
+                    }
+                },
+                12_000,
+            )
+        } catch (failure: Exception) {
+            check.put("waitFailureClass", failure.javaClass.name)
+            recordState("atWaitFailure")
+            engine.failure.get()?.let { throw AssertionError("SCRIPTED_INFERENCE_FAILED", it) }
+            throw AssertionError("Reader did not announce its manual operation result", failure)
+        }
+        try {
+            val actual = event.text.map { it.toString() }.filter { it in results }.toSet()
+            check.put("allowedResultLabelsObserved", JSONArray(actual.toList()))
+                .put("matched", actual == setOf(expected))
+            recordState("atResultNotice")
+            assertEquals(
+                "The actual manual action must announce exactly its semantic outcome",
+                setOf(expected),
+                actual,
+            )
+        } finally {
+            @Suppress("DEPRECATION")
+            event.recycle()
         }
     }
 
@@ -847,8 +1064,8 @@ class OnlineSelectedPageReaderTest {
         val peak = AtomicInteger()
         val closed = AtomicBoolean()
         val failure = AtomicReference<Throwable?>()
-        val entered = List(5) { CountDownLatch(1) }
-        val release = List(5) { CountDownLatch(if (it == 1 || it == 3) 1 else 0) }
+        val entered = List(8) { CountDownLatch(1) }
+        val release = List(8) { CountDownLatch(if (it == 1 || it == 3) 1 else 0) }
         val inputPages = CopyOnWriteArrayList<Int>()
         val outputs = CopyOnWriteArrayList<Bitmap>()
         val resultDiagnostics = CopyOnWriteArrayList<JSONObject>()
@@ -858,8 +1075,8 @@ class OnlineSelectedPageReaderTest {
             val running = active.incrementAndGet()
             peak.updateAndGet { maxOf(it, running) }
             try {
-                check(!closed.get() && index < 5)
-                val expected = listOf(0, 1, 1, 2, 3)[index]
+                check(!closed.get() && index < 8)
+                val expected = listOf(0, 1, 1, 2, 3, 4, 4, 4)[index]
                 assertEquals(originalColor(expected), page.getPixel(0, 0))
                 (0..3).forEach { marker ->
                     assertEquals(
@@ -871,6 +1088,42 @@ class OnlineSelectedPageReaderTest {
                 inputPages += expected
                 entered[index].countDown()
                 check(release[index].await(45, TimeUnit.SECONDS)) { "Scripted inference gate timed out" }
+                if (index >= 5) {
+                    if (index == 7) return PageResult.Failed("Neutral scripted manual failure")
+                    val progress = if (index == 5) {
+                        PageProgress(WIDTH, HEIGHT, emptyList(), noTextDetected = true)
+                    } else {
+                        PageProgress(
+                            WIDTH,
+                            HEIGHT,
+                            listOf(
+                                RegionProgress(
+                                    0,
+                                    RegionState.INTENTIONALLY_KEPT,
+                                    listOf(
+                                        OcrLineProgress(
+                                            listOf(Pt(20f, 20f), Pt(180f, 20f), Pt(180f, 60f), Pt(20f, 60f)),
+                                            1f,
+                                            "h",
+                                            "neutral kept source",
+                                            intentionallyKept = true,
+                                        ),
+                                    ),
+                                    "h",
+                                ),
+                            ),
+                        )
+                    }
+                    resultDiagnostics += JSONObject().put("callIndex", index).put("pageIndex", expected)
+                        .put("result", "SKIPPED").put("noTextDetected", progress.noTextDetected)
+                    // Identical reason text to the no-text case intentionally cannot determine
+                    // whether the engine kept a policy region or found no text.
+                    return PageResult.Skipped(
+                        "No text detected",
+                        PageStats(progress.regions.size, progress.regions.size, 0, 0, 0, 0, 0, 0),
+                        PageAnalysis(owned(Color.BLACK), progress.toTextRegions(), progress),
+                    )
+                }
                 val progress = PageProgress(
                     WIDTH,
                     HEIGHT,
