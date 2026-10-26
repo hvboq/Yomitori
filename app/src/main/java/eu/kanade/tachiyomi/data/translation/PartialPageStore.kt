@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.translation
 
 import android.content.Context
 import com.hippo.unifile.UniFile
+import eu.kanade.tachiyomi.data.nightread.NightSourceRevision
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -25,7 +26,10 @@ import java.util.UUID
  * Call load and commit under the shared page lock. Inference may run outside it; `baseRevision`
  * rejects results computed from an obsolete generation when the lock is acquired again.
  */
-internal class PartialPageStore(private val io: Io) {
+internal class PartialPageStore(
+    private val io: Io,
+    private val visibleMutation: (String, () -> Unit) -> Unit = { _, write -> write() },
+) {
     interface Io {
         fun materialNames(): Set<String>
         fun readMaterial(name: String, maxBytes: Int): ByteArray?
@@ -463,9 +467,11 @@ internal class PartialPageStore(private val io: Io) {
     }
 
     private fun replaceVerified(pageName: String, bytes: ByteArray) {
-        if (!io.replacePage(pageName, bytes)) fail("Cannot replace page")
-        val actual = io.readPage(pageName, MAX_IMAGE_BYTES)
-        if (actual?.contentEquals(bytes) != true) fail("Page replacement checksum mismatch")
+        visibleMutation(pageName) {
+            if (!io.replacePage(pageName, bytes)) fail("Cannot replace page")
+            val actual = io.readPage(pageName, MAX_IMAGE_BYTES)
+            if (actual?.contentEquals(bytes) != true) fail("Page replacement checksum mismatch")
+        }
     }
 
     private fun deleteVerified(name: String) {
@@ -508,7 +514,9 @@ internal class PartialPageStore(private val io: Io) {
         private val PNG_SIGNATURE = byteArrayOf(-119, 80, 78, 71, 13, 10, 26, 10)
 
         fun forUniFile(context: Context, chapterDir: UniFile, materialsDir: UniFile): PartialPageStore =
-            PartialPageStore(UniFileIo(context, chapterDir, materialsDir))
+            PartialPageStore(UniFileIo(context, chapterDir, materialsDir)) { page, write ->
+                NightSourceRevision.mutate(context, chapterDir, materialsDir, page, write)
+            }
 
         fun sha256(bytes: ByteArray): String = digest(bytes)
 

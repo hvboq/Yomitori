@@ -4,10 +4,7 @@ import io.kotest.matchers.shouldBe
 import li.joye.yakuyomi.nightread.NightTier
 import org.junit.jupiter.api.Test
 
-/**
- * 夜讀檔名慣例與查找：兩檔格式（std／more，現行）、三檔格式（l1／l2／l3，2026-10-01 產生、只讀）、舊版單檔（只讀），
- * 以及重新產生被打斷時新舊並存的情形——已產生的章都要照讀、不必重做。
- */
+/** Filename/cleanup compatibility remains; only complete policy pairs authorize reader output. */
 class NightPagesTest {
 
     private val page = "012.jpg"
@@ -36,24 +33,6 @@ class NightPagesTest {
         NightPages.currentNames(page) shouldBe listOf(std, more)
         NightPages.oldFormatNames(page) shouldBe listOf(l1, l2, l3, legacy)
         NightPages.artifactNames(page) shouldBe listOf(legacy, l1, std, more, l2, l3)
-    }
-
-    @Test
-    fun `整頁作廢刪到一半：任何格式組合、任何中途狀態都只看到原本那組或原圖`() {
-        // 所有 2^6 種殘留組合（含新舊並存），照 artifactNames 依序刪：每一步兩個檔位查到的要嘛跟刪之前一樣、要嘛全是原圖。
-        // 舊順序（std 先刪）在「std＋三檔」並存時會先退回舊的 l2／l3——過期重做時那是舊畫面。
-        val all = NightPages.artifactNames(page)
-        for (mask in 0 until (1 shl all.size)) {
-            val start = all.filterIndexed { i, _ -> mask and (1 shl i) != 0 }.toSet()
-            val before = resolveBoth(start)
-            val left = start.toMutableSet()
-            for (n in all) {
-                left -= n
-                val now = resolveBoth(left)
-                (now == before || now.all { it == null }) shouldBe true
-            }
-            left shouldBe emptySet()
-        }
     }
 
     @Test
@@ -105,116 +84,12 @@ class NightPagesTest {
     }
 
     @Test
-    fun `頁名本身含 night 也正確`() {
-        val p = "a.night.jpg"
-        NightPages.isNightArtifact(p) shouldBe false
-        val s = NightPages.levelName(p, NightLevel.STANDARD)
-        val m = NightPages.levelName(p, NightLevel.MORE)
-        s shouldBe "a.night.jpg.night.std.webp"
-        NightPages.isNightArtifact(s) shouldBe true
-        NightPages.pageOf(s) shouldBe p
-        NightPages.pageOf(m) shouldBe p
-        NightPages.pageOf(NightPages.tierName(p, NightTier.L2)) shouldBe p
-        NightPages.pageOf(NightPages.legacyName(p)) shouldBe p
-        NightPages.pageOf("a.night.jpg") shouldBe null
-        NightPages.pageOf("$s.tmp") shouldBe null
-        NightPages.resolveName(setOf(s, m), p, NightLevel.MORE) shouldBe m
-    }
-
-    // —— 兩檔格式（現行） ——
-
-    @Test
-    fun `兩檔：只有 std（更多與標準相同沒存）`() {
-        resolveBoth(setOf(std)) shouldBe listOf(std, std)
-    }
-
-    @Test
-    fun `兩檔：std 加 more`() {
-        resolveBoth(setOf(std, more)) shouldBe listOf(std, more)
-    }
-
-    @Test
-    fun `兩檔：孤兒 more（沒有 std）視而不見`() {
-        resolveBoth(setOf(more)) shouldBe listOf(null, null)
-        // 有三檔格式或舊版單檔就退回它們
-        resolveBoth(setOf(more, l1, l3)) shouldBe listOf(l1, l3)
-        resolveBoth(setOf(more, legacy)) shouldBe listOf(legacy, legacy)
-    }
-
-    // —— 三檔格式（2026-10-01 產生、只讀；語意＝三檔時代的 L2／L3） ——
-
-    @Test
-    fun `三檔：只有 l1`() {
-        resolveBoth(setOf(l1)) shouldBe listOf(l1, l1)
-    }
-
-    @Test
-    fun `三檔：l1 加 l3（L2 與 L1 相同沒存）`() {
-        resolveBoth(setOf(l1, l3)) shouldBe listOf(l1, l3)
-    }
-
-    @Test
-    fun `三檔：l1 加 l2（L3 與 L2 相同沒存）`() {
-        resolveBoth(setOf(l1, l2)) shouldBe listOf(l2, l2)
-    }
-
-    @Test
-    fun `三檔：三檔齊`() {
-        resolveBoth(setOf(l1, l2, l3)) shouldBe listOf(l2, l3)
-    }
-
-    @Test
-    fun `三檔：孤兒 l2 l3（沒有 l1）視而不見`() {
-        resolveBoth(setOf(l2, l3)) shouldBe listOf(null, null)
-        resolveBoth(setOf(l2)) shouldBe listOf(null, null)
-        resolveBoth(setOf(l3)) shouldBe listOf(null, null)
-        // 有舊版單檔就退回它
-        resolveBoth(setOf(l2, l3, legacy)) shouldBe listOf(legacy, legacy)
-    }
-
-    // —— 舊版單檔 ——
-
-    @Test
-    fun `舊版單檔：兩檔都是它；有 std 或 l1 時不用`() {
-        resolveBoth(setOf(legacy)) shouldBe listOf(legacy, legacy)
-        resolveBoth(setOf(l1, legacy)) shouldBe listOf(l1, l1)
-        resolveBoth(setOf(l1, l2, legacy)) shouldBe listOf(l2, l2)
-        resolveBoth(setOf(std, legacy)) shouldBe listOf(std, std)
-    }
-
-    // —— 新舊並存（重新產生被打斷：新 std 已落地、舊格式還沒刪完） ——
-
-    @Test
-    fun `並存：有 std 就只看兩檔格式，三檔與舊版單檔不看`() {
-        resolveBoth(setOf(std, l1, l2, l3, legacy)) shouldBe listOf(std, std)
-        resolveBoth(setOf(std, more, l1, l2, l3)) shouldBe listOf(std, more)
-        resolveBoth(setOf(std, l3)) shouldBe listOf(std, std)
-    }
-
-    @Test
-    fun `並存：std 不在（換檔時已刪舊 std、新的還沒改名）但有 l1 → 照三檔規則`() {
-        resolveBoth(setOf(more, l1, l2, l3)) shouldBe listOf(l2, l3)
-        resolveBoth(setOf(l1, l3, "$std.tmp", "$more.tmp")) shouldBe listOf(l1, l3)
-    }
-
-    @Test
     fun `什麼都沒有、暫存、別頁的檔都不算`() {
         resolveBoth(emptySet()) shouldBe listOf(null, null)
         resolveBoth(setOf("$std.tmp", "$l1.tmp", "$legacy.tmp")) shouldBe listOf(null, null)
         resolveBoth(
             setOf("013.jpg.night.std.webp", "012.png.night.std.webp", "013.jpg.night.l1.webp", "012.png.night.webp"),
         ) shouldBe listOf(null, null)
-    }
-
-    @Test
-    fun `完成標記（新鮮度比它）：有 std 用 std、否則 l1、都沒有 null`() {
-        NightPages.markerName(setOf(std, more, l1, l2), page) shouldBe std
-        NightPages.markerName(setOf(std), page) shouldBe std
-        NightPages.markerName(setOf(l1, l3), page) shouldBe l1
-        NightPages.markerName(setOf(more, l1), page) shouldBe l1
-        NightPages.markerName(setOf(more, l2, l3, legacy), page) shouldBe null
-        NightPages.markerName(setOf(legacy), page) shouldBe null
-        NightPages.markerName(setOf("$std.tmp", "013.jpg.night.std.webp"), page) shouldBe null
     }
 
     @Test
@@ -241,44 +116,6 @@ class NightPagesTest {
     }
 
     @Test
-    fun `chapterState：有 std 或 l1 就 READY、只有舊版 LEGACY、其餘 NONE`() {
-        NightPages.chapterState(listOf("001.jpg.night.std.webp")) shouldBe NightPages.ChapterState.READY
-        NightPages.chapterState(listOf("001.jpg.night.l1.webp", "002.jpg.night.webp")) shouldBe
-            NightPages.ChapterState.READY
-        // 新舊格式混在同一章（部分頁已重新產生）
-        val mixedChapter = listOf("001.jpg.night.std.webp", "002.jpg.night.l1.webp", "003.jpg.night.webp")
-        NightPages.chapterState(mixedChapter) shouldBe NightPages.ChapterState.READY
-        NightPages.chapterState(listOf("002.jpg.night.webp", "002.orig.webp")) shouldBe
-            NightPages.ChapterState.LEGACY
-        NightPages.chapterState(emptyList()) shouldBe NightPages.ChapterState.NONE
-        // 孤兒 more／l2／l3、暫存、重繪素材都不算有
-        NightPages.chapterState(
-            listOf(
-                "001.jpg.night.more.webp",
-                "001.jpg.night.l2.webp",
-                "001.jpg.night.l3.webp",
-                "001.jpg.night.std.webp.tmp",
-                "001.jpg.night.l1.webp.tmp",
-                "001.json",
-            ),
-        ) shouldBe NightPages.ChapterState.NONE
-        NightPages.chapterState(listOf("001.jpg.night.webp.tmp")) shouldBe NightPages.ChapterState.NONE
-        // 沒有頁名的怪檔不算
-        NightPages.chapterState(listOf(".night.std.webp", ".night.l1.webp")) shouldBe NightPages.ChapterState.NONE
-    }
-
-    @Test
-    fun `availability：不支援優先，其餘照 chapterState`() {
-        NightPages.availability(false, listOf(std)) shouldBe NightAvailability.UNSUPPORTED
-        NightPages.availability(true, listOf(std, legacy)) shouldBe NightAvailability.READY
-        NightPages.availability(true, listOf(l1, legacy)) shouldBe NightAvailability.READY
-        NightPages.availability(true, listOf(legacy)) shouldBe NightAvailability.LEGACY
-        NightPages.availability(true, listOf(more)) shouldBe NightAvailability.NONE
-        NightPages.availability(true, listOf(l2)) shouldBe NightAvailability.NONE
-        NightPages.availability(true, emptyList()) shouldBe NightAvailability.NONE
-    }
-
-    @Test
     fun `hasAnyArtifact：含孤兒與舊版，不含暫存`() {
         NightPages.hasAnyArtifact(setOf(more), page) shouldBe true
         NightPages.hasAnyArtifact(setOf(l3), page) shouldBe true
@@ -302,5 +139,88 @@ class NightPagesTest {
         // 產品只寫 l2／l3，往返不變
         NightLevel.entries.map { it.prefValue } shouldBe listOf("l2", "l3")
         NightLevel.entries.forEach { NightLevel.fromPref(it.prefValue) shouldBe it }
+    }
+
+    @Test
+    fun `legacy and numeric-only combinations cannot authorize either reader tier`() {
+        val all = NightPages.artifactNames(page) + NightPages.rulesStampName(page)
+        for (mask in 0 until (1 shl all.size)) {
+            val names = all.filterIndexed { index, _ -> mask and (1 shl index) != 0 }.toSet()
+            resolveBoth(names) shouldBe listOf(null, null)
+            NightPages.markerName(names, page) shouldBe null
+            NightPages.needsRender(names, page) { true } shouldBe true
+        }
+    }
+
+    @Test
+    fun `complete current pair resolves two tiers while legacy siblings are ignored`() {
+        val proofs = NightPolicy.names(page, "a".repeat(32), moreDistinct = true)
+        val current = setOf(std, more) + proofs
+        resolveBoth(current) shouldBe listOf(std, more)
+        resolveBoth(current + setOf(l1, l2, l3, legacy)) shouldBe listOf(std, more)
+        NightPages.markerName(current, page) shouldBe std
+        val other = "a.night.jpg"
+        val otherNames = NightPages.currentNames(other).toSet() +
+            NightPolicy.names(other, "b".repeat(32), moreDistinct = true)
+        NightPages.resolveName(otherNames, other, NightLevel.MORE) shouldBe NightPages.levelName(other, NightLevel.MORE)
+        NightPages.resolveName(current + otherNames, other, NightLevel.STANDARD) shouldBe
+            NightPages.levelName(other, NightLevel.STANDARD)
+    }
+
+    @Test
+    fun `proof deletion never reveals an older legacy image`() {
+        val proofs = NightPolicy.names(page, "c".repeat(32), moreDistinct = true)
+        val start = NightPages.artifactNames(page).toSet() + proofs
+        val remaining = start.toMutableSet()
+        resolveBoth(remaining) shouldBe listOf(std, more)
+        for (proof in proofs) {
+            remaining -= proof
+            resolveBoth(remaining) shouldBe listOf(null, null)
+        }
+        for (image in NightPages.artifactNames(page)) {
+            remaining -= image
+            resolveBoth(remaining) shouldBe listOf(null, null)
+        }
+    }
+
+    @Test
+    fun `availability advertises legacy migration without trusting legacy pixels`() {
+        val proofs = NightPolicy.names(page, "d".repeat(32), moreDistinct = true)
+        NightPages.availability(false, setOf(std, more) + proofs) shouldBe NightAvailability.UNSUPPORTED
+        NightPages.availability(true, setOf(std, more) + proofs) shouldBe NightAvailability.READY
+        listOf(
+            setOf(std),
+            setOf(l1, l2, l3),
+            setOf(legacy),
+            setOf(std, NightPages.rulesStampName(page)),
+        ).forEach { names ->
+            NightPages.availability(true, names) shouldBe NightAvailability.LEGACY
+            resolveBoth(names) shouldBe listOf(null, null)
+        }
+        listOf(emptySet(), setOf(more), setOf(l2, l3), setOf("$std.tmp")).forEach { names ->
+            NightPages.availability(true, names) shouldBe NightAvailability.NONE
+        }
+    }
+
+    @Test
+    fun `legal maximum UTF8 basenames use bounded hashed names without collisions`() {
+        val longPage = "あ".repeat(83) + "ab.png"
+        longPage.toByteArray(Charsets.UTF_8).size shouldBe 255
+        val names = NightPages.currentNames(longPage)
+        val proofs = NightPolicy.names(longPage, "e".repeat(32), moreDistinct = true)
+        (names + names.map(NightPages::tmpName) + proofs + NightSourceRevision.fileName(longPage)).forEach {
+            (it.toByteArray(Charsets.UTF_8).size <= 255) shouldBe true
+        }
+        names.toSet().intersect(NightPages.currentNames(longPage.replace("ab.png", "ac.png")).toSet()) shouldBe
+            emptySet()
+        val all = names.toSet() + proofs
+        NightPages.resolveName(all, longPage, NightLevel.MORE) shouldBe names.last()
+        NightPages.filesOfMissingPages(all, setOf(longPage)) shouldBe emptySet()
+        NightPages.summarize(all) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.READY, false)
+        val incomplete = all - proofs.first()
+        NightPages.summarize(incomplete) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.LEGACY, true)
+        val same = setOf(names.first()) + NightPolicy.names(longPage, "f".repeat(32), moreDistinct = false)
+        NightPages.summarize(same) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.READY, false)
+        NightPages.resolveName(same, longPage, NightLevel.MORE) shouldBe names.first()
     }
 }

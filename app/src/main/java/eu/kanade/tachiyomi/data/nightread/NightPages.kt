@@ -6,10 +6,10 @@ import li.joye.yakuyomi.nightread.NightTier
 
 /** 閱讀器裡一章的夜讀狀態（見 [NightPages.availability]）。 */
 enum class NightAvailability {
-    /** 至少一頁有完成標記（新格式 std 或三檔格式 l1）：檔位切換可用。 */
+    /** At least one complete current-policy recipe exists; opening still validates its witness. */
     READY,
 
-    /** 只有舊版單檔：顯示舊圖、檔位鈕灰，點了可重新產生夜讀版。 */
+    /** Legacy or unproved artifacts need regeneration; reader streams fall back to source. */
     LEGACY,
 
     /** 沒有夜讀版：檔位鈕灰，點了可產生。 */
@@ -20,40 +20,27 @@ enum class NightAvailability {
 }
 
 /**
- * 夜讀版頁圖的**檔名慣例、查找與定位**：產生端（`PageTranslator.renderNightChapter`）、顯示端（reader 的 loader）、
- * 章節列與佇列的「有沒有夜讀版」掃描都照這裡算，別各自拼字串。檔名規則與查找都是純函式（JVM 單元測試見 NightPagesTest）。
+ * Shared naming, metadata-only migration summaries and prepared reader indexes for derived Night
+ * images in `<chapter>/.yakuyomi/`. Standard is L2; more is L3. A distinct more image is optional
+ * only when its immutable proof explicitly records `more.same`.
  *
- * 都放在 `<章節夾>/.yakuyomi/`，保留**完整頁檔名（含副檔名）**。三種格式並存、**已產生的章不必重做**：
- *  - **兩檔（現行，2026-10-01 起寫的都是這種）**，見 [NightLevel]：
- *     - `012.jpg.night.std.webp`：「標準」（引擎 L2），一定有，也是「這頁完成」的標記（新鮮度看它）。
- *     - `012.jpg.night.more.webp`：「更多」（引擎 L3），只在與標準不同時才有（相同＝輸出逐位元相同，不重存）。
- *  - **三檔（只讀）**：2026-10-01 當天三檔版產生的 `012.jpg.night.l1.webp`（一定有、完成標記）／`.l2`（與 l1 不同才有）／
- *    `.l3`（與 l2 不同才有）。標準讀 l2…l1、更多讀 l3…l1 中存在的最高檔（與三檔時代的 L2／L3 完全同義）。
- *  - **舊版單檔（只讀）**：`012.jpg.night.webp`（三檔之前產生的）。兩檔都顯示它、檔位鈕灰，可重新產生。
- *  - 暫存一律是「最終名 + `.tmp`」，reader 永遠不認。
- * 產生端只寫兩檔格式；新的標準檔落地後刪掉同頁的三檔與舊版單檔（[oldFormatNames]）。同頁新舊並存（刪到一半被殺）時
- * **有 std 就只看兩檔格式**，三檔與舊版單檔視而不見（[resolveName]），下次產生開跑時清掉（[leftovers]）。
+ * Reader authority requires a complete std/more proof pair with one UUID generation and the actual
+ * analysis RGB policy, plus a matching committed auxiliary source revision, canonical capture epoch
+ * and known source/material metadata. Names and numeric rules stamps alone never authorize reads.
+ * Legacy single/three-tier images and unproved std images remain migration/history metadata; the
+ * reader falls back to the visible source until they are regenerated. Original/translation/journal
+ * authority remains in the existing translation stores, not in this derived-cache protocol.
  *
- * **不去副檔名**：同章可能同時有 `012.jpg` 與 `012.png`（來源混格式、或重下載換了格式留下舊檔），去副檔名會讓兩頁算到
- * 同一組夜讀檔、互相蓋掉；帶著副檔名就一頁一組、天然不碰撞。重繪素材（`<base>.orig.<副檔名>`、舊版 `<base>.orig.webp`
- * 等，見 `OriginalMaterial`）沿用它自己去副檔名的 base，兩套慣例並存無妨。WebP **無損**——暗底上有損壓縮會出色帶。
+ * Page names keep their extension so mixed source formats remain distinct. Long legal UTF-8 names
+ * use a hashed image stem; revision/proof names are always hashed and fit the filesystem limit.
+ * Temporary images are never served. Producers revoke proof authority before fixed-image writes.
  *
- * **為什麼放 `.yakuyomi/`**：reader 列頁只看章節夾頂層的圖檔，子夾自動被忽略 → 夜讀版不會被當成多出來的一頁；
- * 同時跟重繪素材同一個子夾、刪章時整夾一起走，不留孤兒檔。
- *
- * **新鮮度**：成品頁被覆寫（重翻／重繪／即時翻落地）後夜讀版就是舊畫面。產生端用 [isFresh]（比 [markerName]：有 std 看
- * std、否則看 l1）決定要不要重做、覆寫端呼叫 `invalidateNightPage` 刪掉這頁所有夜讀檔（[artifactNames]：標記照查找優先序
- * 反過來刪、附屬檔最後）；兩道都有，reader 才不會端出過期的暗色頁。
- *
- * **規則版本**（[RULES_VERSION]＝nightread 的 `NightRead.RULES_VERSION`，2026-10-03 起）：app 更新改了夜讀規則時，已產生的頁要
- * 標「可更新」、由使用者一鍵重新產生（不自動重做）。每頁換檔完成（std 落地）後，產生端在旁邊寫一個**空的版本記號**
- * `012.jpg.night.rules1`（[rulesStampName]）。這頁的版本（[pageRulesVersion]）＝有 std 時同頁記號裡最大的那個，沒有記號＝0；
- * 只有三檔格式或舊版單檔的頁＝0（記版本之前產生的）。版本 < [RULES_VERSION] 的頁算舊版：章節列標「可更新」（[summarize]）、
- * 產生端當它不新鮮、重做（[isPageOutdated]）——所以同一章有新有舊時只補舊的那幾頁。
- *  - 記號是另一個檔、不是改夜讀檔的檔名：reader 的查找與刪除順序（上面那些）一個字都不用動，舊版 app 也不認得它、不會刪它。
- *  - 記號寫在 std **之後**：中途被殺最多讓新頁看起來像舊版（下次多做一次），不會讓舊頁冒充新版。std 被刪（作廢、重新產生）時
- *    記號可以留著——沒有 std 的記號不算數，下次產生開跑時清掉（[staleStamps]）；之後同版本再產生會重用同名記號。
- *  - 記號不是夜讀檔（[isNightArtifact] 不認），也不會被當成重繪素材（`OriginalMaterial` 只認 `.orig.`）。
+ * [Index] prepares exact URIs and positive/negative policy entries during initial or explicit refresh.
+ * A complete snapshot is published atomically. Decode uses only those exact URIs, bounded revision/
+ * proof records and known metadata before/after opening an image; it never lists, hashes an image,
+ * recovers, writes or lazily refreshes. Internal writes advance revision and publish per-page events.
+ * External edits preserving all observed metadata are outside this freshness guarantee; discovery
+ * of new external material files requires explicit refresh.
  */
 object NightPages {
 
@@ -89,9 +76,16 @@ object NightPages {
     const val STAMP_PROBE = "night.rules.probe"
 
     /** 兩檔格式：`012.jpg` + 標準 → `012.jpg.night.std.webp`；更多 → `012.jpg.night.more.webp`。 */
-    fun levelName(pageFileName: String, level: NightLevel): String = "$pageFileName.night.${level.fileKey}.webp"
+    fun levelName(pageFileName: String, level: NightLevel): String {
+        val stem = if (pageFileName.toByteArray(Charsets.UTF_8).size <= 220) {
+            pageFileName
+        } else {
+            "night-${NightSourceRevision.pageKey(pageFileName)}"
+        }
+        return "$stem.night.${level.fileKey}.webp"
+    }
 
-    /** 三檔格式（只讀）：`012.jpg` + L2 → `012.jpg.night.l2.webp`。 */
+    /** Historical three-tier name for migration/cleanup, not current read authority. */
     fun tierName(pageFileName: String, tier: NightTier): String = "$pageFileName.night.${tier.key}.webp"
 
     /** `012.jpg` → `012.jpg.night.webp`（舊版單檔）。 */
@@ -109,10 +103,10 @@ object NightPages {
     /** 夜讀最終檔（任一格式，不含暫存）。 */
     fun isFinalNightFile(name: String): Boolean = isNightArtifact(name) && !name.endsWith(TMP_SUFFIX)
 
-    /** 最終檔名 → 它屬於哪一頁（`012.jpg.night.more.webp` → `012.jpg`）；不是夜讀最終檔 → null。 */
+    /** Final image -> source name or hashed stem; non-final names return null. */
     fun pageOf(name: String): String? = FINAL.find(name)?.groupValues?.get(1)
 
-    /** 兩檔格式的檔名，**標準（完成標記）在前**：std、more。 */
+    /** Current fixed image names, standard first; a complete proof pair is also required. */
     fun currentNames(pageFileName: String): List<String> = NightLevel.entries.map { levelName(pageFileName, it) }
 
     /** 舊格式的檔名（新標準檔落地後要清掉的），**標記在前**：l1、l2、l3、舊版單檔。 */
@@ -120,14 +114,8 @@ object NightPages {
         NightTier.entries.map { tierName(pageFileName, it) } + legacyName(pageFileName)
 
     /**
-     * 一頁所有可能的夜讀最終檔，也是**整頁作廢時的刪除順序**：舊版單檔、l1、std、more、l2、l3。
-     *  - 三個完成標記照**查找優先序反過來**刪（舊版單檔 < l1 < std，見 [resolveName]）：先刪的一定是被更高格式遮住、
-     *    本來就看不到的；輪到正在顯示的那個標記時，比它低的都已經刪了，這頁直接變成「沒有夜讀版」。刪到一半的每個狀態，
-     *    reader 看到的不是原本那組、就是原圖——不會在 std 刪掉後退回同頁更舊的三檔或舊版單檔（過期重做時那些也是舊畫面）。
-     *  - 附屬檔（more、l2、l3）放在所有標記之後：標記都沒了它們就是孤兒、reader 不認，順序無所謂。每種格式仍是標記在附屬檔
-     *    之前，閱讀器不會把殘留的 more 配上別的 std、或殘留的 l2 配上別的 l1。
-     * （規格原寫 std、more、l1、l2、l3、舊版單檔；同頁新舊並存時——例如 std 改名後才發現頁圖過期——先刪 std 會讓 reader
-     * 退回舊的三檔或單檔，被殺或刪不掉時就一直端出過期圖。這個順序同樣「標記先於附屬檔」，只多了這一層保證。）
+     * Per-page historical/current final image names in cleanup order. Proof authority and revision
+     * must be revoked before replacement/deletion; this list itself grants no write/read authority.
      */
     fun artifactNames(pageFileName: String): List<String> = listOf(
         legacyName(pageFileName),
@@ -139,35 +127,17 @@ object NightPages {
     )
 
     /**
-     * 顯示 [level] 時這頁要讀哪個檔（純函式，[names]＝`.yakuyomi/` 內的檔名集合）：
-     *  - 有 std（兩檔格式）：標準 → std；更多 → more，沒有就 std。同頁殘留的三檔／舊版單檔不看。
-     *  - 沒有 std、有 l1（三檔格式）：取 l{level.tier}…l1 中存在的最高那一檔（標準＝l2 或 l1、更多＝l3、l2 或 l1）。
-     *  - 都沒有、但有舊版單檔：回舊版單檔（兩檔都是它）。
-     *  - 都沒有：null（顯示原圖）。孤兒（沒有 std 的 more、沒有 l1 的 l2／l3，產生到一半被殺留下的）視而不見。
+     * Metadata-only recipe selection. A complete current-policy pair is required; explicit
+     * more.same selects standard. Legacy, partial and mixed recipes return null. Actual streams
+     * must additionally verify the revision, proof payloads and source/material witness.
      */
     fun resolveName(names: Set<String>, pageFileName: String, level: NightLevel): String? {
-        if (levelName(pageFileName, NightLevel.STANDARD) in names) {
-            for (k in level.ordinal downTo 0) {
-                val n = levelName(pageFileName, NightLevel.entries[k])
-                if (n in names) return n
-            }
-        }
-        if (tierName(pageFileName, NightTier.L1) in names) {
-            for (k in level.tier.ordinal downTo 0) {
-                val n = tierName(pageFileName, NightTier.entries[k])
-                if (n in names) return n
-            }
-        }
-        return legacyName(pageFileName).takeIf { it in names }
+        return NightPolicy.recipe(names, pageFileName, level)?.imageName
     }
 
-    /**
-     * 這頁的完成標記（新鮮度比它）：有 std → std；否則有 l1 → l1；都沒有 → null（只有舊版單檔或孤兒＝不算完成，
-     * 產生端會重做、升級成兩檔）。
-     */
+    /** Standard image of a complete current-policy recipe; never a translation completion marker. */
     fun markerName(names: Set<String>, pageFileName: String): String? =
-        levelName(pageFileName, NightLevel.STANDARD).takeIf { it in names }
-            ?: tierName(pageFileName, NightTier.L1).takeIf { it in names }
+        NightPolicy.recipe(names, pageFileName, NightLevel.STANDARD)?.imageName
 
     /**
      * [names]（`.yakuyomi/` 內的夜讀最終檔）裡**永遠不會被顯示**、可以直接刪的檔（產生端開跑時清掉）：
@@ -184,7 +154,7 @@ object NightPages {
                 levelName(page, NightLevel.STANDARD) in names -> n in oldFormatNames(page)
                 // 沒有 std：孤兒 more
                 n == levelName(page, NightLevel.MORE) -> true
-                // 也沒有 l1：孤兒 l2／l3（有 l1 的三檔照讀）
+                // Historical l1 keeps its siblings for migration; none is current read authority.
                 tierName(page, NightTier.L1) in names -> false
                 else -> n == tierName(page, NightTier.L2) || n == tierName(page, NightTier.L3)
             }
@@ -195,7 +165,7 @@ object NightPages {
 
     // —— 規則版本記號（見類別說明「規則版本」） ——
 
-    /** `012.jpg` + 1 → `012.jpg.night.rules1`（空檔，只看在不在）。 */
+    /** Historical empty numeric stamp name; existence grants no current read authority. */
     fun rulesStampName(pageFileName: String, version: Int = RULES_VERSION): String = "$pageFileName$RULES_MARK$version"
 
     /** 是不是規則版本記號（不是夜讀檔、也不是重繪素材）。 */
@@ -216,18 +186,17 @@ object NightPages {
     }
 
     /**
-     * 這頁夜讀版的規則版本（純函式，[names]＝`.yakuyomi/` 內的檔名、要含記號；[stamps]＝[rulesStamps] 的結果，同一章多頁共用時
-     * 先算好傳進來）：
-     *  - 有 std（兩檔格式）：同頁記號的最大版本，沒有記號＝0。
-     *  - 沒有 std、有 l1（三檔格式）或舊版單檔：0（記版本之前產生的；同頁殘留的記號不算——它不是替這些檔寫的）。
-     *  - 都沒有（沒有夜讀版，含只剩孤兒 more／l2／l3 或只剩記號）：null。
+     * Metadata-only migration version: a complete current policy pair uses [RULES_VERSION];
+     * unproved std, historical l1 or single images use zero; orphan-only sets return null.
+     * [stamps] is retained for call compatibility; numeric stamps cannot promote an old image.
      */
     fun pageRulesVersion(
         names: Set<String>,
         pageFileName: String,
         stamps: Map<String, Int> = rulesStamps(names),
     ): Int? = when {
-        levelName(pageFileName, NightLevel.STANDARD) in names -> stamps[pageFileName] ?: 0
+        levelName(pageFileName, NightLevel.STANDARD) in names ->
+            if (NightPolicy.recipe(names, pageFileName, NightLevel.STANDARD) != null) RULES_VERSION else 0
         tierName(pageFileName, NightTier.L1) in names || legacyName(pageFileName) in names -> 0
         else -> null
     }
@@ -268,7 +237,15 @@ object NightPages {
         val out = LinkedHashSet<String>()
         for (n in names) {
             val page = pageOf(n) ?: parseRulesStamp(n)?.first ?: continue
-            if (page !in pages) out += n
+            val hashedPage = page.removePrefix("night-").takeIf {
+                page.startsWith("night-") &&
+                    it.matches(Regex("[a-f0-9]{64}"))
+            }
+            if (page !in pages &&
+                (hashedPage == null || pages.none { NightSourceRevision.pageKey(it) == hashedPage })
+            ) {
+                out += n
+            }
         }
         return out
     }
@@ -317,10 +294,10 @@ object NightPages {
 
     /** 一章的夜讀狀態（只看檔名；不支援的章由呼叫端另判）。 */
     enum class ChapterState {
-        /** 至少一頁有完成標記（std 或 l1）：檔位切換可用。 */
+        /** At least one complete current-policy recipe, subject to stream-time validation. */
         READY,
 
-        /** 沒有任何完成標記、但有舊版單檔：顯示舊圖，檔位鈕灰、可重新產生。 */
+        /** Legacy/unproved image metadata exists and needs regeneration; source is displayed. */
         LEGACY,
 
         /** 都沒有。 */
@@ -334,8 +311,9 @@ object NightPages {
     data class ChapterSummary(val state: ChapterState, val outdated: Boolean)
 
     /**
-     * [names]＝`.yakuyomi/` 內的檔名（要含記號，否則每頁都算舊版）。一次掃完：狀態照 [chapterState] 的規則，舊版照
-     * [isPageOutdated]。孤兒、暫存、只剩記號的頁都不算有夜讀版、也不算舊版。
+     * Metadata-only summary including immutable policy proof names. Complete current recipes are
+     * READY; unproved std and historical images are LEGACY/outdated. Orphan/temp/stamp-only sets
+     * do not count as available images. Stream-time payload/revision checks remain mandatory.
      */
     fun summarize(names: Iterable<String>, current: Int = RULES_VERSION): ChapterSummary {
         val set = names as? Set<String> ?: names.toHashSet()
@@ -343,10 +321,37 @@ object NightPages {
         var ready = false
         var legacy = false
         var outdated = false
+        // A maximum-length source uses a hashed image stem; the original filename is intentionally
+        // absent from auxiliary names. Its complete proof pair still contributes to chapter UI.
+        val policyByKey = set.mapNotNull(NightPolicy::parse).groupBy { it.pageKey }
+        val hashedStems = set.mapNotNull(::pageOf).filterTo(hashSetOf()) {
+            it.startsWith("night-") && it.removePrefix("night-").matches(Regex("[a-f0-9]{64}"))
+        }
+        for (stem in hashedStems) {
+            if ("$stem.night.std.webp" !in set) continue
+            val pair = policyByKey[stem.removePrefix("night-")].orEmpty()
+            val standard = pair.singleOrNull { it.level == NightLevel.STANDARD }
+            val more = pair.singleOrNull { it.level == NightLevel.MORE }
+            val valid = pair.size == 2 && standard != null && more != null && pair.all {
+                it.generation == standard.generation && it.version == RULES_VERSION &&
+                    it.policy == li.joye.yakuyomi.engine.NightReadRenderer.INPUT_RGB_POLICY_ID
+            } && (more.same != ("$stem.night.more.webp" in set))
+            if (valid) {
+                ready = true
+                if (RULES_VERSION < current) outdated = true
+            } else {
+                legacy = true
+                outdated = true
+            }
+        }
         for (n in set) {
             val page = pageOf(n) ?: continue
+            if (page in hashedStems) continue
             when (n) {
-                levelName(page, NightLevel.STANDARD), tierName(page, NightTier.L1) -> ready = true
+                levelName(page, NightLevel.STANDARD) -> {
+                    if (NightPolicy.recipe(set, page, NightLevel.STANDARD) != null) ready = true else legacy = true
+                }
+                tierName(page, NightTier.L1) -> legacy = true
                 legacyName(page) -> legacy = true
                 else -> continue // more／l2／l3：跟著標記走，不單獨算
             }
@@ -360,7 +365,7 @@ object NightPages {
         return ChapterSummary(state, outdated)
     }
 
-    /** [names]＝`.yakuyomi/` 內的檔名。有 std 或 l1 → READY；否則有舊版單檔 → LEGACY；否則 NONE。孤兒、暫存不算。 */
+    /** Metadata-only READY/LEGACY/NONE summary; proof payload and revision checks occur on open. */
     fun chapterState(names: Iterable<String>): ChapterState = summarize(names).state
 
     /**
@@ -381,51 +386,114 @@ object NightPages {
         artifactNames(pageFileName).any { it in names }
 
     /**
-     * 列 [chapterDir]`/.yakuyomi/` 裡的夜讀**最終檔與規則版本記號**（name → UniFile，不含暫存與重繪素材）。夾不在＝空。
-     * 一次 listFiles（SAF 上一次 provider 查詢），比逐頁 findFile 便宜得多。記號放進來是給 [summarize] 判「可更新」用；
-     * [resolveName]／[availability] 本來就不認它。
+     * Explicit metadata scan of final images, historical numeric stamps and immutable policy proofs.
+     * Does not authorize serving an image; stream readers use an atomically prepared [Index].
      */
     fun listFinal(chapterDir: UniFile): Map<String, UniFile> {
         val dir = chapterDir.findFile(DIR)?.takeIf { it.isDirectory } ?: return emptyMap()
-        return dir.listFiles().orEmpty()
-            .mapNotNull { f -> f.name?.takeIf { isFinalNightFile(it) || isRulesStamp(it) }?.let { it to f } }
-            .toMap()
+        return NightSourceRevision.inventory(dir).filterKeys {
+            isFinalNightFile(it) || isRulesStamp(it) ||
+                NightPolicy.parse(it) != null
+        }
     }
 
-    /**
-     * 夜讀版 [night]（完成標記，[markerName]）是否比成品頁 [page] 新（不比它舊就算新鮮）。
-     * 用修改時間而非內容雜湊：頁圖每次覆寫都會更新 mtime，而夜讀版一定在覆寫之後才產生；比對雜湊得整張讀進來、划不來。
-     */
+    /** Producer mtime prefilter only; reuse also requires a matching revision/policy witness. */
     fun isFresh(night: UniFile, page: UniFile): Boolean = night.lastModified() >= page.lastModified()
 
     /**
-     * 一章 `.yakuyomi/` 的夜讀檔名快取（name → UniFile），給 reader 的 loader 用：每次解碼都 findFile 在非主要儲存上
-     * 等於每次列整個資料夾，這裡列一次就重用。快取可能過期（佇列剛產出新頁、或重新產生時刪了舊檔）：呼叫端在
-     * 「這頁查不到可送的檔」時探一次 std、在開檔失敗時 [invalidate] 後重列（見 `NightPageStreams`）。執行緒安全（整份換掉）。
+     * Exact-URI cache for one chapter. [refreshPrepared] builds positive and negative policy entries
+     * privately, including read-only canonical epoch validation, then publishes the complete
+     * snapshot. [cachedPage] performs no lazy preparation, listing, recovery or refresh. A missing,
+     * corrupt, pending or legacy entry stays negative until an explicit event/status/tier refresh.
      */
     class Index {
-        private class Snapshot(val dir: UniFile, val files: Map<String, UniFile>)
+        internal class PageFiles(val files: Map<String, UniFile>, val io: NightPolicy.Entry)
+        private class Prepared(val value: PageFiles?)
+        private class Snapshot(val dir: UniFile, val files: Map<String, UniFile>) {
+            val pages = HashMap<String, Prepared>()
+
+            // Group policy URIs once. Per decode never walks a chapter-sized name collection.
+            val proofs = files.entries.mapNotNull { (name, file) ->
+                NightPolicy.parse(name)?.let { Triple(it.pageKey, name, file) }
+            }.groupBy { it.first }
+        }
 
         @Volatile
         private var snapshot: Snapshot? = null
+        private val refreshLock = Any()
 
-        /** 讓快取失效（下次 [files] 會重列）。 */
+        /** Discard the snapshot; decode remains negative until explicit prepared refresh. */
         fun invalidate() {
             snapshot = null
         }
 
-        /** 快取的檔名表；沒有或屬於別的資料夾 → 重列。 */
+        /** Metadata inventory API, with initial scan if needed; never called from decode. */
         fun files(chapterDir: UniFile): Map<String, UniFile> {
             val s = snapshot
             if (s != null && (s.dir === chapterDir || s.dir.uri == chapterDir.uri)) return s.files
             return refresh(chapterDir)
         }
 
-        /** 重列一次 `.yakuyomi/` 並換掉快取，回傳新檔名表。 */
-        fun refresh(chapterDir: UniFile): Map<String, UniFile> {
-            val files = listFinal(chapterDir)
-            snapshot = Snapshot(chapterDir, files)
-            return files
+        /** Acquire one bounded inventory without publishing partially prepared entries. */
+        private fun readSnapshot(chapterDir: UniFile): Snapshot {
+            val materials = chapterDir.findFile(DIR)
+            val files = if (materials == null) {
+                emptyMap()
+            } else {
+                if (!materials.isDirectory ||
+                    materials.name != DIR
+                ) {
+                    throw java.io.IOException("Invalid Night materials directory")
+                }
+                NightSourceRevision.inventory(materials)
+            }
+            return Snapshot(chapterDir, files)
+        }
+
+        fun refresh(chapterDir: UniFile): Map<String, UniFile> = synchronized(refreshLock) {
+            val next = readSnapshot(chapterDir)
+            snapshot = next
+            next.files
+        }
+
+        /** Build every positive/negative entry privately; decode sees either complete snapshot. */
+        internal fun refreshPrepared(chapterDir: UniFile, sources: List<Pair<String, UniFile>>): Map<String, UniFile> =
+            synchronized(refreshLock) {
+                val next = readSnapshot(chapterDir)
+                sources.forEach { (page, source) -> prepare(next, source, page) }
+                snapshot = next
+                next.files
+            }
+
+        private fun prepare(current: Snapshot, source: UniFile, page: String): PageFiles? {
+            current.pages[page]?.let { return it.value }
+            val value = runCatching {
+                val selected = LinkedHashMap<String, UniFile>()
+                current.proofs[NightSourceRevision.pageKey(page)].orEmpty().also {
+                    if (it.size > 16) throw java.io.IOException("Ambiguous Night proof inventory")
+                }.forEach { (_, name, file) -> selected[name] = file }
+                NightPages.currentNames(page).forEach { name -> current.files[name]?.let { selected[name] = it } }
+                if (NightPolicy.recipe(selected.keys, page, NightLevel.STANDARD) == null) return@runCatching null
+                PageFiles(selected, NightPolicy.entry(source, page, current.files))
+            }.getOrNull()
+            current.pages[page] = Prepared(value)
+            return value
+        }
+
+        /** Negative results are cached too. Only initial/explicit refresh can discover new files. */
+        @Synchronized
+        internal fun page(chapterDir: UniFile, source: UniFile, page: String): PageFiles? {
+            files(chapterDir)
+            val current = snapshot ?: return null
+            return prepare(current, source, page)
+        }
+
+        /** Decode entry: no lazy refresh or lazy capture-history work, even for a negative cache. */
+        @Synchronized
+        internal fun cachedPage(chapterDir: UniFile, page: String): PageFiles? {
+            val current = snapshot ?: return null
+            if (current.dir !== chapterDir && current.dir.uri != chapterDir.uri) return null
+            return current.pages[page]?.value
         }
     }
 }

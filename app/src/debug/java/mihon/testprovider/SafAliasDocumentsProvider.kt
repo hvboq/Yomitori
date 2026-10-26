@@ -55,6 +55,7 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
     ): Cursor {
         val (session, directory) = resolve(parentDocumentId)
         check(directory.isDirectory)
+        session.childQueries.incrementAndGet()
         session.reads.add(parentDocumentId)
         return MatrixCursor(projection ?: COLUMNS).apply {
             for (child in requireNotNull(directory.listFiles()).sortedBy { it.name }) {
@@ -95,6 +96,8 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
             }
         } else {
             session.reads.add(documentId)
+            if (file == session.page) session.sourceImageOpens.incrementAndGet()
+            if (file.name.startsWith("capture-")) session.captureHistoryOpens.incrementAndGet()
         }
         return ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode))
     }
@@ -311,6 +314,9 @@ class SafAliasDocumentsProvider : DocumentsProvider() {
         val writeModes = CopyOnWriteArrayList<Pair<String, String>>()
         val createRequests = CopyOnWriteArrayList<Pair<String, String>>()
         val reads = CopyOnWriteArrayList<String>()
+        val childQueries = AtomicInteger()
+        val sourceImageOpens = AtomicInteger()
+        val captureHistoryOpens = AtomicInteger()
 
         fun documentId(file: File): String = "$id|${checked(file).relativeTo(directory).invariantSeparatorsPath}"
 

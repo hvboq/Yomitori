@@ -28,6 +28,7 @@ import okio.Buffer
 import okio.BufferedSource
 import tachiyomi.decoder.Format
 import tachiyomi.decoder.ImageDecoder
+import java.io.IOException
 import java.io.InputStream
 import java.util.Locale
 import kotlin.math.abs
@@ -141,33 +142,42 @@ object ImageUtil {
      */
     fun splitInHalf(imageSource: BufferedSource, side: Side): BufferedSource {
         val imageBitmap = BitmapFactory.decodeStream(imageSource.inputStream())
-        val height = imageBitmap.height
-        val width = imageBitmap.width
-
-        val singlePage = Rect(0, 0, width / 2, height)
-
-        val half = createBitmap(width / 2, height)
-        val part = when (side) {
-            Side.RIGHT -> Rect(width - width / 2, 0, width, height)
-            Side.LEFT -> Rect(0, 0, width / 2, height)
+        try {
+            val height = imageBitmap.height
+            val width = imageBitmap.width
+            val singlePage = Rect(0, 0, width / 2, height)
+            val half = createBitmap(width / 2, height)
+            try {
+                val part = when (side) {
+                    Side.RIGHT -> Rect(width - width / 2, 0, width, height)
+                    Side.LEFT -> Rect(0, 0, width / 2, height)
+                }
+                half.applyCanvas {
+                    drawColor(Color.WHITE)
+                    drawBitmap(imageBitmap, part, singlePage, null)
+                }
+                half.setHasAlpha(false)
+                return readerJpeg(half)
+            } finally {
+                half.recycle()
+            }
+        } finally {
+            imageBitmap.recycle()
         }
-        half.applyCanvas {
-            drawBitmap(imageBitmap, part, singlePage, null)
-        }
-        val output = Buffer()
-        half.compress(Bitmap.CompressFormat.JPEG, 100, output.outputStream())
-
-        return output
     }
 
     fun rotateImage(imageSource: BufferedSource, degrees: Float): BufferedSource {
         val imageBitmap = BitmapFactory.decodeStream(imageSource.inputStream())
-        val rotated = rotateBitMap(imageBitmap, degrees)
-
-        val output = Buffer()
-        rotated.compress(Bitmap.CompressFormat.JPEG, 100, output.outputStream())
-
-        return output
+        try {
+            val rotated = rotateBitMap(imageBitmap, degrees)
+            try {
+                return readerJpeg(rotated)
+            } finally {
+                if (rotated !== imageBitmap) rotated.recycle()
+            }
+        } finally {
+            imageBitmap.recycle()
+        }
     }
 
     private fun rotateBitMap(bitmap: Bitmap, degrees: Float): Bitmap {
@@ -180,30 +190,65 @@ object ImageUtil {
      */
     fun splitAndMerge(imageSource: BufferedSource, upperSide: Side): BufferedSource {
         val imageBitmap = BitmapFactory.decodeStream(imageSource.inputStream())
-        val height = imageBitmap.height
-        val width = imageBitmap.width
-
-        val result = createBitmap(width / 2, height * 2)
-        result.applyCanvas {
-            // right -> upper
-            val rightPart = when (upperSide) {
-                Side.RIGHT -> Rect(width - width / 2, 0, width, height)
-                Side.LEFT -> Rect(0, 0, width / 2, height)
+        try {
+            val height = imageBitmap.height
+            val width = imageBitmap.width
+            val result = createBitmap(width / 2, height * 2)
+            try {
+                result.applyCanvas {
+                    drawColor(Color.WHITE)
+                    // right -> upper
+                    val rightPart = when (upperSide) {
+                        Side.RIGHT -> Rect(width - width / 2, 0, width, height)
+                        Side.LEFT -> Rect(0, 0, width / 2, height)
+                    }
+                    val upperPart = Rect(0, 0, width / 2, height)
+                    drawBitmap(imageBitmap, rightPart, upperPart, null)
+                    // left -> bottom
+                    val leftPart = when (upperSide) {
+                        Side.LEFT -> Rect(width - width / 2, 0, width, height)
+                        Side.RIGHT -> Rect(0, 0, width / 2, height)
+                    }
+                    val bottomPart = Rect(0, height, width / 2, height * 2)
+                    drawBitmap(imageBitmap, leftPart, bottomPart, null)
+                }
+                result.setHasAlpha(false)
+                return readerJpeg(result)
+            } finally {
+                result.recycle()
             }
-            val upperPart = Rect(0, 0, width / 2, height)
-            drawBitmap(imageBitmap, rightPart, upperPart, null)
-            // left -> bottom
-            val leftPart = when (upperSide) {
-                Side.LEFT -> Rect(width - width / 2, 0, width, height)
-                Side.RIGHT -> Rect(0, 0, width / 2, height)
-            }
-            val bottomPart = Rect(0, height, width / 2, height * 2)
-            drawBitmap(imageBitmap, leftPart, bottomPart, null)
+        } finally {
+            imageBitmap.recycle()
         }
+    }
 
-        val output = Buffer()
-        result.compress(Bitmap.CompressFormat.JPEG, 100, output.outputStream())
-        return output
+    /** Display transforms use JPEG; its missing alpha must mean white paper rather than black. */
+    private fun readerJpeg(bitmap: Bitmap): BufferedSource {
+        val paper = if (bitmap.hasAlpha()) {
+            createBitmap(bitmap.width, bitmap.height).also { composite ->
+                try {
+                    composite.applyCanvas {
+                        drawColor(Color.WHITE)
+                        drawBitmap(bitmap, null, Rect(0, 0, bitmap.width, bitmap.height), null)
+                    }
+                    composite.setHasAlpha(false)
+                } catch (error: Throwable) {
+                    composite.recycle()
+                    throw error
+                }
+            }
+        } else {
+            bitmap
+        }
+        try {
+            return Buffer().also { output ->
+                if (!paper.compress(Bitmap.CompressFormat.JPEG, 100, output.outputStream())) {
+                    throw IOException("Cannot encode reader image transform")
+                }
+            }
+        } finally {
+            if (paper !== bitmap) paper.recycle()
+        }
     }
 
     /**

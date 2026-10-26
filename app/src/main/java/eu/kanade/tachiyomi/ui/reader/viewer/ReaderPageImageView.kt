@@ -1,11 +1,14 @@
 package eu.kanade.tachiyomi.ui.reader.viewer
 
 import android.content.Context
+import android.graphics.Color
 import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.drawable.Animatable
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.LayerDrawable
 import android.util.AttributeSet
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -220,7 +223,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
         pendingRestore = null
         when (it) {
             is SubsamplingScaleImageView -> it.recycle()
-            is AppCompatImageView -> it.dispose()
+            is AppCompatImageView -> {
+                (it.drawable as? Animatable)?.stop()
+                it.dispose()
+            }
         }
         it.isVisible = false
     }
@@ -281,6 +287,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
     private fun prepareNonAnimatedImageView() {
         if (pageView is SubsamplingScaleImageView) return
+        ((pageView as? AppCompatImageView)?.drawable as? Animatable)?.stop()
         removeView(pageView)
 
         pageView = if (isWebtoon) {
@@ -288,6 +295,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
         } else {
             SubsamplingScaleImageView(context)
         }.apply {
+            // Paper belongs to the image bounds, independently of the reader's outer theme.
+            setTileBackgroundColor(Color.WHITE)
             setMaxTileSize(ImageUtil.hardwareBitmapThreshold)
             setDoubleTapZoomStyle(SubsamplingScaleImageView.ZOOM_FOCUS_CENTER)
             setPanLimit(SubsamplingScaleImageView.PAN_LIMIT_INSIDE)
@@ -466,8 +475,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
             .target(
                 onSuccess = { result ->
                     val drawable = result.asDrawable(context.resources)
-                    setImageDrawable(drawable)
-                    (drawable as? Animatable)?.start()
+                    (this.drawable as? Animatable)?.stop()
+                    val paper = PaperDrawable(drawable)
+                    setImageDrawable(paper)
+                    paper.start()
                     isVisible = true
                     this@ReaderPageImageView.onImageLoaded()
                 },
@@ -484,6 +495,20 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
     private fun Int.getSystemScaledDuration(): Int {
         return (this * context.animatorDurationScale).toInt().coerceAtLeast(1)
+    }
+
+    /** The ImageView matrix moves paper and frames together, leaving the outer theme untouched. */
+    private class PaperDrawable(private val image: Drawable) :
+        LayerDrawable(arrayOf(ColorDrawable(Color.WHITE), image)), Animatable {
+        override fun start() {
+            (image as? Animatable)?.start()
+        }
+
+        override fun stop() {
+            (image as? Animatable)?.stop()
+        }
+
+        override fun isRunning(): Boolean = (image as? Animatable)?.isRunning ?: false
     }
 
     /**

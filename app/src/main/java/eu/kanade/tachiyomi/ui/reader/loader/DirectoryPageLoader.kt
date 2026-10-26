@@ -34,7 +34,7 @@ internal class DirectoryPageLoader(val file: UniFile) : PageLoader(), NightPageS
             ?.filter { !it.isDirectory && ImageUtil.isImage(it.name) { it.openInputStream() } }
             ?.sortedWith { f1, f2 -> f1.name.orEmpty().compareToCaseInsensitiveNaturalOrder(f2.name.orEmpty()) }
             ?.mapIndexed { i, pageFile ->
-                night.registerPage(i) { pageFile.name }
+                night.registerSource(i) { pageFile }
                 // 夜讀：每次解碼都重查（開關 + 檔位 + 夜讀檔是否存在），沒夜讀版退回原檔。
                 val streamFn = { night.open(i) { pageFile.openInputStream() } }
                 ReaderPage(i).apply {
@@ -44,5 +44,6 @@ internal class DirectoryPageLoader(val file: UniFile) : PageLoader(), NightPageS
                 }
             }
             .orEmpty()
+            .also { runCatching { night.refresh() } }
     }
 }

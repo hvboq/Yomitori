@@ -3,7 +3,9 @@ package eu.kanade.tachiyomi.data.translation
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Rect
 import android.os.Build
 import android.os.SystemClock
 import android.util.Base64
@@ -16,7 +18,9 @@ import eu.kanade.tachiyomi.data.nightread.NightLevel
 import eu.kanade.tachiyomi.data.nightread.NightPageOutcome
 import eu.kanade.tachiyomi.data.nightread.NightPages
 import eu.kanade.tachiyomi.data.nightread.NightPerfProbe
+import eu.kanade.tachiyomi.data.nightread.NightPolicy
 import eu.kanade.tachiyomi.data.nightread.NightPump
+import eu.kanade.tachiyomi.data.nightread.NightSourceRevision
 import eu.kanade.tachiyomi.data.nightread.NightTicket
 import eu.kanade.tachiyomi.data.translation.model.TranslationFailureCode
 import kotlinx.coroutines.CancellationException
@@ -311,7 +315,16 @@ class PageTranslator(private val context: Context) {
         captureFences[PageIdentity.fromUri(page.uri)] = captureFenceSequence.incrementAndGet()
         withContext(NonCancellable) {
             manifestMutex.withLock {
+                val directory = materialsDir(chapterDir) ?: throw java.io.IOException("Cannot fence capture recovery")
+                val mutation = NightSourceRevision.begin(
+                    context,
+                    chapterDir,
+                    directory,
+                    name,
+                    allowUnsettledCapture = true,
+                )
                 store.recover(name) { complete -> setCapturedPageCompletionLocked(chapterDir, name, complete) }
+                mutation.committed()
             }
         }
     }
@@ -372,14 +385,27 @@ class PageTranslator(private val context: Context) {
                     } ?: throw java.io.IOException("Cannot list capture materials")
                     val store = CapturedSourceStore(CapturedSourceUniFileIo(context, chapterDir, directory))
                     val coroutineContext = kotlinx.coroutines.currentCoroutineContext()
-                    store.replace(
-                        pageName,
-                        bytes,
-                        capturedMaterialNames(pageName, names),
-                        previousComplete,
-                        setComplete = { complete -> setCapturedPageCompletionLocked(chapterDir, pageName, complete) },
-                        checkCancellation = { coroutineContext.ensureActive() },
-                    )
+                    val mutation = NightSourceRevision.begin(context, chapterDir, directory, pageName)
+                    try {
+                        store.replace(
+                            pageName,
+                            bytes,
+                            capturedMaterialNames(pageName, names),
+                            previousComplete,
+                            setComplete = { complete ->
+                                setCapturedPageCompletionLocked(chapterDir, pageName, complete)
+                            },
+                            checkCancellation = { coroutineContext.ensureActive() },
+                        )
+                        mutation.committed()
+                    } catch (failure: Exception) {
+                        // The capture store verifies its rollback itself. Only settled canonical
+                        // history can lift pending; an unresolved prepare leaves it revoked.
+                        NightSourceRevision.settleFailure(failure) {
+                            if (!store.hasPending(pageName)) mutation.committed()
+                        }
+                        throw failure
+                    }
                 }
             }
         }
@@ -747,7 +773,7 @@ class PageTranslator(private val context: Context) {
             } else {
                 coroutineContext.ensureActive()
                 val encodedOutput = encodePage(name, output)
-                writeBackOrRestore(pageFile, output, saved, previousOutputBytes, encodedOutput)
+                writeBackOrRestore(chapterDir, pageFile, output, saved, previousOutputBytes, encodedOutput)
                 displaySha256 = PartialPageStore.sha256(encodedOutput)
             }
             invalidateNightPage(materialDir, name)
@@ -1419,7 +1445,15 @@ class PageTranslator(private val context: Context) {
             .sortedBy { it.name.orEmpty() }
         for (image in images) {
             val name = image.name ?: continue
-            pageLock(image).withLock { recoverCapturedSourceLocked(chapterDir, image, name) }
+            pageLock(image).withLock {
+                recoverCapturedSourceLocked(chapterDir, image, name)
+                val journal = loadJournal(chapterDir, name)
+                if (journal == null && name !in readDonePages(chapterDir) &&
+                    !recoverInterrupted(chapterDir, image, name)
+                ) {
+                    throw java.io.IOException("Cannot settle interrupted source before Night generation")
+                }
+            }
         }
         val total = images.size
 
@@ -1462,7 +1496,12 @@ class PageTranslator(private val context: Context) {
         }
         val existing = HashMap<String, UniFile>()
         for ((n, f) in matFiles) {
-            if (n !in doomed && (NightPages.isFinalNightFile(n) || NightPages.isRulesStamp(n))) existing[n] = f
+            if (n !in doomed &&
+                (NightPages.isFinalNightFile(n) || NightPages.isRulesStamp(n) || NightPolicy.parse(n) != null)
+            ) {
+                existing[n] =
+                    f
+            }
         }
         if (total == 0) {
             onProgress(0, 0)
@@ -1482,7 +1521,11 @@ class PageTranslator(private val context: Context) {
             val todo = NightPages.needsRender(kept, name, stamps) { m ->
                 val marker = existing.getValue(m)
                 NightPages.isFresh(marker, img) && (forceBefore <= 0L || marker.lastModified() >= forceBefore)
-            }
+            } || !runCatching {
+                // Initial scan only. Actual decode paths never rebuild this authority adapter.
+                val io = NightPolicy.entry(img, name, matFiles)
+                NightPolicy.reusable(kept, name, io)
+            }.getOrDefault(false)
             if (todo) {
                 // 有去字遮罩檔＝譯後頁，重繪時多帶一份遮罩（估 heap 用，見 [NightJob.hasMask]）；文字框檔順手從同一次列目錄帶上
                 pending += NightJob(
@@ -1742,12 +1785,15 @@ class PageTranslator(private val context: Context) {
         try {
             val sourceLock = pageLock(img)
             if (!sourceLock.tryLock(round)) return NightPageOutcome.DROPPED
+            val policyWitness: NightPolicy.Witness
             val token = try {
+                NightSourceRevision.ensureCommitted(context, chapter.chapterDir, chapter.matDir, name)
+                policyWitness = NightPolicy.snapshot(chapter.chapterDir, chapter.matDir, name)
                 sourceToken(chapter.chapterDir, img, name)
             } finally {
                 sourceLock.unlock(round)
             }
-            round.bindSource(token)
+            round.bindSource(token, policyWitness)
             // The producer's budget probe can precede a recapture; decode using current bounds.
             val bounds = probeNightBounds(img) ?: throw IllegalStateException("頁圖解碼失敗")
             // 過期競態的前置快照：decode 前記成品頁 (mtime, size)，寫完後再比（見下）。
@@ -1775,8 +1821,8 @@ class PageTranslator(private val context: Context) {
                     if (!sourceLock.tryLock(round)) return NightPageOutcome.DROPPED
                     try {
                         if (sourceToken(chapter.chapterDir, img, name) != token) return NightPageOutcome.DROPPED
-                        if (NightPages.hasAnyArtifact(chapter.namesAtStart, name)) {
-                            deleteNightFiles(chapter.matDir, NightPages.artifactNames(name))
+                        if (!retireNightForColor(chapter.chapterDir, chapter.matDir, name, policyWitness)) {
+                            chapter.error("$name\tCannot retire previous Night image for skipped color page")
                         }
                     } finally {
                         sourceLock.unlock(round)
@@ -1844,14 +1890,9 @@ class PageTranslator(private val context: Context) {
                 val rendered = try {
                     NightReadRenderer.renderTiers(
                         page,
-                        detect = { b ->
-                            ticket.checkpoint()
-                            nets.detector.detect(b)
-                        },
-                        segment = { b ->
-                            ticket.checkpoint()
-                            nets.segmenter.segment(b)
-                        },
+                        detector = nets.detector,
+                        charSeg = nets.segmenter,
+                        beforeInference = { ticket.checkpoint() },
                         base = chapter.base,
                         stats = stats,
                         extraLines = extra,
@@ -1860,9 +1901,10 @@ class PageTranslator(private val context: Context) {
                         beforeRender = { ticket.keep() },
                         tiers = NightLevel.engineTiers,
                     ) { tier, bmp ->
+                        val level = checkNotNull(NightLevel.ofTier(tier)) { "Unexpected Night tier ${tier.key}" }
+                        round.record(level, hasBitmap = bmp != null)
                         // 1. 與前一檔相同（bmp == null；只會是更多）不存；有圖的檔位一律只寫暫存
                         if (bmp != null) {
-                            val level = checkNotNull(NightLevel.ofTier(tier)) { "引擎交回非產品檔位 ${tier.key}" }
                             if (!sourceLock.tryLock(round)) throw ObsoleteNightSource()
                             try {
                                 if (sourceToken(chapter.chapterDir, img, name) != token) throw ObsoleteNightSource()
@@ -1893,6 +1935,10 @@ class PageTranslator(private val context: Context) {
             }
             try {
                 if (sourceToken(chapter.chapterDir, img, name) != token) {
+                    round.discard()
+                    return NightPageOutcome.DROPPED
+                }
+                if (NightPolicy.snapshot(chapter.chapterDir, chapter.matDir, name) != policyWitness) {
                     round.discard()
                     return NightPageOutcome.DROPPED
                 }
@@ -1931,7 +1977,10 @@ class PageTranslator(private val context: Context) {
                 // 完成標記落地 → 三檔格式與舊版單檔作廢（有 std 就只讀兩檔）。刪不掉也無害：不會再被顯示，下次開跑清掉。
                 deleteNightFiles(chapter.matDir, NightPages.oldFormatNames(name))
                 // 6. 規則版本記號：std 落地之後才寫（中途被殺＝新頁看起來像舊版、下次多做一次，不會讓舊頁冒充新版）
-                if (!writeRulesStamp(chapter, name)) {
+                if (NightPolicy.snapshot(chapter.chapterDir, chapter.matDir, name) != round.publishedWitness()) {
+                    return nightPageStale(chapter, name, "Night source/material revision changed")
+                }
+                if (!writeRulesStamp(chapter, name, round.policyStamps(), round.publishedWitness())) {
                     chapter.stampFailed("$name\t規則版本記號寫不出來（這頁會一直顯示可更新，這章標失敗、重試只補這種頁）")
                 }
                 val scaled = stats.scaledTo?.let { "${it.first}x${it.second}" } ?: "-"
@@ -1977,13 +2026,40 @@ class PageTranslator(private val context: Context) {
      * 這頁夜讀版換檔完成後寫目前的規則版本記號（[NightPages.rulesStampName]，空檔；已存在＝重用，例如同版本強制重做），
      * 再刪掉開跑時列到的同頁其他版本記號（刪不掉無害：版本取同頁最大，下次開跑也會清）。回傳記號有沒有寫成。
      */
-    private fun writeRulesStamp(chapter: NightChapter, page: String): Boolean {
+    private fun writeRulesStamp(
+        chapter: NightChapter,
+        page: String,
+        policyStamps: List<String>,
+        witness: NightPolicy.Witness,
+    ): Boolean {
         val stamp = NightPages.rulesStampName(page)
-        val ok = createEmptyNamed(chapter.matDir, stamp)
-        if (!ok) logcat(LogPriority.WARN) { "夜讀規則版本記號寫不出來 $stamp" }
-        val others = chapter.stampsAtStart[page].orEmpty().filter { it != stamp }
-        if (others.isNotEmpty()) deleteNightFiles(chapter.matDir, others)
-        return ok
+        // Numeric legacy stamp is optional compatibility metadata; long legal source names
+        // use hashed images/proofs and must never fail solely because this old suffix overflows.
+        if (stamp.toByteArray(Charsets.UTF_8).size <= 255) createEmptyNamed(chapter.matDir, stamp)
+        val created = ArrayList<UniFile>(policyStamps.size)
+        try {
+            for (name in policyStamps) {
+                // Generation-specific authorities are never reused or overwritten.
+                if (chapter.matDir.findFile(name) != null) return false
+                val file = chapter.matDir.createFile(name) ?: return false
+                created += file
+                if (!file.isFile || file.name != name) return false
+                val bytes = NightPolicy.encode(checkNotNull(NightPolicy.parse(name)), witness)
+                val output = openTruncating(file) ?: return false
+                output.use { it.write(bytes) }
+                val actual = file.openInputStream()?.use { NightPolicy.readBounded(it, 512) } ?: return false
+                if (!actual.contentEquals(bytes)) return false
+            }
+            // Remove old numeric records only after the complete pair has been published.
+            val others = chapter.stampsAtStart[page].orEmpty().filter { it != stamp && it !in policyStamps }
+            if (others.isNotEmpty()) deleteNightFiles(chapter.matDir, others)
+            NightSourceRevision.changed(chapter.chapterDir, page)
+            created.clear() // transfer the complete authority pair to the committed page
+            return true
+        } finally {
+            // Failure never deletes originals/unrelated metadata or reuses an old proof.
+            created.forEach { file -> runCatching { if (file.isFile && file.name in policyStamps) file.delete() } }
+        }
     }
 
     /**
@@ -2058,9 +2134,11 @@ class PageTranslator(private val context: Context) {
         private val format: Bitmap.CompressFormat,
     ) {
         private var expectedSourceToken: SourceToken? = null
+        private var expectedPolicyWitness: NightPolicy.Witness? = null
 
-        fun bindSource(token: SourceToken) {
+        fun bindSource(token: SourceToken, witness: NightPolicy.Witness) {
             expectedSourceToken = token
+            expectedPolicyWitness = witness
         }
 
         /** 已寫好暫存、還沒改名的檔位。 */
@@ -2069,6 +2147,18 @@ class PageTranslator(private val context: Context) {
         /** 換檔途中已改成最終名的 more（std 改名失敗時要拆掉，免得變成孤兒）。 */
         private val finals = ArrayList<String>(1)
         private val levels = ArrayList<String>(2)
+        private val recipe = LinkedHashMap<NightLevel, Boolean>()
+        private val generation = java.util.UUID.randomUUID().toString().replace("-", "")
+        private var committedPolicyNames: List<String>? = null
+
+        fun record(level: NightLevel, hasBitmap: Boolean) {
+            check(level !in recipe) { "Duplicate night tier" }
+            check(level != NightLevel.STANDARD || hasBitmap) { "Night standard cannot be deduplicated" }
+            recipe[level] = hasBitmap
+        }
+
+        fun policyStamps(): List<String> = checkNotNull(committedPolicyNames) { "Night round not committed" }
+        fun publishedWitness(): NightPolicy.Witness = checkNotNull(expectedPolicyWitness)
 
         /** 這一輪編碼＋寫檔的總耗時（ms）。 */
         var encodeMs = 0L
@@ -2092,17 +2182,54 @@ class PageTranslator(private val context: Context) {
          * 沒有完成標記、下次照樣重做。
          */
         fun commit(): Boolean {
-            check(NightLevel.STANDARD in tmps) { "夜讀標準檔沒寫出來" }
-            if (!deleteNightFiles(matDir, NightPages.currentNames(page), stopOnFailure = true)) return false
-            for (level in tmps.filter { it != NightLevel.STANDARD }) {
-                val finalName = NightPages.levelName(page, level)
-                tmps -= level // commitNightTmp 失敗時自己刪暫存
-                commitNightTmp(matDir, finalName)
-                finals += finalName
+            check(NightPolicy.snapshot(chapterDir, matDir, page) == expectedPolicyWitness) {
+                "Night source/material revision changed"
             }
-            tmps -= NightLevel.STANDARD
-            commitNightTmp(matDir, NightPages.levelName(page, NightLevel.STANDARD))
-            finals.clear() // 兩檔整組落地：之後的例外不能再拆掉 more（會變成 std 配缺檔）
+            check(NightLevel.STANDARD in tmps) { "夜讀標準檔沒寫出來" }
+            check(recipe.keys == NightLevel.entries.toSet()) { "Incomplete night tier recipe" }
+            check(tmps.toSet() == recipe.filterValues { it }.keys) { "Night tier write recipe mismatch" }
+            val proofs = NightPolicy.names(page, generation, moreDistinct = recipe.getValue(NightLevel.MORE))
+            // Validate all write components and the generation collision BEFORE deleting authority
+            // or image data. A valid long source name can exceed the proof limit: fail preserving it.
+            (NightPages.currentNames(page) + NightPages.currentNames(page).map(NightPages::tmpName)).forEach {
+                check(
+                    it.toByteArray(Charsets.UTF_8).size <= 255 && it.none { c ->
+                        c == '/' || c == '\\' || c.code < 32
+                    },
+                )
+            }
+            check(proofs.none { matDir.findFile(it) != null }) { "Night proof generation collision" }
+            val oldProofs = matDir.listFiles()?.mapNotNull { file ->
+                file.name?.takeIf { NightPolicy.belongsTo(it, page) }
+            } ?: throw java.io.IOException("Cannot list existing night authority")
+            if (!deleteNightFiles(matDir, oldProofs, stopOnFailure = true)) return false
+            // Revoke cached old proof URIs durably before touching fixed final image names as
+            // well. This barrier is auxiliary; source pixels/materials are unchanged here.
+            val publication = NightSourceRevision.beginPublication(
+                context,
+                chapterDir,
+                matDir,
+                page,
+                checkNotNull(expectedPolicyWitness),
+            )
+            try {
+                if (!deleteNightFiles(matDir, NightPages.currentNames(page), stopOnFailure = true)) return false
+                for (level in tmps.filter { it != NightLevel.STANDARD }) {
+                    val finalName = NightPages.levelName(page, level)
+                    tmps -= level // commitNightTmp 失敗時自己刪暫存
+                    commitNightTmp(matDir, finalName)
+                    finals += finalName
+                }
+                tmps -= NightLevel.STANDARD
+                commitNightTmp(matDir, NightPages.levelName(page, NightLevel.STANDARD))
+                finals.clear()
+                committedPolicyNames = proofs
+            } finally {
+                // Even a derived-image failure has not changed the protected source/materials;
+                // settle this barrier with a fresh UUID, never restore the previous revision.
+                publication.committed()
+                expectedPolicyWitness = NightPolicy.snapshot(chapterDir, matDir, page)
+            }
             return true
         }
 
@@ -2114,6 +2241,13 @@ class PageTranslator(private val context: Context) {
             try {
                 val expected = expectedSourceToken ?: return
                 if (runCatching { sourceToken(chapterDir, sourcePage, page) }.getOrNull() != expected) {
+                    tmps.clear()
+                    finals.clear()
+                    return
+                }
+                if (runCatching { NightPolicy.snapshot(chapterDir, matDir, page) }.getOrNull() !=
+                    expectedPolicyWitness
+                ) {
                     tmps.clear()
                     finals.clear()
                     return
@@ -2357,8 +2491,14 @@ class PageTranslator(private val context: Context) {
     private fun deleteNightFiles(matDir: UniFile, names: List<String>, stopOnFailure: Boolean = false): Boolean {
         var ok = true
         for (n in names) {
-            val f = runCatching { matDir.findFile(n) }.getOrNull() ?: continue
-            if (!deleteFileOnly(f, n)) {
+            val f = try {
+                matDir.findFile(n)
+            } catch (_: Exception) {
+                ok = false
+                if (stopOnFailure) return false
+                continue
+            } ?: continue
+            if (!deleteFileOnly(f, n) || !runCatching { matDir.findFile(n) == null }.getOrDefault(false)) {
                 logcat(LogPriority.WARN) { "刪夜讀檔失敗 $n" }
                 ok = false
                 if (stopOnFailure) break
@@ -2404,8 +2544,34 @@ class PageTranslator(private val context: Context) {
      */
     private fun invalidateNightPage(matDir: UniFile?, pageFileName: String) {
         if (matDir == null) return
-        if (!deleteNightFiles(matDir, NightPages.artifactNames(pageFileName))) {
-            logcat(LogPriority.WARN) { "刪過期夜讀版失敗 $pageFileName（reader 可能端出舊夜讀畫面）" }
+        // Source revision was already revoked BEFORE the actual source/material write. Keep
+        // old derived images for inspection/migration; only their policy authority is retired.
+        runCatching {
+            val proofs = NightSourceRevision.inventory(matDir).keys.filter { NightPolicy.belongsTo(it, pageFileName) }
+            deleteNightFiles(matDir, proofs)
+        }.onFailure { logcat(LogPriority.WARN, it) { "Retiring Night proof failed $pageFileName" } }
+    }
+
+    /** Page lock owned. Also publishes an event when a later pause/failure prevents chapterDone. */
+    private fun retireNightForColor(
+        chapter: UniFile,
+        materials: UniFile,
+        page: String,
+        witness: NightPolicy.Witness,
+    ): Boolean {
+        check(NightPolicy.snapshot(chapter, materials, page) == witness) { "Night color source changed" }
+        val names = NightSourceRevision.inventory(materials).keys
+        val proofs = names.filter { NightPolicy.belongsTo(it, page) }
+        val images = NightPages.artifactNames(page).filter { it in names }
+        if (proofs.isEmpty() && images.isEmpty()) return true
+        val publication = NightSourceRevision.beginPublication(context, chapter, materials, page, witness)
+        return try {
+            // A failed delete is an error, never a claim that a page/cache was removed.
+            deleteNightFiles(materials, proofs, stopOnFailure = true) &&
+                deleteNightFiles(materials, images, stopOnFailure = true)
+        } finally {
+            // Derived-only retirement cannot restore old source revision/proofs on failure.
+            publication.committed()
         }
     }
 
@@ -2457,7 +2623,7 @@ class PageTranslator(private val context: Context) {
             }
             val materials = decodeMaterials(matDir, base)
             if (materials == null && newMethod == ORIGINAL_METHOD) {
-                return restoreOriginalWithoutMaterials(matDir, img, name)
+                return restoreOriginalWithoutMaterials(chapterDir, matDir, img, name)
             }
             if (materials == null) return false
             val (originalFile, byteCopy) = findOriginalMaterial(matDir, name) ?: return false
@@ -2465,9 +2631,9 @@ class PageTranslator(private val context: Context) {
             // 原圖：用素材的原圖還原該頁（不去字/不排版）。記 method=original、保留 manifest（即時翻譯視為已處理、
             // 不會又翻回去）；檔案＝原圖。inpainter/renderCfg 此路徑用不到（呼叫端對原圖傳 null、不載 lama）。
             // 有原檔 → 位元組原樣寫回、不解碼；寫不回去才退到下面「解碼後重新編碼」那條（舊版 WebP 素材本來就走那條）。
-            if (newMethod == ORIGINAL_METHOD && byteCopy && restoreOriginalBytes(originalFile, img)) {
+            if (newMethod == ORIGINAL_METHOD && byteCopy && restoreOriginalBytes(chapterDir, originalFile, img)) {
                 invalidateNightPage(matDir, name) // 成品頁換回原圖 → 舊夜讀版（暗色譯圖）作廢
-                saveMaterialsMethod(matDir, base, materials, newMethod)
+                saveMaterialsMethod(chapterDir, matDir, name, materials, newMethod)
                 return true
             }
 
@@ -2477,9 +2643,9 @@ class PageTranslator(private val context: Context) {
             ownedBitmaps.add(original)
 
             if (newMethod == ORIGINAL_METHOD) {
-                writeBack(img, original)
+                writeBack(chapterDir, img, original)
                 invalidateNightPage(matDir, name) // 成品頁換回原圖 → 舊夜讀版（暗色譯圖）作廢
-                saveMaterialsMethod(matDir, base, materials, newMethod)
+                saveMaterialsMethod(chapterDir, matDir, name, materials, newMethod)
                 original.recycle()
                 return true
             }
@@ -2498,11 +2664,11 @@ class PageTranslator(private val context: Context) {
             ownedBitmaps.add(finalPage)
 
             try {
-                writeBack(img, finalPage)
+                writeBack(chapterDir, img, finalPage)
             } catch (e: PageWriteInterrupted) {
                 // 頁檔寫到一半（可能已被截斷）：有原檔就把它寫回去——原圖不比半截檔差（§11）；舊夜讀版跟著作廢。
                 // 編碼失敗（頁檔沒被碰）不在這裡：舊的成品原封不動留著。
-                if (byteCopy && restoreOriginalBytes(originalFile, img)) {
+                if (byteCopy && restoreOriginalBytes(chapterDir, originalFile, img)) {
                     invalidateNightPage(matDir, name)
                     TraceLog.log("page", "$name reRender write interrupted, original restored")
                 }
@@ -2510,7 +2676,7 @@ class PageTranslator(private val context: Context) {
             }
             invalidateNightPage(matDir, name) // 成品頁換了去字法 → 舊夜讀版作廢
             // 更新 json 的 method（其餘素材不變），保持記錄與檔案一致。
-            saveMaterialsMethod(matDir, base, materials, newMethod)
+            saveMaterialsMethod(chapterDir, matDir, name, materials, newMethod)
 
             original.recycle()
             mask.recycle()
@@ -2575,7 +2741,7 @@ class PageTranslator(private val context: Context) {
             )
             invalidateNightPage(matDir, journal.pageName)
             decodeMaterials(matDir, OriginalMaterial.base(journal.pageName))?.let {
-                saveMaterialsMethod(matDir, OriginalMaterial.base(journal.pageName), it, method)
+                saveMaterialsMethod(chapterDir, matDir, journal.pageName, it, method)
             }
             return true
         } finally {
@@ -2687,11 +2853,29 @@ class PageTranslator(private val context: Context) {
         }
 
     /** 重繪後覆寫 `.yakuyomi/<base>.json`：只改 [PageMaterials.method]、其餘（遮罩/文字區）原樣保留。best-effort。 */
-    private fun saveMaterialsMethod(matDir: UniFile, base: String, materials: PageMaterials, newMethod: String) {
+    private fun saveMaterialsMethod(
+        chapterDir: UniFile,
+        matDir: UniFile,
+        page: String,
+        materials: PageMaterials,
+        newMethod: String,
+    ) {
+        var write: NightMaterialWrite? = null
         runCatching {
+            write = beginNightMaterialWrite(chapterDir, matDir, page)
             val updated = materials.copy(method = newMethod)
-            overwriteBytes(matDir, "$base.json", MATERIALS_JSON.encodeToString(updated).toByteArray())
-        }.onFailure { logcat(LogPriority.WARN, it) { "重繪後更新 method 失敗 $base（不影響已覆蓋的頁圖）" } }
+            check(
+                overwriteBytes(
+                    matDir,
+                    "${OriginalMaterial.base(page)}.json",
+                    MATERIALS_JSON.encodeToString(updated).toByteArray(),
+                ),
+            )
+            write!!.committed()
+        }.onFailure {
+            NightSourceRevision.settleFailure(it) { write?.rollback() }
+            logcat(LogPriority.WARN, it) { "重繪後更新 method 失敗 $page（不影響已覆蓋的頁圖）" }
+        }
     }
 
     /** 該章是否已翻：manifest 涵蓋所有現有圖頁（chapterDir＝鬆散資料夾或 CBZ 解壓後暫存夾）。 */
@@ -2810,16 +2994,43 @@ class PageTranslator(private val context: Context) {
         if (format == WriteBackFormat.PNG && bmp.hasAlpha() && runCatching { isOpaque(bmp) }.getOrDefault(false)) {
             bmp.setHasAlpha(false)
         }
-        val encoded = java.io.ByteArrayOutputStream(1 shl 20)
-        // 編碼失敗（記憶體不足等）：頁檔還沒碰，原封不動
-        if (!bmp.compress(fmt, WriteBackFormat.QUALITY, encoded)) {
-            throw java.io.IOException("頁檔編碼失敗 $name")
+        var jpegPaper: Bitmap? = null
+        try {
+            val image = if (format == WriteBackFormat.JPEG && bmp.hasAlpha() && !isOpaque(bmp)) {
+                // JPEG cannot retain alpha. Composite physical pixels onto owned white paper,
+                // preserving the caller bitmap and the separately retained exact original.
+                Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888).also { paper ->
+                    jpegPaper = paper
+                    paper.density = bmp.density
+                    Canvas(paper).apply {
+                        drawColor(Color.WHITE)
+                        drawBitmap(bmp, null, Rect(0, 0, bmp.width, bmp.height), null)
+                    }
+                    paper.setHasAlpha(false)
+                }
+            } else {
+                bmp
+            }
+            val encoded = java.io.ByteArrayOutputStream(1 shl 20)
+            // Encode before opening/truncating the visible page, as with the opaque path.
+            if (!image.compress(fmt, WriteBackFormat.QUALITY, encoded)) {
+                throw java.io.IOException("頁檔編碼失敗 $name")
+            }
+            return encoded.toByteArray().also {
+                check(it.size <= MAX_PAGE_BYTES) { "Encoded page exceeds storage bound" }
+            }
+        } finally {
+            jpegPaper?.recycle()
         }
-        return encoded.toByteArray().also { check(it.size <= MAX_PAGE_BYTES) { "Encoded page exceeds storage bound" } }
     }
 
     /** Explicit recovery needs the preserved source, not optional OCR JSON or masks. Page lock held. */
-    private suspend fun restoreOriginalWithoutMaterials(matDir: UniFile, page: UniFile, name: String): Boolean {
+    private suspend fun restoreOriginalWithoutMaterials(
+        chapterDir: UniFile,
+        matDir: UniFile,
+        page: UniFile,
+        name: String,
+    ): Boolean {
         val (original, byteCopy) = findOriginalMaterial(matDir, name) ?: return false
         val decoded = decodePageCapped(original) as? PageDecode.Ok ?: return false
         try {
@@ -2829,7 +3040,14 @@ class PageTranslator(private val context: Context) {
             val previousOutput = readPageBytes(page)
             val operationContext = kotlinx.coroutines.currentCoroutineContext()
             operationContext.ensureActive()
-            writeBackOrRestore(page, decoded.bitmap, SavedOriginal(original, null), previousOutput, replacement) {
+            writeBackOrRestore(
+                chapterDir,
+                page,
+                decoded.bitmap,
+                SavedOriginal(original, null),
+                previousOutput,
+                replacement,
+            ) {
                 operationContext.ensureActive()
                 check(PartialPageStore.sha256(readPageBytes(original)) == decoded.sha256) {
                     "Original changed during recovery"
@@ -2842,15 +3060,22 @@ class PageTranslator(private val context: Context) {
         }
     }
 
-    private fun writeBack(file: UniFile, bmp: Bitmap) = writeBackBytes(file, encodePage(file.name, bmp))
+    private fun writeBack(chapter: UniFile, file: UniFile, bmp: Bitmap) = writeBackBytes(
+        chapter,
+        file,
+        encodePage(file.name, bmp),
+    )
 
-    private fun writeBackBytes(file: UniFile, encoded: ByteArray) {
+    private fun writeBackBytes(chapter: UniFile, file: UniFile, encoded: ByteArray) {
+        val materials = materialsDir(chapter) ?: throw java.io.IOException("Cannot fence page replacement")
+        val mutation = NightSourceRevision.begin(context, chapter, materials, checkNotNull(file.name))
         try {
             // Never fall back to a non-truncating SAF stream; opening can itself truncate then fail.
             val os = openTruncating(file) ?: throw java.io.IOException("Cannot open page for replacement")
             os.use { it.write(encoded) }
             check(file.length() == encoded.size.toLong()) { "Page replacement length mismatch" }
             check(readPageBytes(file).contentEquals(encoded)) { "Page replacement readback mismatch" }
+            mutation.committed()
         } catch (t: Throwable) {
             throw PageWriteInterrupted("頁檔寫到一半失敗 ${file.name}", t)
         }
@@ -2876,6 +3101,7 @@ class PageTranslator(private val context: Context) {
      * Rollback deliberately finishes without checking cancellation, then propagates the failure.
      */
     private fun writeBackOrRestore(
+        chapter: UniFile,
         page: UniFile,
         bmp: Bitmap,
         saved: SavedOriginal?,
@@ -2887,13 +3113,17 @@ class PageTranslator(private val context: Context) {
             "Cannot preserve the original page. Translation was not saved; check storage access and free space."
         }
         try {
-            if (encodedOverride == null) writeBack(page, bmp) else writeBackBytes(page, encodedOverride)
+            if (encodedOverride ==
+                null
+            ) {
+                writeBack(chapter, page, bmp)
+            } else {
+                writeBackBytes(chapter, page, encodedOverride)
+            }
             afterWrite()
         } catch (t: Throwable) {
             val restored = runCatching {
-                val stream = openTruncating(page) ?: throw java.io.IOException("Cannot restore previous page")
-                stream.use { it.write(previousOutputBytes) }
-                check(readPageBytes(page).contentEquals(previousOutputBytes)) { "Previous page rollback mismatch" }
+                writeBackBytes(chapter, page, previousOutputBytes)
             }.isSuccess
             if (restored) {
                 TraceLog.log("page", "${page.name} writeBack failed, previous output restored")
@@ -3079,7 +3309,7 @@ class PageTranslator(private val context: Context) {
             deleteFileOnly(marker, OriginalMaterial.inflightName(name)) // 記號在、原檔不在：沒東西可寫回
             return true
         }
-        if (!restoreOriginalBytes(original!!, pageFile)) {
+        if (!restoreOriginalBytes(chapterDir, original!!, pageFile)) {
             TraceLog.log("page", "$name interrupted overwrite: restore original FAILED")
             logcat(LogPriority.WARN) { "上次翻譯被中斷，原檔寫不回頁檔 $name" }
             return false
@@ -3146,7 +3376,8 @@ class PageTranslator(private val context: Context) {
         if (!f.isFile || f.name != name) return@runCatching false
         val os = openTruncating(f) ?: return@runCatching false
         os.use { it.write(bytes) }
-        true
+        f.length() == bytes.size.toLong() &&
+            f.openInputStream()?.use { NightPolicy.readBounded(it, bytes.size) }?.contentEquals(bytes) == true
     }.getOrDefault(false)
 
     /** 把 [bmp] 以 [format]/[quality] 壓進 [dir]/[name]，同樣走 "wt" 截斷（避免短輸出留舊尾）。best-effort：回傳是否成功。 */
@@ -3273,18 +3504,13 @@ class PageTranslator(private val context: Context) {
      * 下來時的樣子。動手前先確認 [material] 解得開（只解尺寸、不佔記憶體），解不開就不碰頁檔（§11：別用壞檔蓋掉現有的頁）。
      * 寫完比長度。回傳是否成功；false 時呼叫端退到「解碼後重新編碼」那條。
      */
-    private fun restoreOriginalBytes(material: UniFile, page: UniFile): Boolean = runCatching {
+    private fun restoreOriginalBytes(chapter: UniFile, material: UniFile, page: UniFile): Boolean = runCatching {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(material.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching false
-        val copied = context.contentResolver.openInputStream(material.uri)?.use { input ->
-            openTruncating(page)?.use { output -> input.copyTo(output) }
-        } ?: return@runCatching false
-        val landed = page.length()
-        if (copied <= 0L || landed != copied) {
-            logcat(LogPriority.WARN) { "原檔寫回頁檔長度不符 ${page.name}：寫 $copied、落地 $landed（改用重新編碼）" }
-            return@runCatching false
-        }
+        val bytes = readPageBytes(material)
+        check(bytes.isNotEmpty()) { "Empty preserved original" }
+        writeBackBytes(chapter, page, bytes)
         true
     }.onFailure { logcat(LogPriority.WARN, it) { "原檔寫回頁檔失敗 ${page.name}" } }.getOrDefault(false)
 
@@ -3309,10 +3535,12 @@ class PageTranslator(private val context: Context) {
         method: String,
         originalSaved: Boolean,
     ): String? {
+        var write: NightMaterialWrite? = null
         return runCatching {
             val base = OriginalMaterial.base(pageName)
             val dir = materialsDir(chapterDir)
                 ?: return "素材存失敗：無法建立 .yakuyomi 子夾（此儲存位置可能不支援，建議改用內部儲存）"
+            write = beginNightMaterialWrite(chapterDir, dir, pageName)
             if (!originalSaved) {
                 // 後備：原檔位元組沒複製成 → 照舊把解碼後的原圖存成有損 WEBP（API≥30 用 WEBP_LOSSY，否則舊 WEBP）。
                 val webpFmt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -3330,7 +3558,11 @@ class PageTranslator(private val context: Context) {
             // 遮罩 → 獨立無損 PNG 檔（不再 base64 內嵌 json）：換去字法重繪只重寫小 json、遮罩檔不動；省 ~33% 膨脹、讀取走 native stream 不灌 heap。
             val bin = binarizeMask(analysis.mask)
             try {
-                check(compressToFile(dir, "$base$MASK_SUFFIX", bin, Bitmap.CompressFormat.PNG, 100)) {
+                val encodedMask = java.io.ByteArrayOutputStream().use { out ->
+                    check(bin.compress(Bitmap.CompressFormat.PNG, 100, out)) { "Cannot encode translation mask" }
+                    out.toByteArray()
+                }
+                check(overwriteBytes(dir, "$base$MASK_SUFFIX", encodedMask)) {
                     "Cannot save translation mask"
                 }
             } finally {
@@ -3365,9 +3597,11 @@ class PageTranslator(private val context: Context) {
                 }
                     .onFailure { logcat(LogPriority.WARN, it) { "刪舊夜讀文字框檔失敗 $pageName（夜讀先看完整素材，無害）" } }
             }
+            write!!.committed()
         }.fold(
             onSuccess = { null },
             onFailure = { e ->
+                NightSourceRevision.settleFailure(e) { write?.rollback() }
                 logcat(LogPriority.WARN, e) { "保留重繪素材失敗 $pageName（不影響翻譯）" }
                 "素材存失敗（此儲存位置可能不支援保留素材／重繪，建議改用內部儲存）：" +
                     "${e.javaClass.simpleName}${e.message?.let { ": $it" } ?: ""}"
@@ -3399,6 +3633,7 @@ class PageTranslator(private val context: Context) {
         pageWidth: Int,
         pageHeight: Int,
     ): String? {
+        var write: NightMaterialWrite? = null
         return runCatching {
             val dir = materialsDir(chapterDir)
                 ?: return "夜讀素材存失敗：無法建立 .yakuyomi 子夾（此儲存位置可能不支援，建議改用內部儲存）"
@@ -3416,12 +3651,14 @@ class PageTranslator(private val context: Context) {
                     bin.recycle()
                 }
             }
+            write = beginNightMaterialWrite(chapterDir, dir, pageName)
             val maskOk = png != null && overwriteBytes(dir, "${OriginalMaterial.base(pageName)}$MASK_SUFFIX", png)
             val boxesName = NightTextBoxes.fileName(pageName)
             val pageBytes = pageLength(pageFile)
             if (pageBytes <= 0L) {
                 deleteFileOnly(dir.findFile(boxesName), boxesName)
                 logcat(LogPriority.WARN) { "夜讀文字框沒寫 $pageName：讀不到頁檔大小" }
+                write!!.rollback()
                 return if (maskOk) "夜讀文字框沒寫：讀不到頁檔大小（不影響翻譯）" else "夜讀遮罩與文字框都沒寫成（不影響翻譯）"
             }
             val quads = analysis.regions.flatMap { region ->
@@ -3433,6 +3670,9 @@ class PageTranslator(private val context: Context) {
                 boxesName,
                 NightTextBoxes.encode(pageWidth, pageHeight, pageBytes, maskBytes, quads).toByteArray(),
             )
+            // No encoded mask means no mask write was attempted. A verified boxes record with
+            // maskBytes=0 explicitly selects no mask, including when an older mask still exists.
+            if (boxesOk && (maskOk || png == null)) write!!.committed() else write!!.rollback()
             when {
                 !maskOk && !boxesOk -> "夜讀遮罩與文字框都寫檔失敗（不影響翻譯）"
                 !boxesOk -> "夜讀文字框寫檔失敗（不影響翻譯）"
@@ -3440,9 +3680,67 @@ class PageTranslator(private val context: Context) {
                 else -> null
             }
         }.getOrElse { e ->
+            NightSourceRevision.settleFailure(e) { write?.rollback() }
             logcat(LogPriority.WARN, e) { "夜讀素材存失敗 $pageName（不影響翻譯）" }
             "夜讀素材存失敗：${e.javaClass.simpleName}${e.message?.let { ": $it" } ?: ""}"
         }
+    }
+
+    /** Optional Night inputs have their own verified rollback; originals/journals are untouched. */
+    private inner class NightMaterialWrite(
+        private val chapter: UniFile,
+        private val directory: UniFile,
+        private val page: String,
+        private val mutation: NightSourceRevision.Mutation,
+        private val before: Map<String, ByteArray?>,
+    ) {
+        private var settled = false
+        fun committed() {
+            check(!settled)
+            mutation.committed()
+            settled = true
+        }
+
+        fun rollback() {
+            if (settled) return
+            // A prior COMMITTED write may have landed even when its readback failed. Revoke it
+            // with a NEW pending record before restoring any selected material, never assume
+            // that the original pending record is still durable.
+            val rollback = NightSourceRevision.begin(context, chapter, directory, page)
+            for ((name, bytes) in before) {
+                if (bytes == null) {
+                    val current = directory.findFile(name)
+                    if (current != null) {
+                        check(deleteFileOnly(current, name) && directory.findFile(name) == null) {
+                            "Cannot roll back optional Night material"
+                        }
+                    }
+                } else {
+                    check(overwriteBytes(directory, name, bytes)) { "Cannot restore optional Night material" }
+                }
+            }
+            rollback.committed()
+            settled = true // fresh UUID even when rollback restores identical size and mtime
+        }
+    }
+
+    private fun beginNightMaterialWrite(chapter: UniFile, directory: UniFile, page: String): NightMaterialWrite {
+        val names =
+            listOf(
+                NightTextBoxes.materialsJsonName(page),
+                OriginalMaterial.base(page) + MASK_SUFFIX,
+                NightTextBoxes.fileName(page),
+            )
+        var remainingBytes = 16 * 1024 * 1024
+        val before = names.associateWith { name ->
+            directory.findFile(name)?.let { file ->
+                check(file.isFile && file.name == name) { "Invalid optional Night material" }
+                check(remainingBytes > 0) { "Optional Night rollback exceeds budget" }
+                NightSourceRevision.readExact(file, remainingBytes).also { remainingBytes -= it.size }
+            }
+        }
+        val mutation = NightSourceRevision.begin(context, chapter, directory, page)
+        return NightMaterialWrite(chapter, directory, page, mutation, before)
     }
 
     /** 頁檔位元組數；讀不到（例外或 ≤ 0）就再讀一次，還是讀不到回 0。 */
@@ -3463,7 +3761,8 @@ class PageTranslator(private val context: Context) {
         if (!f.isFile || f.name != name) return@runCatching false
         val os = openTruncating(f) ?: return@runCatching false
         os.use { it.write(bytes) }
-        true
+        f.length() == bytes.size.toLong() &&
+            f.openInputStream()?.use { NightPolicy.readBounded(it, bytes.size) }?.contentEquals(bytes) == true
     }.getOrDefault(false)
 
     /** 二值化 seg 遮罩（>127 白 / 否則黑）→ 新 ARGB Bitmap（呼叫端負責 recycle）。getPixels/setPixels 批次，不逐像素。 */

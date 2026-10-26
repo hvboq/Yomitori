@@ -3,12 +3,15 @@ package eu.kanade.tachiyomi.ui.reader.loader
 import com.hippo.unifile.UniFile
 import eu.kanade.tachiyomi.data.nightread.NightLevel
 import eu.kanade.tachiyomi.data.nightread.NightPages
+import eu.kanade.tachiyomi.data.nightread.NightPolicy
+import eu.kanade.tachiyomi.data.nightread.NightSourceRevision
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.translation.service.TranslationPreferences
-import uy.kohesive.injekt.injectLazy
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 
@@ -21,31 +24,30 @@ internal interface NightPageSource {
 }
 
 /**
- * reader 顯示端的夜讀：loader 的 stream lambda 每次解碼都經 [open] 決定送夜讀檔還是原圖，並記下**每頁實際送出的檔名**——
- * 換檔位時 [pagesToReload] 拿它跟「新設定下該送的檔」逐頁比，只重畫真的會變的頁（單一真理來源：loader 送了什麼、
- * 就以它為準，VM 不另外猜）。
+ * Night stream selection for a loose downloaded/local chapter. Effective mode is the translation
+ * master Night switch AND reader Night mode; the preferred [NightLevel] is read on every decode.
  *
- * - **有效夜讀模式＝夜讀總開關 AND reader 夜讀模式**（總開關關時一律原圖，免得卡在畫面上沒有入口能關的夜讀頁）。
- * - **檔位**＝偏好 `nightread_fill_level`（[NightLevel.fromPref]：標準／更多，舊值 l1／protect／aggressive 照對應），
- *   每次解碼都讀。
- * - **查找**＝[NightPages.resolveName]：兩檔格式（std／more）優先，其次 2026-10-01 的三檔格式（l1…l3），再其次舊版
- *   單檔；都沒有 → 原圖。已產生的章不必重做。
- * - **檔名快取**（[NightPages.Index]）：`.yakuyomi/` 列一次就重用（非主要儲存上一次 findFile 等於列整個資料夾）。
- *   快取可能過期：這頁在快取裡查不到可送的檔（沒有夜讀檔，或只有產生到一半的孤兒 more／l2／l3）時探一次 std（佇列
- *   現在只產兩檔格式；接住列目錄之後才產出的頁，探到就重列）；開檔失敗（檔已被重新產生刪掉或換掉）先讓快取失效、重列
- *   再找一次，還是不行才退原圖。查得到但已過時（快取時只有 std、重新產生後多了 more）這裡看不出來：由 ReaderViewModel
- *   在這章產生中每做完一頁、以及整章做完時讓快取失效。
- * - 任何例外都吞掉、退原圖：夜讀壞了也絕不影響原圖顯示（§11 不變式）。
+ * Loaders register exact source URIs and call [refresh] during setup. Explicit source/proof events,
+ * availability checks and tier changes also refresh. Refresh prepares all positive/negative entries
+ * and canonical capture witnesses before atomically publishing one complete [NightPages.Index].
  *
- * [chapterDir]＝鬆散章節夾（loader 列頁時設定）；null 時退化用 [open] 的 fallback（頁檔的 parentFile）。
- * 頁檔名每頁算一次就快取（SAF 上取名字是一次查詢）。
+ * [open] only uses the prepared entry: a complete immutable std/more generation pair, committed
+ * source revision, actual RGB policy and known source/material metadata must match before/after
+ * opening the exact image URI. Missing, corrupt, pending or legacy entries fall back to [open]'s
+ * original stream. Decode never lazily lists, scans history, hashes images, recovers or writes;
+ * negative reads and open failures do not trigger automatic refresh.
+ *
+ * Served tokens contain generation AND filename, so regeneration under the same name is observable.
+ * Per-page mutation/publication events reload affected decoded pages even when a job pauses/fails;
+ * successful chapter completion remains a backstop. Original and translation-completion authority
+ * stay in their existing stores. Ordinary Night read exceptions fall back to source.
  */
-internal class NightPageStreams {
+internal class NightPageStreams(
+    private val readerPreferences: ReaderPreferences = Injekt.get(),
+    private val translationPreferences: TranslationPreferences = Injekt.get(),
+) {
 
-    private val readerPreferences: ReaderPreferences by injectLazy()
-    private val translationPreferences: TranslationPreferences by injectLazy()
-
-    /** 這章 `.yakuyomi/` 的夜讀檔名快取。 */
+    /** Atomically prepared exact-URI and positive/negative policy cache for this chapter. */
     val index = NightPages.Index()
 
     /** 鬆散章節夾；null＝還沒解析到（或不是鬆散夾）。 */
@@ -53,7 +55,7 @@ internal class NightPageStreams {
     var chapterDir: UniFile? = null
 
     /**
-     * page.index → 這頁最近一次解碼實際送出的夜讀檔名（[ORIGINAL]＝原圖；[PENDING]＝正在開、還不知道送哪個）。
+     * page.index -> last served generation:filename token; [ORIGINAL] is source, [PENDING] is opening.
      * 沒解碼過的頁不在表裡。
      */
     private val served = ConcurrentHashMap<Int, String>()
@@ -63,6 +65,8 @@ internal class NightPageStreams {
 
     /** page.index → 怎麼算頁檔名（loader 列頁時登記；便宜的 lambda，真的要名字時才呼叫）。 */
     private val nameFns = ConcurrentHashMap<Int, () -> String?>()
+    private val sourceFns = ConcurrentHashMap<Int, () -> UniFile?>()
+    private val sources = ConcurrentHashMap<Int, UniFile>()
 
     /** 有效夜讀模式＝夜讀總開關 AND reader 夜讀模式。 */
     fun effectiveNight(): Boolean =
@@ -76,6 +80,26 @@ internal class NightPageStreams {
         nameFns[pageIndex] = name
     }
 
+    /** Exact source URI registered by the loader; decode never searches the chapter directory. */
+    fun registerSource(pageIndex: Int, source: () -> UniFile?) {
+        sourceFns[pageIndex] = source
+        registerPage(pageIndex) { sourceFile(pageIndex)?.name }
+    }
+
+    private fun sourceFile(pageIndex: Int): UniFile? = sources[pageIndex]
+        ?: sourceFns[pageIndex]?.invoke()?.also { sources[pageIndex] = it }
+
+    /** Loader setup and explicit event/tier refresh only. Never invoked from a decode lambda. */
+    fun refresh(): Map<String, UniFile> {
+        val dir = chapterDir ?: return emptyMap()
+        val registered = sourceFns.keys.mapNotNull { pageIndex ->
+            val source = sourceFile(pageIndex) ?: return@mapNotNull null
+            val page = pageName(pageIndex) ?: return@mapNotNull null
+            page to source
+        }
+        return index.refreshPrepared(dir, registered)
+    }
+
     private fun pageName(pageIndex: Int): String? {
         pageNames[pageIndex]?.let { return it }
         val n = runCatching { nameFns[pageIndex]?.invoke() }.getOrNull() ?: return null
@@ -84,12 +108,12 @@ internal class NightPageStreams {
     }
 
     /**
-     * 第 [pageIndex] 頁的串流：有效夜讀模式開著且這頁在目前檔位有夜讀檔 → 夜讀檔，否則 [original]。
+     * Open the prepared, currently verified Night recipe when enabled; otherwise use [original].
      * [dirFallback]：[chapterDir] 沒有時的退路（例如頁檔的 parentFile；SAF 文件 URI 拿不到 parent，所以只是退路）。
      */
     fun open(pageIndex: Int, dirFallback: () -> UniFile? = { null }, original: () -> InputStream): InputStream {
-        // 一進來就標「開檔中」：讀檔位、探查、開檔可能要幾百 ms（SAF 上 findFile＝列整個資料夾），期間換了檔位時
-        // [pagesToReload] 要把這頁算進去（否則第一次解碼的頁不在表裡、被略過，停在舊檔位）
+        // Register before bounded proof/metadata reads and image open so a concurrent tier/event
+        // refresh includes this in-flight decode. No directory search occurs in this path.
         served[pageIndex] = PENDING
         val night = if (effectiveNight()) {
             try {
@@ -109,42 +133,50 @@ internal class NightPageStreams {
         // 退路找到的資料夾記下來：之後的頁與 [pagesToReload] 都用同一個
         val dir = chapterDir ?: dirFallback()?.takeIf { it.isDirectory }?.also { chapterDir = it } ?: return null
         val page = pageName(pageIndex) ?: return null
-        val tier = currentTier()
-        var files = index.files(dir)
-        if (NightPages.resolveName(files.keys, page, tier) == null) {
-            // 這頁在快取裡查不到可送的檔（沒有夜讀檔，或快取剛好抓到產生途中的孤兒 more）：探一次 std（佇列只產兩檔格式），
-            // 接住佇列在列目錄之後才產出的頁；探到就重列
-            val probe = dir.findFile(NightPages.DIR)?.findFile(NightPages.levelName(page, NightLevel.STANDARD))
-            if (probe != null) files = index.refresh(dir)
-        }
-        var name = NightPages.resolveName(files.keys, page, tier) ?: return null
-        files[name]?.let { f -> runCatching { f.openInputStream() }.getOrNull() }?.let { return name to it }
-        // 開檔失敗：快取過期（檔被重新產生刪掉、或換成新檔）→ 重列一次再找；仍失敗才退原圖
-        files = index.refresh(dir)
-        name = NightPages.resolveName(files.keys, page, tier) ?: return null
-        return files[name]?.openInputStream()?.let { name to it }
+        val entry = index.cachedPage(dir, page) ?: return null
+        // Both successful and negative decode paths retain the refresh snapshot. A missing,
+        // corrupt, pending or legacy result NEVER causes a per-decode listing/history scan.
+        return NightPolicy.openCurrent(entry.files.keys, page, currentTier(), entry.io)
     }
 
     /**
-     * 換檔位（或開關）後要重畫哪些頁：重列一次 `.yakuyomi/`（同時更新 [index]），逐頁比「上次實際送出的檔」與
-     * 「目前設定下會送的檔」，只回不同的頁。沒解碼過的頁不回（之後首次解碼本來就讀當時的設定）；正在開檔的頁（[PENDING]）
-     * 一律回（它可能讀到的是換之前的設定）。IO，呼叫端在 IO 跑。
+     * Explicit tier/mode refresh, then compare generation+filename tokens with already decoded
+     * pages. In-flight pages always reload; untouched pages use current policy on first decode.
+     * Caller runs on IO. This refresh is not part of a decode or a negative-read retry.
      */
     fun pagesToReload(pages: List<ReaderPage>): List<ReaderPage> {
         val on = effectiveNight()
         val tier = currentTier()
         val dir = chapterDir
-        val names = if (on && dir != null) index.refresh(dir).keys else emptySet()
+        if (on && dir != null) refresh()
         return pages.filter { p ->
             val sent = served[p.index] ?: return@filter false
             if (sent == PENDING) return@filter true
-            val want = if (on) pageName(p.index)?.let { NightPages.resolveName(names, it, tier) } else null
+            val want = if (on && dir != null) {
+                runCatching {
+                    val name = pageName(p.index) ?: return@runCatching null
+                    val entry = index.cachedPage(dir, name) ?: return@runCatching null
+                    val recipe = NightPolicy.recipe(entry.files.keys, name, tier) ?: return@runCatching null
+                    if (!NightPolicy.reusable(entry.files.keys, name, entry.io)) return@runCatching null
+                    "${recipe.generation}:${recipe.imageName}"
+                }.getOrNull()
+            } else {
+                null
+            }
             (sent.takeIf { it != ORIGINAL }) != want
         }
     }
 
     /** 第 [pageIndex] 頁最近一次送出的夜讀檔名；null＝送的是原圖或還沒解碼過。 */
     fun servedNightName(pageIndex: Int): String? = served[pageIndex]?.takeIf { it != ORIGINAL && it != PENDING }
+        ?.substringAfter(':')
+
+    /** Source writes and same-name proof publication must refresh already decoded holders too. */
+    fun changedPages(change: NightSourceRevision.Change, pages: List<ReaderPage>): List<ReaderPage> {
+        if (chapterDir?.let(NightSourceRevision::chapterKey) != change.chapterUri) return emptyList()
+        refresh()
+        return pages.filter { served.containsKey(it.index) && pageName(it.index) == change.page }
+    }
 
     private companion object {
         /** [served] 裡代表「送的是原圖」（ConcurrentHashMap 不收 null）。 */

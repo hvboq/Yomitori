@@ -6,12 +6,7 @@ import li.joye.yakuyomi.nightread.NightRead
 import li.joye.yakuyomi.nightread.NightTier
 import org.junit.jupiter.api.Test
 
-/**
- * 夜讀規則版本（2026-10-03，使用者拍板「標示＋一鍵更新」）：每頁換檔完成後在旁邊寫空的版本記號 `<頁檔名>.night.rules<N>`，
- * 頁的版本＝有 std 時同頁記號的最大值（沒有＝0），只有三檔格式或舊版單檔＝0。版本 < 目前的頁＝舊版：章節列「可更新」、
- * 產生端當它不新鮮。這裡驗記號的命名／解析、頁的版本、整章的「可更新」（含舊版單檔、三檔格式、同章新舊混合）、可清的記號，
- * 以及章節列判斷與產生端判斷一致。
- */
+/** Numeric stamps remain migration metadata; current policy proof pairs establish rules freshness. */
 class NightRulesVersionTest {
 
     private val page = "012.jpg"
@@ -75,21 +70,8 @@ class NightRulesVersionTest {
             NightPages.resolveName(setOf(std, more, r1), page, level) shouldBe
                 NightPages.resolveName(setOf(std, more), page, level)
         }
-        NightPages.markerName(setOf(std, r1), page) shouldBe std
+        NightPages.markerName(setOf(std, r1), page) shouldBe null
         NightPages.leftovers(setOf(std, more, r1, r2)) shouldBe emptySet()
-    }
-
-    @Test
-    fun `頁的版本：有 std 看記號最大值，沒有記號＝0`() {
-        NightPages.pageRulesVersion(setOf(std, r1), page) shouldBe 1
-        NightPages.pageRulesVersion(setOf(std, more, r1), page) shouldBe 1
-        NightPages.pageRulesVersion(setOf(std), page) shouldBe 0
-        NightPages.pageRulesVersion(setOf(std, more), page) shouldBe 0
-        NightPages.pageRulesVersion(setOf(std, r1, r2), page) shouldBe 2
-        // 別頁的記號不算
-        NightPages.pageRulesVersion(setOf(std, stampOf("013.jpg", 1)), page) shouldBe 0
-        // std 和殘留的舊格式並存：std 說了算
-        NightPages.pageRulesVersion(setOf(std, l1, legacy, r1), page) shouldBe 1
     }
 
     @Test
@@ -110,64 +92,6 @@ class NightRulesVersionTest {
     }
 
     @Test
-    fun `舊版判斷：版本小於目前才算，沒有夜讀版不算`() {
-        NightPages.isPageOutdated(setOf(std, r1), page, current = 1) shouldBe false
-        NightPages.isPageOutdated(setOf(std, r1), page, current = 2) shouldBe true
-        NightPages.isPageOutdated(setOf(std, r2), page, current = 2) shouldBe false
-        // 比目前還新（降版裝回舊 app）不算舊版
-        NightPages.isPageOutdated(setOf(std, r2), page, current = 1) shouldBe false
-        NightPages.isPageOutdated(setOf(std), page, current = 1) shouldBe true
-        NightPages.isPageOutdated(setOf(l1, l2), page, current = 1) shouldBe true
-        NightPages.isPageOutdated(setOf(legacy), page, current = 1) shouldBe true
-        NightPages.isPageOutdated(emptySet(), page, current = 1) shouldBe false
-        NightPages.isPageOutdated(setOf(r1), page, current = 2) shouldBe false
-    }
-
-    @Test
-    fun `整章：全是目前版本不可更新`() {
-        val names = listOf(
-            stdOf("001.jpg"),
-            stampOf("001.jpg", 1),
-            stdOf("002.jpg"),
-            NightPages.levelName("002.jpg", NightLevel.MORE),
-            stampOf("002.jpg", 1),
-        )
-        NightPages.summarize(names, current = 1) shouldBe
-            NightPages.ChapterSummary(NightPages.ChapterState.READY, outdated = false)
-    }
-
-    @Test
-    fun `整章：記版本之前的格式一律可更新（沒記號的兩檔、三檔、舊版單檔）`() {
-        NightPages.summarize(listOf(stdOf("001.jpg"), stdOf("002.jpg")), current = 1) shouldBe
-            NightPages.ChapterSummary(NightPages.ChapterState.READY, outdated = true)
-        NightPages.summarize(
-            listOf(NightPages.tierName("001.jpg", NightTier.L1), NightPages.tierName("001.jpg", NightTier.L3)),
-            current = 1,
-        ) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.READY, outdated = true)
-        NightPages.summarize(listOf(NightPages.legacyName("001.jpg"), "001.orig.jpg"), current = 1) shouldBe
-            NightPages.ChapterSummary(NightPages.ChapterState.LEGACY, outdated = true)
-    }
-
-    @Test
-    fun `整章：新舊混合（升級後續做的章）只要有一頁舊就可更新`() {
-        val mixed = listOf(
-            stdOf("001.jpg"),
-            stampOf("001.jpg", 1), // 新版 app 續做的
-            stdOf("002.jpg"), // 舊版 app 做的（沒記號）
-            NightPages.tierName("003.jpg", NightTier.L1), // 三檔時代做的
-        )
-        NightPages.summarize(mixed, current = 1) shouldBe
-            NightPages.ChapterSummary(NightPages.ChapterState.READY, outdated = true)
-        // 下一次規則改版（版本 2）：做到一半的章，1 頁新、1 頁舊
-        val half = listOf(stdOf("001.jpg"), stampOf("001.jpg", 2), stdOf("002.jpg"), stampOf("002.jpg", 1))
-        NightPages.summarize(half, current = 2).outdated shouldBe true
-        NightPages.summarize(half, current = 1).outdated shouldBe false
-        // 舊頁補完之後
-        val done = listOf(stdOf("001.jpg"), stampOf("001.jpg", 2), stdOf("002.jpg"), stampOf("002.jpg", 2))
-        NightPages.summarize(done, current = 2).outdated shouldBe false
-    }
-
-    @Test
     fun `整章：沒有可顯示的夜讀版就不算可更新（只剩記號、孤兒、暫存、素材）`() {
         NightPages.summarize(emptyList(), current = 1) shouldBe
             NightPages.ChapterSummary(NightPages.ChapterState.NONE, outdated = false)
@@ -182,13 +106,6 @@ class NightRulesVersionTest {
             ),
             current = 1,
         ) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.NONE, outdated = false)
-    }
-
-    @Test
-    fun `chapterState 不受記號影響`() {
-        NightPages.chapterState(listOf(stampOf("001.jpg", 1))) shouldBe NightPages.ChapterState.NONE
-        NightPages.chapterState(listOf(stdOf("001.jpg"), stampOf("001.jpg", 1))) shouldBe NightPages.ChapterState.READY
-        NightPages.availability(true, listOf(stampOf("001.jpg", 1))) shouldBe NightAvailability.NONE
     }
 
     @Test
@@ -226,87 +143,6 @@ class NightRulesVersionTest {
         NightPages.filesOfMissingPages(names, setOf("001.jpg", "002.jpg", "003.png")) shouldBe emptySet()
     }
 
-    /**
-     * 模擬產生端一輪（`PageTranslator.renderNightChapter` 的開跑清理 [NightPages.cleanupPlan]、待做判斷
-     * [NightPages.needsRender]、每頁換檔＋寫記號），跑完之後章節列（[NightPages.summarize]）不該再是「可更新」，
-     * 再跑一輪也不該有事做。[colour]＝被「略過彩色頁」跳過的頁（刪掉它的夜讀檔、不寫記號）。標記一律當新鮮（mtime 的判斷
-     * 在 UniFile 上，這裡只驗檔名的部分）。
-     */
-    private fun simulateRun(
-        start: Set<String>,
-        pages: List<String>,
-        current: Int,
-        colour: Set<String> = emptySet(),
-        topLevel: Set<String>? = pages.toSet() + NightPages.DIR,
-    ): Pair<Set<String>, List<String>> {
-        val names = start.toMutableSet()
-        names -= NightPages.cleanupPlan(start, topLevel)
-        val kept = names.filterTo(HashSet()) { NightPages.isFinalNightFile(it) || NightPages.isRulesStamp(it) }
-        val stamps = NightPages.rulesStamps(kept)
-        val stampsAtStart = kept.mapNotNull { n -> NightPages.parseRulesStamp(n)?.let { it.first to n } }
-            .groupBy({ it.first }, { it.second })
-        val pending = pages.filter { p -> NightPages.needsRender(kept, p, stamps, current) { true } }
-        for (p in pending) {
-            if (p in colour) {
-                names -= NightPages.artifactNames(p).toSet()
-                continue
-            }
-            // 換檔：舊 std／more 換成新的（這裡假設「更多」與標準不同，兩檔都在），刪同頁舊格式
-            names += NightPages.levelName(p, NightLevel.STANDARD)
-            names += NightPages.levelName(p, NightLevel.MORE)
-            names -= NightPages.oldFormatNames(p).toSet()
-            // 寫目前版本的記號、刪開跑時同頁的其他記號
-            val stamp = NightPages.rulesStampName(p, current)
-            names += stamp
-            names -= stampsAtStart[p].orEmpty().filter { it != stamp }.toSet()
-        }
-        return names to pending
-    }
-
-    @Test
-    fun `產生一輪之後不再可更新、再跑一輪沒事做（混合格式、不在本章的頁、孤兒記號、彩頁）`() {
-        val pages = listOf("001.jpg", "002.jpg", "003.jpg", "004.jpg", "005.jpg", "006.jpg")
-        val start = setOf(
-            stdOf("001.jpg"), stampOf("001.jpg", 1), // 已是版本 1
-            stdOf("002.jpg"), NightPages.levelName("002.jpg", NightLevel.MORE), // 沒記號的兩檔（舊）
-            NightPages.tierName("003.jpg", NightTier.L1), NightPages.tierName("003.jpg", NightTier.L3), // 三檔（舊）
-            NightPages.legacyName("004.jpg"), // 舊版單檔
-            stampOf("005.jpg", 1), // 孤兒記號（沒有 std）
-            NightPages.legacyName("006.jpg"), // 彩頁、舊版單檔
-            stdOf("099.jpg"), stampOf("099.jpg", 1), NightPages.legacyName("098.png"), // 已經不在這章的頁
-            "${stdOf("002.jpg")}.tmp", // 暫存
-            "001.json", "001.mask.png", "001.orig.jpg", // 重繪素材（不碰）
-        )
-        NightPages.summarize(start, current = 1).outdated shouldBe true
-
-        val (after, pending) = simulateRun(start, pages, current = 1, colour = setOf("006.jpg"))
-        // 001 已是新版不做；002、003、004 舊版要做；005 沒有夜讀版（只有孤兒記號）要做；006 彩頁也排進來（舊版單檔）
-        pending shouldBe listOf("002.jpg", "003.jpg", "004.jpg", "005.jpg", "006.jpg")
-        NightPages.summarize(after, current = 1) shouldBe
-            NightPages.ChapterSummary(NightPages.ChapterState.READY, outdated = false)
-        // 重繪素材沒動、不在本章的頁清掉了、彩頁沒有夜讀版
-        after.containsAll(listOf("001.json", "001.mask.png", "001.orig.jpg")) shouldBe true
-        after.any { it.startsWith("099.jpg") || it.startsWith("098.png") } shouldBe false
-        NightPages.hasAnyArtifact(after, "006.jpg") shouldBe false
-
-        val (again, pending2) = simulateRun(after, pages, current = 1, colour = setOf("006.jpg"))
-        // 彩頁沒有夜讀版＝每輪都會解碼看一次（不落標記，見 renderNightPage），其餘不再做
-        pending2 shouldBe listOf("006.jpg")
-        again shouldBe after
-    }
-
-    @Test
-    fun `下一次改版（版本 2）：一輪之後全是 2，舊記號清掉`() {
-        val pages = listOf("001.jpg", "002.jpg")
-        val start = setOf(stdOf("001.jpg"), stampOf("001.jpg", 1), stdOf("002.jpg"), stampOf("002.jpg", 2))
-        NightPages.summarize(start, current = 2).outdated shouldBe true
-        val (after, pending) = simulateRun(start, pages, current = 2)
-        pending shouldBe listOf("001.jpg")
-        NightPages.summarize(after, current = 2).outdated shouldBe false
-        after.filter { NightPages.isRulesStamp(it) }.toSet() shouldBe
-            setOf(stampOf("001.jpg", 2), stampOf("002.jpg", 2))
-    }
-
     @Test
     fun `列目錄不可信時不清不在本章的頁（列出來是空的不能把整章夜讀版刪光）`() {
         val start = setOf(stdOf("001.jpg"), stampOf("001.jpg", 1), stdOf("002.jpg"), stampOf("002.jpg", 1))
@@ -335,40 +171,93 @@ class NightRulesVersionTest {
     }
 
     @Test
-    fun `needsRender：標記不算數（不新鮮或早於強制重做）也要做`() {
-        val names = setOf(stdOf(page), r1)
-        NightPages.needsRender(names, page, current = 1) { true } shouldBe false
-        NightPages.needsRender(names, page, current = 1) { false } shouldBe true
-        NightPages.needsRender(names, page, current = 2) { true } shouldBe true
-        NightPages.needsRender(setOf(r1), page, current = 1) { true } shouldBe true
-        // 三檔格式的 l1 是標記，但沒有版本＝舊版
-        NightPages.needsRender(setOf(l1, l2), page, current = 1) { true } shouldBe true
+    fun `numeric rules stamps cannot upgrade any unproven image`() {
+        listOf(setOf(std), setOf(std, more), setOf(std, l1, legacy)).forEach { images ->
+            val stamped = images + setOf(r1, r2, NightPages.rulesStampName(page, 999999))
+            NightPages.pageRulesVersion(stamped, page) shouldBe 0
+            NightPages.isPageOutdated(stamped, page) shouldBe true
+            NightPages.needsRender(stamped, page) { true } shouldBe true
+            NightPages.summarize(stamped) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.LEGACY, true)
+        }
     }
 
-    /**
-     * 一頁所有檔案組合（std、more、l1、l2、l3、舊版單檔、記號 1、記號 2；2^8 種）× 目前版本 1、2：
-     *  - 有可顯示的夜讀版（[NightPages.resolveName] 查得到）⇔ 頁的版本不是 null。
-     *  - 章節列（[NightPages.summarize]）的「可更新」＝產生端判舊版（[NightPages.isPageOutdated]）：章節列標了，按下去一定會重做；
-     *    沒標的，產生端也不會因為版本重做。
-     *  - 清掉可清的記號（[NightPages.staleStamps]）不改變頁的版本。
-     *  - 寫上目前版本的記號之後：有 std 的頁不再是舊版（產生端換檔完成後的狀態）。
-     */
     @Test
-    fun `一頁所有組合：章節列與產生端一致、清記號不改版本、寫記號後不再舊`() {
-        val all = listOf(std, more, l1, l2, l3, legacy, r1, r2)
-        for (mask in 0 until (1 shl all.size)) {
-            val names = all.filterIndexed { i, _ -> mask and (1 shl i) != 0 }.toSet()
-            for (current in 1..2) {
-                val version = NightPages.pageRulesVersion(names, page)
-                (version != null) shouldBe (NightPages.resolveName(names, page, NightLevel.STANDARD) != null)
-                NightPages.summarize(names, current).outdated shouldBe
-                    NightPages.isPageOutdated(names, page, current = current)
-                NightPages.pageRulesVersion(names - NightPages.staleStamps(names), page) shouldBe version
-                if (std in names) {
-                    val stamped = names + NightPages.rulesStampName(page, current)
-                    NightPages.isPageOutdated(stamped, page, current = current) shouldBe false
-                }
-            }
+    fun `current complete pair establishes rules version independently of numeric stamps`() {
+        val current = setOf(std, more) + NightPolicy.names(page, "1".repeat(32), moreDistinct = true)
+        NightPages.pageRulesVersion(current, page) shouldBe NightPages.RULES_VERSION
+        NightPages.pageRulesVersion(current + setOf(r1, r2), page) shouldBe NightPages.RULES_VERSION
+        NightPages.summarize(current) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.READY, false)
+        NightPages.needsRender(current, page) { true } shouldBe false
+        NightPages.needsRender(current, page) { false } shouldBe true
+        NightPages.isPageOutdated(current, page, current = NightPages.RULES_VERSION + 1) shouldBe true
+    }
+
+    @Test
+    fun `wrong version or policy pair remains a migration candidate`() {
+        val proof = NightPolicy.names(page, "2".repeat(32), moreDistinct = true)
+        val wrongVersion = proof.map {
+            it.replace(".rules${NightPages.RULES_VERSION}.", ".rules${NightPages.RULES_VERSION + 1}.")
         }
+        val policy = checkNotNull(NightPolicy.parse(proof.first())).policy
+        val wrongPolicy = proof.map { it.replace(".$policy.", ".other-policy.") }
+        listOf(wrongVersion, wrongPolicy, proof.take(1)).forEach { stamps ->
+            val names = setOf(std, more) + stamps
+            NightPages.resolveName(names, page, NightLevel.STANDARD) shouldBe null
+            NightPages.summarize(names) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.LEGACY, true)
+            NightPages.needsRender(names, page) { true } shouldBe true
+        }
+    }
+
+    @Test
+    fun `chapter with proven and legacy pages advertises ready and still offers migration`() {
+        val current =
+            NightPages.currentNames("001.jpg").toSet() +
+                NightPolicy.names("001.jpg", "3".repeat(32), moreDistinct = true)
+        val legacyPage = setOf(stdOf("002.jpg"), stampOf("002.jpg", NightPages.RULES_VERSION))
+        NightPages.summarize(current + legacyPage) shouldBe
+            NightPages.ChapterSummary(NightPages.ChapterState.READY, true)
+        val allCurrent = current + legacyPage + NightPages.levelName("002.jpg", NightLevel.MORE) +
+            NightPolicy.names("002.jpg", "4".repeat(32), moreDistinct = true)
+        NightPages.summarize(allCurrent) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.READY, false)
+    }
+
+    @Test
+    fun `all image and proof subsets keep reader and migration decisions coherent`() {
+        val proofs = NightPolicy.names(page, "5".repeat(32), moreDistinct = true)
+        val all = listOf(std, more, l1, l2, l3, legacy, r1, r2) + proofs
+        for (mask in 0 until (1 shl all.size)) {
+            val names = all.filterIndexed { index, _ -> mask and (1 shl index) != 0 }.toSet()
+            val proven = names.containsAll(listOf(std, more) + proofs)
+            (NightPages.resolveName(names, page, NightLevel.STANDARD) != null) shouldBe proven
+            NightPages.needsRender(names, page) { true } shouldBe !proven
+            NightPages.summarize(names).outdated shouldBe NightPages.isPageOutdated(names, page)
+            NightPages.pageRulesVersion(names - NightPages.staleStamps(names), page) shouldBe
+                NightPages.pageRulesVersion(names, page)
+        }
+    }
+
+    @Test
+    fun `metadata migration produces complete proofs and a second pass has no pending work`() {
+        val pages = listOf("001.jpg", "002.jpg", "003.jpg")
+        val names = mutableSetOf(
+            stdOf("001.jpg"),
+            stampOf("001.jpg", NightPages.RULES_VERSION),
+            NightPages.tierName("002.jpg", NightTier.L1),
+            NightPages.tierName("002.jpg", NightTier.L3),
+            NightPages.legacyName("003.jpg"),
+            "001.orig.jpg",
+            "001.mask.png",
+            "001.json",
+        )
+        val pending = pages.filter { NightPages.needsRender(names, it) { true } }
+        pending shouldBe pages
+        pending.forEachIndexed { index, p ->
+            names += NightPages.currentNames(p)
+            names += NightPolicy.names(p, (index + 6).toString().repeat(32), moreDistinct = true)
+            names -= NightPages.oldFormatNames(p).toSet()
+        }
+        NightPages.summarize(names) shouldBe NightPages.ChapterSummary(NightPages.ChapterState.READY, false)
+        pages.filter { NightPages.needsRender(names, it) { true } } shouldBe emptyList()
+        names.containsAll(listOf("001.orig.jpg", "001.mask.png", "001.json")) shouldBe true
     }
 }

@@ -77,7 +77,7 @@ internal class DownloadPageLoader(
         val pages = downloadManager.buildPageList(source, manga, chapter.chapter.toDomainChapter()!!)
         return pages.map { page ->
             val uri = page.uri ?: Uri.EMPTY
-            night.registerPage(page.index) { UniFile.fromUri(context, uri)?.name }
+            night.registerSource(page.index) { UniFile.fromUri(context, uri) }
             ReaderPage(page.index, page.url, page.imageUrl) {
                 // 夜讀：每次解碼都重查（開關 + 檔位 + 夜讀檔是否存在）——切換後 reload 立即生效，夜讀佇列後來才產出的檔也接得到。
                 night.open(
@@ -88,7 +88,7 @@ internal class DownloadPageLoader(
                 this.uri = uri // Preserve file identity; an index can shift when other image formats are present.
                 status = Page.State.Ready
             }
-        }
+        }.also { runCatching { night.refresh() } }
     }
 
     override suspend fun loadPage(page: ReaderPage) {

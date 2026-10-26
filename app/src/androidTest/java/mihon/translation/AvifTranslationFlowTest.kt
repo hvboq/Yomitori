@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.data.translation.TranslationEngineService
 import eu.kanade.tachiyomi.data.translation.TranslationManager
 import eu.kanade.tachiyomi.data.translation.TranslationStatsStore
 import eu.kanade.tachiyomi.data.translation.TranslationStore
+import eu.kanade.tachiyomi.data.translation.WriteBackFormat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
@@ -219,6 +220,91 @@ class AvifTranslationFlowTest {
         }
     }
 
+    @Test(timeout = 30_000)
+    fun alphaResultSingleAndChapterAvifPagesStoreWhiteJpegAndRestoreExactSources(): Unit = runBlocking {
+        withFixture { fixture ->
+            fixture.engine.alphaOutput = true
+            val directory = fixture.chapterDirectory()
+            val chapter = requireNotNull(UniFile.fromFile(directory))
+            val names = listOf("001.avif", "002.AVIF")
+            names.forEach { File(directory, it).writeBytes(fixture.avif) }
+            File(directory, "note.txt").writeBytes(NOTE)
+            assertEquals(
+                PageTranslator.SinglePageResult.TRANSLATED,
+                fixture.translator.translateSinglePage(chapter, names.first(), METHOD),
+            )
+            val first = File(directory, names.first()).readBytes()
+            assertEquals(1, fixture.translator.translateChapter(chapter, METHOD))
+            assertArrayEquals(first, File(directory, names.first()).readBytes())
+            assertEquals(2, fixture.engine.calls)
+            assertTrue(fixture.translator.isChapterTranslated(chapter))
+            for (name in names) {
+                assertTrue(fixture.translator.isPageTranslated(chapter, name))
+                assertArrayEquals(
+                    fixture.avif,
+                    File(directory, ".yakuyomi/${OriginalMaterial.exactName(name)}").readBytes(),
+                )
+                assertAlphaJpeg(File(directory, name).readBytes())
+                assertFalse(File(directory, ".yakuyomi/${OriginalMaterial.inflightName(name)}").exists())
+            }
+            fixture.engine.assertReturnedBitmapsRecycled()
+            assertEquals(2, fixture.translator.reRenderChapter(chapter, PageTranslator.ORIGINAL_METHOD))
+            names.forEach { name ->
+                assertArrayEquals("Exact AVIF recovery", fixture.avif, File(directory, name).readBytes())
+                assertArrayEquals(
+                    fixture.avif,
+                    File(directory, ".yakuyomi/${OriginalMaterial.exactName(name)}").readBytes(),
+                )
+            }
+            assertArrayEquals(NOTE, File(directory, "note.txt").readBytes())
+            assertEquals("Original recovery performs no inference", 2, fixture.engine.calls)
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun alphaResultCbzStoresWhiteJpegAndRestoresExactSourceEntries(): Unit = runBlocking {
+        withFixture { fixture ->
+            fixture.engine.alphaOutput = true
+            val directory = fixture.chapterDirectory()
+            val archive = File(directory, "alpha.cbz")
+            zip(archive, linkedMapOf("001.avif" to fixture.avif, "note.txt" to NOTE))
+            val originalArchive = archive.readBytes()
+            val archiveFile = requireNotNull(UniFile.fromFile(archive))
+            assertTrue(
+                rewrite(fixture.context, archive) { chapter ->
+                    assertEquals(1, fixture.translator.translateChapter(chapter, METHOD))
+                    assertTrue(fixture.translator.isChapterTranslated(chapter))
+                },
+            )
+            assertEquals(1, fixture.engine.calls)
+            fixture.engine.assertReturnedBitmapsRecycled()
+            assertTrue(fixture.translator.isArchiveTranslated(archiveFile))
+            assertPackedBytes(archive, ".yakuyomi/001.orig.avif", fixture.avif)
+            assertPackedBytes(archive, "note.txt", NOTE)
+            assertAlphaJpeg(packedBytes(archive, "001.avif"))
+            val translatedArchive = archive.readBytes()
+            assertTrue(
+                rewrite(fixture.context, archive) { chapter ->
+                    assertEquals(1, fixture.translator.reRenderChapter(chapter, PageTranslator.ORIGINAL_METHOD))
+                },
+            )
+            assertPackedBytes(archive, "001.avif", fixture.avif)
+            assertPackedBytes(archive, ".yakuyomi/001.orig.avif", fixture.avif)
+            assertPackedBytes(archive, "note.txt", NOTE)
+            val backups = directory.listFiles().orEmpty().filter {
+                it.name.startsWith("alpha.cbz.yomitori-original-") && it.name.endsWith(".bak")
+            }
+            assertEquals(2, backups.size)
+            assertEquals(
+                setOf(sha(originalArchive), sha(translatedArchive)),
+                backups.map {
+                    sha(it.readBytes())
+                }.toSet(),
+            )
+            assertEquals(1, fixture.engine.calls)
+        }
+    }
+
     private suspend fun withFixture(block: suspend (Fixture) -> Unit) {
         val target = InstrumentationRegistry.getInstrumentation().targetContext
         check(target.packageName == "app.yomitori.yakuyomi.audit") {
@@ -356,6 +442,7 @@ class AvifTranslationFlowTest {
     private class ScriptedEngine : TranslationEngine {
         override val translationContext = TranslationContext.fromTranslator(TranslatorConfig(toLangName = "Korean"))
         var calls = 0
+        var alphaOutput = false
         var closed = false
         private val returned = mutableListOf<Bitmap>()
         override suspend fun translatePage(page: Bitmap): PageResult {
@@ -385,7 +472,8 @@ class AvifTranslationFlowTest {
             assertTrue("Translator must recycle all returned outputs and masks", returned.all { it.isRecycled })
         }
         fun recycleRemaining() = returned.filterNot { it.isRecycled }.forEach { it.recycle() }
-        private fun owned(color: Int): Bitmap = image(color).also { returned += it }
+        private fun owned(color: Int): Bitmap =
+            (if (alphaOutput && color == Color.GREEN) alphaImage() else image(color)).also { returned += it }
     }
 
     private suspend fun rewrite(context: Context, archive: File, process: suspend (UniFile) -> Unit): Boolean {
@@ -426,6 +514,23 @@ class AvifTranslationFlowTest {
         assertArrayEquals(fixture.avif, File(directory, ".yakuyomi/${OriginalMaterial.exactName(name)}").readBytes())
         assertFalse(File(directory, ".yakuyomi/${OriginalMaterial.inflightName(name)}").exists())
         assertGreenJpeg(File(directory, name).readBytes())
+    }
+
+    private fun assertAlphaJpeg(bytes: ByteArray) {
+        assertArrayEquals(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte()), bytes.copyOfRange(0, 3))
+        val expected = alphaWhiteJpeg()
+        assertTrue("Scripted alpha output must be encoded against white paper", expected.contentEquals(bytes))
+        val bitmap = checkNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+        try {
+            assertEquals(SIZE, bitmap.width)
+            assertEquals(SIZE, bitmap.height)
+            assertTrue(Color.red(bitmap.getPixel(0, 0)) >= 250)
+            assertTrue(Color.green(bitmap.getPixel(0, 0)) >= 250)
+            assertTrue(Color.blue(bitmap.getPixel(0, 0)) >= 250)
+            assertTrue(Color.red(bitmap.getPixel(16, 16)) <= 8)
+        } finally {
+            bitmap.recycle()
+        }
     }
 
     private fun assertSnapshotEquals(expected: Map<String, ByteArray>, actual: Map<String, ByteArray>) {
@@ -494,6 +599,31 @@ class AvifTranslationFlowTest {
         fun pageField(name: String) = PageTranslator::class.java.getDeclaredField(name).apply { isAccessible = true }
         fun image(color: Int): Bitmap = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888).apply {
             eraseColor(color)
+        }
+        fun alphaImage(): Bitmap = image(Color.TRANSPARENT).apply {
+            density = 241
+            val values = IntArray(SIZE * SIZE)
+            for (y in 8 until 24) for (x in 8 until 24) values[y * SIZE + x] = Color.BLACK
+            for (y in 2 until 7) for (x in 16 until 28) values[y * SIZE + x] = Color.argb(128, 255, 0, 0)
+            setPixels(values, 0, SIZE, 0, 0, SIZE, SIZE)
+        }
+        fun alphaWhiteJpeg(): ByteArray {
+            val expected = image(Color.WHITE)
+            try {
+                val values = IntArray(SIZE * SIZE) { Color.WHITE }
+                for (y in 8 until 24) for (x in 8 until 24) values[y * SIZE + x] = Color.BLACK
+                // Independent integer SrcOver endpoints: red128 over white is255/127/127.
+                for (y in 2 until 7) for (x in 16 until 28) values[y * SIZE + x] = Color.rgb(255, 127, 127)
+                expected.density = 241
+                expected.setPixels(values, 0, SIZE, 0, 0, SIZE, SIZE)
+                expected.setHasAlpha(false)
+                return ByteArrayOutputStream().use {
+                    check(expected.compress(Bitmap.CompressFormat.JPEG, WriteBackFormat.QUALITY, it))
+                    it.toByteArray()
+                }
+            } finally {
+                expected.recycle()
+            }
         }
         fun encoded(color: Int, format: Bitmap.CompressFormat): ByteArray {
             val bitmap = image(color)

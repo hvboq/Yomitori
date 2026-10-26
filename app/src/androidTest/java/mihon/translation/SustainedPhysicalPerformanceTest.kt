@@ -1142,93 +1142,46 @@ class SustainedPhysicalPerformanceTest {
         return observationTiming(result, started)
     }
 
-    private class SmapsObservationException(val reason: String) : Exception()
-
     /** Bounded self-only stream. Mapping names select buckets but never leave this method. */
     private fun selfSmaps(): JSONObject {
         val started = now()
         val result = JSONObject().put("available", false).put("complete", false)
             .put("buckets", JSONObject.NULL).put("totalsKiB", JSONObject.NULL)
             .put("categoriesDescribeMappingNamesNotOwnership", true)
-            .put("byteLimit", 8 * 1024 * 1024).put("lineByteLimit", 8192).put("mapLimit", 32_768)
-            .put("timeLimitMsCheckedBetweenLines", 2000)
-        var bytesRead = 0
-        var maps = 0
-        var opened = false
-        val totals = SMAPS_BUCKETS.associateWith { LongArray(SMAPS_METRICS.size) }
-        val counts = SMAPS_BUCKETS.associateWith { 0 }.toMutableMap()
-        var bucket: String? = null
-        var current = LongArray(SMAPS_METRICS.size) { -1L }
-        fun finishMap() {
-            val name = bucket ?: return
-            if (current.any { it < 0 }) throw SmapsObservationException("missing-required-metric")
-            current.forEachIndexed { index, value ->
-                totals.getValue(name)[index] = Math.addExact(totals.getValue(name)[index], value)
-            }
-            counts[name] = counts.getValue(name) + 1
-        }
-        fun line(value: String) {
-            if (now() - started > 2 * NANOS_PER_SECOND) throw SmapsObservationException("time-limit")
-            val header = SMAPS_HEADER.matchEntire(value)
-            if (header != null) {
-                finishMap()
-                if (++maps > 32_768) throw SmapsObservationException("map-limit")
-                bucket = smapsBucket(header.groupValues[1])
-                current = LongArray(SMAPS_METRICS.size) { -1L }
-            } else {
-                val index = SMAPS_METRICS.indexOf(value.substringBefore(':'))
-                if (index >= 0) {
-                    if (bucket == null || current[index] >= 0L) throw SmapsObservationException("malformed-map")
-                    val fields = value.substringAfter(':').trim().split(Regex("\\s+"))
-                    val number = fields.firstOrNull()?.toLongOrNull()
-                    if (fields.size != 2 || fields[1] != "kB" || number == null || number < 0L) {
-                        throw SmapsObservationException("malformed-metric")
-                    }
-                    current[index] = number
-                } else if (bucket == null && value.isNotBlank()) {
-                    throw SmapsObservationException("missing-header")
-                }
-            }
-        }
+            .put("byteLimit", BoundedSmapsReader.BYTE_LIMIT)
+            .put("lineByteLimit", BoundedSmapsReader.LINE_BYTE_LIMIT)
+            .put("mapLimit", BoundedSmapsReader.MAP_LIMIT)
+            .put("timeLimitMsCheckedBetweenLines", BoundedSmapsReader.TIME_LIMIT_MS)
+        val snapshot = BoundedSmapsReader.read(
+            openStream = { File("/proc/self/smaps").inputStream() },
+            startedNanos = started,
+            nowNanos = ::now,
+            bucketForMapping = ::smapsBucket,
+        )
         try {
-            File("/proc/self/smaps").inputStream().buffered().use { input ->
-                opened = true
-                val buffer = ByteArray(8192)
-                var length = 0
-                while (true) {
-                    val byte = input.read()
-                    if (byte < 0) break
-                    if (++bytesRead > 8 * 1024 * 1024) throw SmapsObservationException("byte-limit")
-                    if (byte == 10) {
-                        line(String(buffer, 0, length, Charsets.UTF_8))
-                        length = 0
-                    } else {
-                        if (length == buffer.size) throw SmapsObservationException("line-limit")
-                        buffer[length++] = byte.toByte()
-                    }
+            if (snapshot.complete) {
+                val buckets = JSONObject()
+                for ((name, bucket) in checkNotNull(snapshot.buckets)) {
+                    val values = JSONObject().put("maps", bucket.maps)
+                    SMAPS_METRICS.forEachIndexed { index, metric -> values.put(metric, bucket.metricsKiB[index]) }
+                    buckets.put(name, values)
                 }
-                if (length != 0 || maps == 0) throw SmapsObservationException("incomplete-stream")
-                finishMap()
-            }
-            val buckets = JSONObject()
-            val all = LongArray(SMAPS_METRICS.size)
-            for (name in SMAPS_BUCKETS) {
-                val values = JSONObject().put("maps", counts.getValue(name))
+                val combined = JSONObject()
                 SMAPS_METRICS.forEachIndexed { index, metric ->
-                    values.put(metric, totals.getValue(name)[index])
-                    all[index] = Math.addExact(all[index], totals.getValue(name)[index])
+                    combined.put(metric, checkNotNull(snapshot.totalsKiB)[index])
                 }
-                buckets.put(name, values)
+                result.put("complete", true).put("buckets", buckets).put("totalsKiB", combined)
+            } else {
+                snapshot.unavailableClass?.let { result.put("unavailableClass", it) }
+                snapshot.incompleteReason?.let { result.put("incompleteReason", it) }
             }
-            val combined = JSONObject()
-            SMAPS_METRICS.forEachIndexed { index, metric -> combined.put(metric, all[index]) }
-            result.put("complete", true).put("buckets", buckets).put("totalsKiB", combined)
         } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException) throw error
-            result.put("unavailableClass", error.javaClass.simpleName)
-            if (error is SmapsObservationException) result.put("incompleteReason", error.reason)
+            result.put("complete", false).put("buckets", JSONObject.NULL).put("totalsKiB", JSONObject.NULL)
+                .put("unavailableClass", error.javaClass.simpleName)
         }
-        result.put("available", opened).put("bytesRead", bytesRead).put("mapsRead", maps)
+        result.put("available", snapshot.available).put("bytesRead", snapshot.bytesRead)
+            .put("mapsRead", snapshot.mapsRead)
         return observationTiming(result, started)
     }
 
@@ -1438,20 +1391,7 @@ class SustainedPhysicalPerformanceTest {
         val PAGE_NAME = Regex("[0-9]{5}\\.png")
         val FIXTURE_NAMES = listOf("horizontal", "vertical", "dense")
         val HANGUL = Regex("[가-힣]")
-        val SMAPS_METRICS = listOf("Size", "Rss", "Pss", "Private_Clean", "Private_Dirty", "Anonymous", "SwapPss")
-        val SMAPS_BUCKETS = listOf(
-            "allocatorNamed",
-            "artNamed",
-            "stackNamed",
-            "unnamedAnonymous",
-            "otherNamedAnonymous",
-            "modelNamedFile",
-            "otherFileNamed",
-            "unknown",
-        )
-        val SMAPS_HEADER = Regex(
-            "[0-9a-f]+-[0-9a-f]+\\s+[rwxps-]{4}\\s+[0-9a-f]+\\s+[0-9a-f]+:[0-9a-f]+\\s+\\d+(?:\\s+(.*))?",
-        )
+        val SMAPS_METRICS = BoundedSmapsReader.METRICS
         const val METHOD = "auto_whole"
         const val AOT_FIXTURE_DEFINITION = "Light grayscale diagonal gradient bubbles; actual AOT required per page"
         fun requireAotArgument(args: Bundle): Boolean {
