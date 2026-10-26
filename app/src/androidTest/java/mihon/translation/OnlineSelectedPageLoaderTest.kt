@@ -32,11 +32,115 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Real HTTP loader/cache and storage with injected processing; no inference, server or Activity. */
 @RunWith(AndroidJUnit4::class)
 class OnlineSelectedPageLoaderTest {
+    @Test
+    fun cachedReplayUsesCurrentTokenAndOnlyExplicitRetryProcessesAgain() = runBlocking {
+        OnlineSelectedPageFixture.run { fixture ->
+            val calls = CopyOnWriteArrayList<Int>()
+            val session = fixture.session(count = 2) { index, _ ->
+                calls += index
+                PageTranslator.SinglePageResult.SKIPPED
+            }
+            val loader = session.loader
+            val pages = session.pages
+            val load = launch(Dispatchers.IO) { loader.loadPage(pages[0]) }
+            try {
+                pages.forEach { ready(it) }
+                loader.select(pages[0], translate = true, explicitRetry = true, retryVersion = 11)
+                val first = finished(loader, 0, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 11)
+                OnlineSelectedPageFixture.settled(loader)
+                assertTrue(first.page === pages[0])
+                loader.select(pages[1], translate = true)
+                finished(loader, 1, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 0)
+                OnlineSelectedPageFixture.settled(loader)
+
+                // Reusing stored terminal data must create the current selection's envelope,
+                // rather than replay the earlier page/token that originally produced it.
+                loader.select(pages[0], translate = true, retryVersion = 22)
+                val replay = finished(loader, 0, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 22)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(listOf(0, 1), calls.toList())
+                assertTrue(replay.page === pages[0])
+                assertTrue(replay.matchesSelection(pages[0], 22, loader, pages[0].chapter, pages[0].chapter))
+                assertFalse(first.matchesSelection(pages[0], 22, loader, pages[0].chapter, pages[0].chapter))
+                assertEquals(11L, first.retryVersion)
+
+                // A changed token on the same page must not be mistaken for a duplicate Select.
+                loader.select(pages[0], translate = true, retryVersion = 23)
+                finished(loader, 0, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 23)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(listOf(0, 1), calls.toList())
+
+                loader.select(pages[0], translate = true, explicitRetry = true, retryVersion = 24)
+                finished(loader, 0, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 24)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(listOf(0, 1, 0), calls.toList())
+                loader.select(pages[1], translate = true)
+                finished(loader, 1, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 0)
+                OnlineSelectedPageFixture.settled(loader)
+                assertEquals(listOf(0, 1, 0), calls.toList())
+            } finally {
+                load.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun imageRetryPreservesTheWaitingManualRequestToken() = runBlocking {
+        OnlineSelectedPageFixture.run { fixture ->
+            val imageEntered = CountDownLatch(1)
+            val releaseImage = CountDownLatch(1)
+            val calls = AtomicInteger()
+            val session = fixture.session(
+                count = 1,
+                beforeImageResponse = {
+                    imageEntered.countDown()
+                    check(releaseImage.await(10, TimeUnit.SECONDS)) { "Scripted image response gate timed out" }
+                },
+            ) { _, _ ->
+                calls.incrementAndGet()
+                PageTranslator.SinglePageResult.SKIPPED
+            }
+            val loader = session.loader
+            val page = session.pages.single()
+            try {
+                loader.select(page, translate = true, explicitRetry = true, retryVersion = 71)
+                withTimeout(5000) {
+                    loader.progress.first {
+                        it != null && it.page === page && it.retryVersion == 71L &&
+                            it.stage == OnlineTranslatedPageLoader.Stage.WAITING_IMAGE
+                    }
+                }
+                assertTrue(session.imageRequests.isEmpty())
+                // No loadPage subscription has started the HTTP image. The real image retry
+                // requests it, but the gate prevents Ready until retryPage has replaced Select.
+                loader.retryPage(page)
+                assertTrue(imageEntered.await(5, TimeUnit.SECONDS))
+                assertEquals(0, calls.get())
+                releaseImage.countDown()
+                val result = finished(loader, 0, PageTranslator.SinglePageResult.SKIPPED, retryVersion = 71)
+                OnlineSelectedPageFixture.settled(loader)
+                assertTrue(result.page === page)
+                assertTrue(result.matchesSelection(page, 71, loader, page.chapter, page.chapter))
+                assertEquals(1, calls.get())
+                assertEquals(listOf(0), session.imageRequests.toList())
+                val stored = checkNotNull(loader.resolvePage(page))
+                assertArrayEquals(
+                    OnlineSelectedPageFixture.original(0),
+                    File(checkNotNull(stored.pageFile.uri.path)).readBytes(),
+                )
+            } finally {
+                releaseImage.countDown()
+            }
+        }
+    }
+
     @Test
     fun skippedAttemptFinishesWithoutCompletionAndDoesNotAutomaticallyRepeat() = runBlocking {
         OnlineSelectedPageFixture.run { fixture ->
@@ -497,10 +601,11 @@ class OnlineSelectedPageLoaderTest {
         loader: OnlineTranslatedPageLoader,
         pageIndex: Int,
         expectedResult: PageTranslator.SinglePageResult = PageTranslator.SinglePageResult.TRANSLATED,
-    ) {
+        retryVersion: Long? = null,
+    ): OnlineTranslatedPageLoader.Progress {
         val state = withTimeout(10000) {
             loader.progress.first {
-                it != null && it.pageIndex == pageIndex &&
+                it != null && it.pageIndex == pageIndex && (retryVersion == null || it.retryVersion == retryVersion) &&
                     (
                         it.stage == OnlineTranslatedPageLoader.Stage.FINISHED ||
                             it.stage == OnlineTranslatedPageLoader.Stage.FAILED
@@ -509,6 +614,7 @@ class OnlineSelectedPageLoaderTest {
         }
         assertEquals(OnlineTranslatedPageLoader.Stage.FINISHED, checkNotNull(state).stage)
         assertEquals(expectedResult, state.result)
+        return state
     }
 
     private suspend fun await(condition: () -> Boolean) = withTimeout(5000) {

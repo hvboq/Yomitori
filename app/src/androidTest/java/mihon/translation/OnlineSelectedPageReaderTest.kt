@@ -93,6 +93,7 @@ class OnlineSelectedPageReaderTest {
     private val context get() = instrumentation.targetContext
     private val renderChecks = JSONArray()
     private val resultNoticeChecks = JSONArray()
+    private var lastResultRetryVersion = 0L
 
     @Test(timeout = 300_000)
     fun currentPageMenusTranslateStopAndRefreshWithoutDownloadingTheChapter() = runBlocking<Unit> {
@@ -316,6 +317,18 @@ class OnlineSelectedPageReaderTest {
                 select(scenario, pages[2])
                 waitFor("old selection enters inference") { fake.entered[3].count == 0L }
                 val cancelledStored = awaitStored(loader, pages[2])
+                waitFor("old selection has active reader progress") {
+                    activity.viewModel.state.value.onlinePageIndex == 2 &&
+                        activity.viewModel.state.value.onlinePageProgress != null
+                }
+                val activeProgress = checkNotNull(activity.viewModel.state.value.onlinePageProgress)
+                // This is a model callback positive control, not an additional physical gesture:
+                // a repeated callback for the same page must not erase its active indicator.
+                scenario.onActivity {
+                    it.viewModel.onPageSelected(pages[2])
+                    assertEquals(activeProgress, it.viewModel.state.value.onlinePageProgress)
+                    assertEquals(2, it.viewModel.state.value.onlinePageIndex)
+                }
                 select(scenario, pages[3])
                 // Observe ownership invalidation before releasing the non-cooperative old call.
                 // currentPage changes before the asynchronous selection flow necessarily drains.
@@ -325,6 +338,10 @@ class OnlineSelectedPageReaderTest {
                 }
                 assertEquals(4, fake.calls.get())
                 assertEquals(1, fake.active.get())
+                // The new selected page has no processing yet: the old native-like call is
+                // still held. Its previously accepted progress must already be cleared.
+                assertEquals(null, activity.viewModel.state.value.onlinePageProgress)
+                assertEquals(null, activity.viewModel.state.value.onlinePageIndex)
                 fake.release[3].countDown()
                 awaitTranslated(loader, pages[3], translator, 0)
                 awaitRendered(scenario, pages[3], translated = true)
@@ -410,6 +427,8 @@ class OnlineSelectedPageReaderTest {
                     .put("sameReaderRenderedManualAndAutomaticResults", true)
                     .put("originalAndProcessingRecordMenuVerified", true)
                     .put("cancelledSelectionResultDiscarded", true)
+                    .put("samePageSelectionCallbackPreservedActiveProgress", true)
+                    .put("oldSelectionProgressClearedBeforePriorInferenceDrained", true)
                     .put("manualNoTextAndPolicyKeptNeutralNotFailure", true)
                     .put("actualFailureNotInferredFromPriorSummary", true)
                     .put("automaticSkippedRevisitWithoutAnotherInference", true)
@@ -606,6 +625,8 @@ class OnlineSelectedPageReaderTest {
                     .put("busy", TranslationBusy.active.value)
                     .put("pageStatus", page.status.javaClass.simpleName)
                     .put("loaderPageIndex", progress?.pageIndex ?: JSONObject.NULL)
+                    .put("loaderRetryVersion", progress?.retryVersion ?: JSONObject.NULL)
+                    .put("loaderPageIsRequestedPage", progress?.page === page)
                     .put("loaderStage", progress?.stage?.name ?: JSONObject.NULL)
                     .put("loaderResult", progress?.result?.name ?: JSONObject.NULL),
             )
@@ -657,6 +678,13 @@ class OnlineSelectedPageReaderTest {
                 setOf(expected),
                 actual,
             )
+            val progress = checkNotNull((page.chapter.pageLoader as? OnlineTranslatedPageLoader)?.progress?.value)
+            assertTrue("A manual result must still belong to its exact reader page", progress.page === page)
+            assertTrue(
+                "Each new public manual action must expose a newer request token",
+                progress.retryVersion > lastResultRetryVersion,
+            )
+            lastResultRetryVersion = progress.retryVersion
         } finally {
             @Suppress("DEPRECATION")
             event.recycle()

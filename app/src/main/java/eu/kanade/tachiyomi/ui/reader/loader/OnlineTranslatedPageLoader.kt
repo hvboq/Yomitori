@@ -49,17 +49,34 @@ internal class OnlineTranslatedPageLoader(
     enum class Stage { WAITING_IMAGE, CAPTURING, TRANSLATING, FINISHED, FAILED }
 
     data class Progress(
-        val pageIndex: Int,
+        val page: ReaderPage,
         val stage: Stage,
         val result: PageTranslator.SinglePageResult? = null,
-    )
+        val retryVersion: Long = 0L,
+    ) {
+        val pageIndex: Int get() = page.index
+
+        /** Bind progress to the selection that requested it, before showing state or a result. */
+        fun matchesSelection(
+            selectedPage: ReaderPage,
+            retryVersion: Long,
+            activeLoader: PageLoader,
+            activeChapter: ReaderChapter?,
+            currentChapter: ReaderChapter?,
+        ): Boolean = page === selectedPage && this.retryVersion == retryVersion &&
+            activeChapter != null && currentChapter === activeChapter &&
+            page.chapter === activeChapter && page.chapter.pageLoader === activeLoader
+    }
 
     private data class Request(
         val page: ReaderPage,
         val translate: Boolean,
         val explicitRetry: Boolean,
         val generation: Long,
+        val retryVersion: Long,
     )
+
+    private data class TerminalResult(val stage: Stage, val result: PageTranslator.SinglePageResult? = null)
 
     private sealed interface Command {
         data class Select(val request: Request) : Command
@@ -90,7 +107,7 @@ internal class OnlineTranslatedPageLoader(
     private val operationMutex = Mutex()
     private val captured = mutableMapOf<Int, Captured>()
     private val attempted = ConcurrentHashMap.newKeySet<String>()
-    private val terminalResults = ConcurrentHashMap<String, Progress>()
+    private val terminalResults = ConcurrentHashMap<String, TerminalResult>()
     private val explicitlyStopped = mutableSetOf<Int>()
     private var generation = 0L
     private var requested: Request? = null
@@ -195,20 +212,24 @@ internal class OnlineTranslatedPageLoader(
             page.status = Page.State.Queue
             delegate.retryPage(page)
             val old = synchronized(monitor) { requested }
-            if (old?.page === page) select(page, old.translate, explicitRetry = true)
+            if (old?.page === page) select(page, old.translate, explicitRetry = true, retryVersion = old.retryVersion)
         }
     }
 
     /** Only the reader's selected-page event (or explicit retry) may request page inference. */
-    fun select(page: ReaderPage, translate: Boolean, explicitRetry: Boolean = false) {
+    fun select(page: ReaderPage, translate: Boolean, explicitRetry: Boolean = false, retryVersion: Long = 0L) {
         val next = synchronized(monitor) {
             if (isRecycled || pages.getOrNull(page.index) !== page) return
             val old = requested
-            if (!explicitRetry && old?.page === page && old.translate == translate) return
+            if (!explicitRetry && old?.page === page && old.translate == translate &&
+                old.retryVersion == retryVersion
+            ) {
+                return
+            }
             generation++
             selectedPage = page
             if (explicitRetry) explicitlyStopped.remove(page.index)
-            Request(page, translate, explicitRetry, generation).also { requested = it }
+            Request(page, translate, explicitRetry, generation, retryVersion).also { requested = it }
         }
         commands.trySend(Command.Select(next))
     }
@@ -401,7 +422,7 @@ internal class OnlineTranslatedPageLoader(
                                 Stage.FAILED
                             }
                         }
-                        terminalResults[key] = Progress(request.page.index, final, result)
+                        terminalResults[key] = TerminalResult(final, result)
                         update(request, final, result)
                     } finally {
                         withContext(NonCancellable) {
@@ -421,11 +442,11 @@ internal class OnlineTranslatedPageLoader(
         } catch (_: OnlinePageCache.TooManyPixels) {
             update(request, Stage.FAILED, PageTranslator.SinglePageResult.TOO_LARGE)
         } catch (_: OnlinePageCache.TooLarge) {
-            attemptKey?.let { terminalResults[it] = Progress(request.page.index, Stage.FAILED) }
+            attemptKey?.let { terminalResults[it] = TerminalResult(Stage.FAILED) }
             // This is the private online-cache bound, not PageTranslator's different pixel cap.
             update(request, Stage.FAILED, PageTranslator.SinglePageResult.NOT_TRANSLATED)
         } catch (_: Exception) {
-            attemptKey?.let { terminalResults[it] = Progress(request.page.index, Stage.FAILED) }
+            attemptKey?.let { terminalResults[it] = TerminalResult(Stage.FAILED) }
             update(request, Stage.FAILED, PageTranslator.SinglePageResult.NOT_TRANSLATED)
         } finally {
             runCatching { cacheStore.trim() }
@@ -441,7 +462,9 @@ internal class OnlineTranslatedPageLoader(
         stage: Stage,
         result: PageTranslator.SinglePageResult? = null,
     ) {
-        if (request.translate && isCurrent(request)) mutableProgress.value = Progress(request.page.index, stage, result)
+        if (request.translate && isCurrent(request)) {
+            mutableProgress.value = Progress(request.page, stage, result, request.retryVersion)
+        }
     }
 
     private fun captured(page: ReaderPage): Captured? = synchronized(monitor) {

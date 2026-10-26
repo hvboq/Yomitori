@@ -767,7 +767,7 @@ class ReaderViewModel @JvmOverloads constructor(
                         deliveredManualVersion = selection.retryVersion
                         val context = Injekt.get<Application>()
                         if (!TranslationEngineConfig.modelsResolvable(context)) {
-                            online.select(page, translate = false)
+                            online.select(page, translate = false, retryVersion = selection.retryVersion)
                             eventChannel.send(
                                 Event.TranslateModelsUnavailable(TranslationEngineConfig.modelsOutdated(context)),
                             )
@@ -775,7 +775,12 @@ class ReaderViewModel @JvmOverloads constructor(
                         }
                         eventChannel.send(Event.TranslatePageStarted)
                     }
-                    online.select(page, translate = translate, explicitRetry = retry && translate)
+                    online.select(
+                        page,
+                        translate = translate,
+                        explicitRetry = retry && translate,
+                        retryVersion = selection.retryVersion,
+                    )
                 }
             } finally {
                 withContext(NonCancellable) { activeOnlinePageLoader?.stopAndJoin() }
@@ -791,11 +796,19 @@ class ReaderViewModel @JvmOverloads constructor(
             // A cancelled old observer must not clear a new loader's current progress.
             if (activeOnlinePageLoader !== online) return@onEach
             val selection = selectedOnlinePage.value
-            if (progress == null || selection == null ||
-                getCurrentChapter() !== activeOnlinePageChapter ||
-                selection.page.index != progress.pageIndex
-            ) {
+            if (progress == null || selection == null) {
                 mutableState.update { it.copy(onlinePageProgress = null, onlinePageIndex = null) }
+                return@onEach
+            }
+            // A delayed old terminal must neither announce a new retry nor clear its progress.
+            if (!progress.matchesSelection(
+                    selection.page,
+                    selection.retryVersion,
+                    online,
+                    activeOnlinePageChapter,
+                    getCurrentChapter(),
+                )
+            ) {
                 return@onEach
             }
             val active = progress.stage == OnlineTranslatedPageLoader.Stage.WAITING_IMAGE ||
@@ -1161,14 +1174,12 @@ class ReaderViewModel @JvmOverloads constructor(
         visibleNightPages = visible?.map { (it as? InsertPage)?.parent ?: it }
 
         val actualPage = (page as? InsertPage)?.parent ?: page
-        if (actualPage.chapter.pageLoader is OnlineTranslatedPageLoader) {
-            // Split halves share a source authority. Repeated callbacks must not cancel a
-            // manual request, but selecting either half must activate its actual page.
-            if (selectedOnlinePage.value?.page !== actualPage) {
-                selectedOnlinePage.value = OnlinePageSelection(actualPage)
-            }
-        } else {
-            selectedOnlinePage.value = null
+        val onlinePage = actualPage.takeIf { it.chapter.pageLoader is OnlineTranslatedPageLoader }
+        // Split halves and repeated callbacks retain the same selection/manual request.
+        if (selectedOnlinePage.value?.page !== onlinePage) {
+            // A previous native call can take time to drain; its indicator belongs to the old page.
+            mutableState.update { it.copy(onlinePageProgress = null, onlinePageIndex = null) }
+            selectedOnlinePage.value = onlinePage?.let { OnlinePageSelection(it) }
         }
 
         // InsertPage doesn't change page progress

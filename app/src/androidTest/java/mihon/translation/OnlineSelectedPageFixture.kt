@@ -71,6 +71,7 @@ internal class OnlineSelectedPageFixture private constructor(val root: File, tar
     suspend fun session(
         count: Int = 12,
         limits: OnlinePageCache.Limits = loaderLimits(),
+        beforeImageResponse: ((Int) -> Unit)? = null,
         translate: suspend (Int, OnlineTranslatedPageLoader.StoredPage) -> PageTranslator.SinglePageResult,
     ): Session {
         val requested = CopyOnWriteArrayList<Int>()
@@ -81,6 +82,7 @@ internal class OnlineSelectedPageFixture private constructor(val root: File, tar
             val index = request.url.pathSegments.last().removeSuffix(".png").toInt()
             check(index in 0 until count)
             requested += index
+            beforeImageResponse?.invoke(index)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("neutral")
                 .body(original(index).toResponseBody("image/png".toMediaType())).build()
         }.build()
