@@ -59,9 +59,11 @@ import kotlin.math.floor
 /**
  * Fresh selected-page research, not a replay of the signed reader's private original or geometry.
  * Required arguments: liveHitomiOcrDiagnostic=true, diagnosticRunId=UUID, hitomiReader=/reader/ID.html,
- * pageNumbers=2,3. No content, URL, raw trace, exception message or image is emitted or saved.
+ * pageNumbers=2,3. No text, URL, raw trace or exception message is emitted or saved.
  * Optional liveHitomiOcrPolarityDiagnostic=true adds neutral controls before fetching, then full-page RGB
  * inversion of owned opaque copies. Candidate confidence is not evidence of actual semantic correctness.
+ * Optional liveHitomiOcrGroundTruthDiagnostic=true binds private salted expectations to source/quad and
+ * retains bounded original ROI PNGs in an isolated cache directory for host extraction and cleanup.
  * Public default Detector/Ocr configurations are test defaults, not the signed app's observed settings.
  */
 @OptIn(InternalEngineApi::class)
@@ -93,6 +95,7 @@ class HitomiOcrUnreadDiagnosticTest {
         var failure: Throwable? = null
         var models: Models? = null
         var client: OkHttpClient? = null
+        var groundTruth: OcrCandidateGroundTruth? = null
         val nativeOwners = mutableListOf<Any>()
         val httpExecutor = Executors.newCachedThreadPool { task -> Thread(task, "hitomi-ocr-http") }
         val pool = ConnectionPool()
@@ -110,6 +113,8 @@ class HitomiOcrUnreadDiagnosticTest {
             val id = checkNotNull(match.groupValues[1].toLongOrNull()).also { check(it > 0) }
             check(context.packageName == "app.yomitori.yakuyomi.audit")
             check(Process.is64Bit() && "arm64-v8a" in Build.SUPPORTED_ABIS)
+            groundTruth = OcrCandidateGroundTruth.parse(context, arguments)
+            check(groundTruth == null || polarityDiagnostic)
             idle(context)
             val nativeModels = Models(context).also { models = it }
             report.put("modelsBefore", nativeModels.manifest())
@@ -184,7 +189,16 @@ class HitomiOcrUnreadDiagnosticTest {
                             val bitmap = checkNotNull(decoder.decode(sampleSize = 1))
                             try {
                                 check(bitmap.width == decoder.width && bitmap.height == decoder.height)
-                                analyze(context, nativeModels, bitmap, row, nativeOwners, polarityDiagnostic)
+                                groundTruth?.validatePage(descriptor.number, sha(bytes), bitmap.width, bitmap.height)
+                                analyze(
+                                    context,
+                                    nativeModels,
+                                    bitmap,
+                                    row,
+                                    nativeOwners,
+                                    polarityDiagnostic,
+                                    groundTruth,
+                                )
                             } finally {
                                 bitmap.recycle()
                             }
@@ -199,6 +213,7 @@ class HitomiOcrUnreadDiagnosticTest {
                 status()
             }
             check(pages.length() == 2)
+            groundTruth?.let { check(it.retainedImageCount == 2) }
             report.put("passed", true)
             phase = 20
         } catch (error: Throwable) {
@@ -230,6 +245,9 @@ class HitomiOcrUnreadDiagnosticTest {
             httpExecutor.shutdownNow()
             verify { check(httpExecutor.awaitTermination(5, TimeUnit.SECONDS)) }
             verify { check(pool.connectionCount() == 0) }
+            verify { groundTruth?.addSummary(report) }
+            report.put("imageFilesByTest", groundTruth?.retainedImageCount ?: 0)
+                .put("contentFilesByTest", groundTruth?.retainedImageCount ?: 0)
             report.put("nativeOwnersCreated", nativeOwners.size).put("cleanupFailures", cleanupFailures)
                 .put("ownedNativeHandlesClosed", cleanupFailures == 0)
                 .put("modelsUnchanged", models?.unchanged == true)
@@ -257,6 +275,7 @@ class HitomiOcrUnreadDiagnosticTest {
         row: JSONObject,
         owners: MutableList<Any>,
         polarityDiagnostic: Boolean,
+        groundTruth: OcrCandidateGroundTruth?,
     ) {
         val source = SourceSnapshot(page)
         row.put("width", page.width).put("height", page.height).put("density", page.density)
@@ -313,7 +332,7 @@ class HitomiOcrUnreadDiagnosticTest {
             .put("finalNonBlankLines", on.count { it.text.isNotBlank() }).put("intentionallyKeptLines", onKept.size)
         validateTrace(trace.snapshot(), on, onKept, config, lines, row)
         if (polarityDiagnostic) {
-            pagePolarity(context, models, page, on, onKept, row, owners)
+            pagePolarity(context, models, page, on, onKept, row, owners, groundTruth)
             source.verify(page)
         }
         idle(context)
@@ -385,6 +404,7 @@ class HitomiOcrUnreadDiagnosticTest {
         kept: Set<TextLine>,
         pageRow: JSONObject,
         owners: MutableList<Any>,
+        groundTruth: OcrCandidateGroundTruth?,
     ) {
         val baselineRows = pageRow.getJSONArray("lines")
         val pending = baseline.indices.filter { baseline[it].text.isBlank() && baseline[it] !in kept }
@@ -430,6 +450,11 @@ class HitomiOcrUnreadDiagnosticTest {
             selected.forEachIndexed { index, baselineIndex ->
                 val original = baseline[baselineIndex]
                 check(candidate[index].quad == original.quad)
+                val originalCrop = selectedOriginal.getJSONArray("lines").getJSONObject(index)
+                    .getJSONArray("attempts").getJSONObject(0).getJSONObject("crop")
+                val invertedCrop = row.getJSONArray("lines").getJSONObject(index)
+                    .getJSONArray("attempts").getJSONObject(0).getJSONObject("crop")
+                check(originalCrop.toString() == invertedCrop.toString())
                 row.getJSONArray("lines").getJSONObject(index).put("baselineLineIndex", baselineIndex)
                     .put("baselineBlank", original.text.isBlank()).put("recognizedControl", baselineIndex == control)
                     .put("baselineTextExact", candidate[index].text == original.text)
@@ -437,6 +462,8 @@ class HitomiOcrUnreadDiagnosticTest {
             }
             row.put("sourceFullyOpaque", true).put("exactRgbInversion", true)
                 .put("sourcePixelsMetadataAndGeometryUnchanged", true)
+                .put("firstAttemptExpandedCropGeometryExact", true)
+            groundTruth?.record(pageRow.getInt("pageOneBased"), page, baseline, candidate, selected, row)
         } finally {
             inverted.recycle()
         }
@@ -552,6 +579,13 @@ class HitomiOcrUnreadDiagnosticTest {
                 val attemptRow = JSONObject().put("index", attempt).put("warpFailed", warpFailed)
                     .put("policyIgnored", ignored).put("inferences", inferred)
                     .put("accepted", path.last().accepted == true).put("intentionallyKept", ignored)
+                    .put(
+                        "crop",
+                        JSONObject().put("expandedSortedQuadSha256", crop.quadSha256)
+                            .put("stripWidth", crop.stripWidth).put("stripHeight", crop.stripHeight)
+                            .put("direction", crop.direction).put("stripPad", crop.stripPad)
+                            .put("bicubic", crop.bicubic),
+                    )
                 attempts.put(attemptRow)
                 if (warpFailed || ignored) {
                     check(terminals.isEmpty() && inferred == 0 && path.none { it.type == EventType.CONTEXT })
