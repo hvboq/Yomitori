@@ -47,7 +47,7 @@ internal object HitomiSearchQuery {
     /** Replace the complete term at the caret, preserving all surrounding terms and separators. */
     fun replaceAt(query: String, token: ActiveToken, value: String): Replacement? {
         if (query != token.query || activeToken(query, token.caret) != token) return null
-        val canonical = value.trim().replace(Regex("\\s+"), "_")
+        val canonical = HitomiSearchText.canonicalTag(value)
         if (canonical.isEmpty() || canonical.startsWith('-')) return null
         val inserted = (if (token.excluded) "-" else "") + canonical
         val suffix = query.substring(token.end)

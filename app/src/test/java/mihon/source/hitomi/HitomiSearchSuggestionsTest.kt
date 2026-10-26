@@ -27,6 +27,33 @@ import java.util.concurrent.TimeUnit
 
 class HitomiSearchSuggestionsTest {
     @Test
+    fun `noncontrol editor whitespace in remote names becomes one canonical tag`() {
+        for (separator in listOf(' ', '\u00A0', '\u2007', '\u202F', '\u3000')) {
+            separator.isWhitespace() shouldBe true
+            HitomiSuggestionProtocol.parse("""[["Neutral${separator}${separator}Name",1,"artist"]]""") shouldBe
+                listOf(HitomiSearchSuggestion("artist:neutral_name", "artist:Neutral${separator}${separator}Name", 1))
+        }
+    }
+
+    @Test
+    fun `noncontrol editor whitespace prefixes address the same remote space index`() {
+        for (separator in listOf(' ', '\u00A0', '\u2007', '\u202F', '\u3000')) {
+            HitomiSuggestionProtocol.url("artist:A${separator}B/C.D")?.encodedPath shouldBe
+                "/artist/a/_/b/slash/c/dot/d.json"
+        }
+    }
+
+    @Test
+    fun `ASCII control characters remain rejected in remote names and prefix requests`() {
+        for (code in (0..31) + 127) {
+            val control = code.toChar()
+            HitomiSuggestionProtocol.url("artist:neutral${control}name") shouldBe null
+            val escaped = "\\u${code.toString(16).padStart(4, '0')}"
+            HitomiSuggestionProtocol.parse("""[["neutral${escaped}name",1,"artist"]]""") shouldBe emptyList()
+        }
+    }
+
+    @Test
     fun `global and every supported namespace use the remote character index`() {
         HitomiSuggestionProtocol.url("JAP").toString() shouldBe "https://tagindex.hitomi.la/global/j/a/p.json"
         val namespaces = listOf("artist", "group", "series", "character", "tag", "female", "male", "language", "type")

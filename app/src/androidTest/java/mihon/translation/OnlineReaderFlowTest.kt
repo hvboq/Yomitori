@@ -20,6 +20,7 @@ import eu.kanade.tachiyomi.ui.reader.ReaderActivity
 import eu.kanade.tachiyomi.ui.reader.loader.HttpPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.OnlineTranslatedPageLoader
 import eu.kanade.tachiyomi.ui.reader.loader.TranslatingPageLoader
+import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
@@ -70,6 +71,7 @@ class OnlineReaderFlowTest {
             "PROTECTED_FLOW_USES_CONFIGURED_SERVER_ONLY"
         }
         val scope = OnlineReaderFlowScope(context)
+        val onlineCache = OnlineCacheGuard(File(context.cacheDir.canonicalFile, "online-reader-pages-v1"))
         val stages = JSONArray()
         val report = JSONObject().put("source", "complete two-page synthetic HTTP chapter; not Hitomi")
             .put("translation", "configured real server and native OCR")
@@ -194,8 +196,14 @@ class OnlineReaderFlowTest {
                                 scenario.onActivity { activity = it }
                                 stage("http_reader_two_original_pages") {
                                     waitFor(60000) {
+                                        val current = activity.viewModel.state.value.viewerChapters?.currChapter
+                                        // Register before observing a background error: the first page
+                                        // can be captured while a later fixture image fails to load.
+                                        current?.pages?.takeIf { pages -> pages.size == originals.size }?.let { pages ->
+                                            onlineCache.own(manga, chapter, pages, originals)
+                                        }
                                         checkBackgroundFailure()
-                                        activity.viewModel.state.value.viewerChapters?.currChapter?.let {
+                                        current?.let {
                                             it.pageLoader is OnlineTranslatedPageLoader && it.pages?.size == 2 &&
                                                 it.pages!!.all { page -> page.status == Page.State.Ready }
                                         } == true
@@ -346,7 +354,8 @@ class OnlineReaderFlowTest {
                                 .put("files", JSONObject(completedHashes))
                         } finally {
                             server.releaseDownload()
-                            // Dependency/file/DB cleanup belongs to the outer scope, after all Activity callbacks settle.
+                            // Dependency/file/DB cleanup belongs to the outer scope,
+                            // after all Activity callbacks settle.
                         }
                     }
                     assertTrue(
@@ -375,9 +384,16 @@ class OnlineReaderFlowTest {
                 report.put("reportFailureType", it.javaClass.name)
                 failure = failure ?: AssertionError("ONLINE_READER_REPORT_FAILURE")
             }
+            report.put(
+                "onlinePageCacheCleanup",
+                JSONObject().put("passed", false).put("retainedForFailedRun", true),
+            )
             withContext(NonCancellable) {
                 try {
                     report.put("cleanup", scope.close())
+                    // Scope closes Activity/VM, native/client and loader owners before touching
+                    // their cache. A failed run keeps its exact private source/output evidence.
+                    report.put("onlinePageCacheCleanup", onlineCache.close(delete = failure == null))
                 } catch (cleanup: Throwable) {
                     report.put("cleanupFailureType", cleanup.javaClass.name)
                         .put("cleanupFailureStructure", onlineReaderFlowFailure(cleanup))
@@ -414,6 +430,122 @@ class OnlineReaderFlowTest {
 
     private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
         .joinToString("") { "%02x".format(it.toInt() and 255) }
+
+    /** Only this source's new exact capture authorities may be removed after all owners drain. */
+    private class OnlineCacheGuard(private val root: File) {
+        private val beforeNames: Set<String>
+        private val before: Map<String, String>
+        private val ownedSources = mutableMapOf<String, Pair<String, Long>>()
+
+        init {
+            check(root.parentFile?.name == "cache" && root.canonicalFile == root)
+            check(!root.exists() || root.isDirectory)
+            beforeNames = root.listFiles().orEmpty().map { it.name }.toSet()
+            check(beforeNames.size <= 16) { "AUDIT_ONLINE_CACHE_REQUIRES_HEADROOM" }
+            var count = 0
+            var bytes = 0L
+            // Validate boundaries and headroom BEFORE reading any existing file's content hash.
+            if (root.exists()) {
+                root.walkTopDown().onEnter { entry ->
+                    check(entry.canonicalFile == entry && entry.toPath().startsWith(root.toPath()))
+                    true
+                }.forEach { entry ->
+                    check(++count <= 4096 && entry.canonicalFile == entry)
+                    check(entry.isFile || entry.isDirectory)
+                    if (entry.isFile) bytes += entry.length()
+                    check(bytes < 16L * 1024 * 1024) { "AUDIT_ONLINE_CACHE_REQUIRES_HEADROOM" }
+                }
+            }
+            check(bytes < 16L * 1024 * 1024) {
+                "AUDIT_ONLINE_CACHE_REQUIRES_HEADROOM"
+            }
+            before = hashes(root)
+        }
+
+        fun own(manga: Manga, chapter: Chapter, pages: List<ReaderPage>, originals: List<ByteArray>) {
+            check(pages.size == originals.size)
+            pages.forEach { page ->
+                val identity = sha(
+                    listOf(
+                        "online-reader-v1",
+                        manga.source.toString(),
+                        manga.url,
+                        chapter.url,
+                        page.index.toString(),
+                        page.url,
+                    ).joinToString("") { "${it.length}:$it" }.toByteArray(Charsets.UTF_8),
+                )
+                val expected = sha(originals[page.index]) to originals[page.index].size.toLong()
+                check(ownedSources.put(identity, expected)?.let { it == expected } != false)
+            }
+        }
+
+        fun close(delete: Boolean): JSONObject {
+            check(!root.exists() || (root.isDirectory && root.canonicalFile == root))
+            val current = hashes(root)
+            check(before.all { (path, hash) -> current[path] == hash }) { "Existing online cache bytes changed" }
+            val children = root.listFiles().orEmpty()
+            check(children.map { it.name }.toSet().containsAll(beforeNames)) { "Existing cache entry disappeared" }
+            val created = children.filter { it.name !in beforeNames }
+            // Validate EVERY candidate before deleting any; unknown/torn entries retain evidence.
+            val evidence = created.map { directory ->
+                check(directory.isDirectory && directory.canonicalFile == directory && directory.parentFile == root)
+                check(Regex("[a-f0-9]{64}").matches(directory.name))
+                val metadata = File(directory, "origin.json")
+                check(metadata.isFile && metadata.canonicalFile == metadata && metadata.length() in 1..4096)
+                val value = JSONObject(metadata.readText(Charsets.UTF_8))
+                val identity = value.getString("identity")
+                val expected = checkNotNull(ownedSources[identity]) { "Unowned online cache authority" }
+                check(value.getInt("version") == 1 && value.getString("sourceSha256") == expected.first)
+                check(value.getLong("sourceBytes") == expected.second && value.getString("page") == "page.png")
+                check(directory.name == sha("online-page-v1\n$identity\n${expected.first}".toByteArray()))
+                val source = File(directory, "source.bin")
+                check(source.isFile && source.canonicalFile == source && source.length() == expected.second)
+                check(hash(source) == expected.first)
+                JSONObject().put("partitionName", directory.name).put("identitySha256", identity)
+                    .put("sourceSha256", expected.first).put("sourceBytes", expected.second)
+            }
+            if (delete) {
+                created.forEach { directory ->
+                    directory.walkBottomUp().forEach { entry ->
+                        check(entry.canonicalFile == entry && entry.toPath().startsWith(directory.toPath()))
+                        check(entry.delete())
+                    }
+                }
+                assertEquals("Existing online cache must be unchanged", before, hashes(root))
+            }
+            return JSONObject().put("passed", delete).put("retainedForFailedRun", !delete)
+                .put("existingCacheFilesPreserved", true).put("newOwnedPartitions", JSONArray(evidence))
+                .put("removedOwnedPartitionCount", if (delete) created.size else 0)
+        }
+
+        private fun hashes(directory: File): Map<String, String> {
+            var count = 0
+            return directory.walkTopDown().onEnter { entry ->
+                check(entry.canonicalFile == entry && entry.toPath().startsWith(directory.toPath()))
+                true
+            }.filter { entry ->
+                check(++count <= 4096 && entry.canonicalFile == entry)
+                entry.isFile
+            }.associate { it.relativeTo(directory).invariantSeparatorsPath to hash(it) }
+        }
+
+        private fun hash(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+        }
+
+        private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
 
     private fun configure(settings: OnlineReaderFlowScope) {
         val prefs = settings.preferences

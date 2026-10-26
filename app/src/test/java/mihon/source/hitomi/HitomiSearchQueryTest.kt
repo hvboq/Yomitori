@@ -5,6 +5,38 @@ import org.junit.jupiter.api.Test
 
 class HitomiSearchQueryTest {
     @Test
+    fun `editor whitespace replacement preserves surrounding filters and exclusion exactly`() {
+        val separators = listOf(
+            '\u3000', '\u00A0', '\u2007', '\u202F', ' ', '\t', '\n', '\r',
+            '\u000B', '\u000C', '\u001C', '\u001D', '\u001E', '\u001F',
+        )
+        for (separator in separators) {
+            separator.isWhitespace() shouldBe true
+            val prefix = "type:manga$separator"
+            val query = "$prefix-langBROKEN${separator}artist:neutral_name"
+            val token = HitomiSearchQuery.activeToken(query, prefix.length + "-lang".length)!!
+            token.text shouldBe "lang"
+            token.excluded shouldBe true
+            val replaced = HitomiSearchQuery.replaceAt(query, token, "language:japanese")!!
+            replaced.query shouldBe "$prefix-language:japanese${separator}artist:neutral_name"
+            replaced.caret shouldBe prefix.length + "-language:japanese".length + 1
+        }
+    }
+
+    @Test
+    fun `every editor whitespace in a suggested multiword value becomes one searchable token`() {
+        val token = HitomiSearchQuery.activeToken("artist:ne")!!
+        val separators = listOf(
+            '\u3000', '\u00A0', '\u2007', '\u202F', ' ', '\t', '\n', '\r',
+            '\u000B', '\u000C', '\u001C', '\u001D', '\u001E', '\u001F',
+        )
+        for (separator in separators) {
+            HitomiSearchQuery.replaceAt(token.query, token, "artist:neutral${separator}${separator}name") shouldBe
+                HitomiSearchQuery.Replacement("artist:neutral_name ", "artist:neutral_name ".length)
+        }
+    }
+
+    @Test
     fun `plain prefix selection inserts an actual canonical tag`() {
         val token = HitomiSearchQuery.activeToken("jap")!!
         token.text shouldBe "jap"

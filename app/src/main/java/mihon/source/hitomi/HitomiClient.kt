@@ -113,7 +113,7 @@ internal class HitomiClient(private val client: OkHttpClient, private val header
 
     suspend fun search(query: String, language: String, page: Int): Pair<List<Long>, Boolean> {
         require(page > 0)
-        val terms = query.trim().lowercase().split(Regex("\\s+")).filter(String::isNotBlank)
+        val terms = HitomiSearchText.terms(query.lowercase())
         val positives = terms.filterNot { it.startsWith('-') }.toMutableList()
         val negatives = terms.filter { it.startsWith('-') && it.length > 1 }.map { it.drop(1) }
         if (language != "all" &&

@@ -45,6 +45,10 @@ all searchable namespaces (`language`, `artist`, `group`, `series`,
 than a curated tag list. Both search bars debounce input, cancel obsolete
 requests, and replace only the token at the cursor when a candidate is selected.
 Multiple-word values use underscores and negative filters retain `-`.
+Editing, remote candidate normalization and actual search share the same
+`Char.isWhitespace` boundaries, including full-width and non-breaking spaces.
+Remote names and prefix requests still reject ISO control characters before
+normalization; ordinary search separators retain the editor's whitespace rules.
 Responses are bounded to 256 KiB and at most 20 candidates are displayed.
 
 The opt-in Android `HitomiConnectivityDiagnosticTest` checks suggestions,

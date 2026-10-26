@@ -26,6 +26,44 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class HitomiClientTest {
     @Test
+    fun `every editor whitespace separator preserves query intersection and exclusions`() = runBlocking<Unit> {
+        val requests = mutableListOf<List<String>>()
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            requests += request.url.pathSegments
+            val data = when (request.url.pathSegments) {
+                listOf("type", "manga-all.nozomi") -> ids(9, 7, 5)
+                listOf("artist", "neutral name-all.nozomi") -> ids(7, 5)
+                listOf("tag", "exclude-all.nozomi") -> ids(5)
+                else -> error("Unexpected neutral filter path: ${request.url.encodedPath}")
+            }
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body(data.toResponseBody()).build()
+        }.build()
+        try {
+            val api = HitomiClient(client) { Headers.headersOf() }
+            val separators = listOf(
+                '\u3000', '\u00A0', '\u2007', '\u202F', ' ', '\t', '\n', '\r',
+                '\u000B', '\u000C', '\u001C', '\u001D', '\u001E', '\u001F',
+            )
+            for (separator in separators) {
+                separator.isWhitespace() shouldBe true
+                requests.clear()
+                val query = "type:manga${separator}artist:neutral_name$separator-tag:exclude"
+                api.search(query, "all", 1) shouldBe (listOf(7L) to false)
+                requests shouldBe listOf(
+                    listOf("type", "manga-all.nozomi"),
+                    listOf("artist", "neutral name-all.nozomi"),
+                    listOf("tag", "exclude-all.nozomi"),
+                )
+            }
+        } finally {
+            client.dispatcher.executorService.shutdown()
+            client.connectionPool.evictAll()
+        }
+    }
+
+    @Test
     fun `missing tag index is an empty search rather than a network failure`() = runBlocking<Unit> {
         val client = OkHttpClient.Builder().addInterceptor { chain ->
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(404).message("Not Found")

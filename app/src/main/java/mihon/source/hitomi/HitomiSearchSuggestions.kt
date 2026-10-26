@@ -73,12 +73,11 @@ internal object HitomiSuggestionProtocol {
     private const val MAX_NAME_LENGTH = 256
     private val namespaces =
         setOf("artist", "group", "series", "character", "tag", "female", "male", "language", "type")
-    private val whitespace = Regex("\\s+")
     private val json = Json { ignoreUnknownKeys = true }
 
     fun url(query: String): HttpUrl? {
         if (query.any(Char::isISOControl)) return null
-        val normalized = query.trim().lowercase().replace('_', ' ')
+        val normalized = HitomiSearchText.normalizeWhitespace(query).trim().lowercase().replace('_', ' ')
         if (normalized.isEmpty() || normalized.length > MAX_QUERY_LENGTH || normalized.any(Char::isISOControl)) {
             return null
         }
@@ -130,7 +129,7 @@ internal object HitomiSuggestionProtocol {
                 if (number.isString) continue
                 number.intOrNull?.takeIf { it >= 0 } ?: continue
             }
-            val value = "$namespace:${name.lowercase().replace(whitespace, "_")}"
+            val value = "$namespace:${HitomiSearchText.canonicalTag(name.lowercase())}"
             results.putIfAbsent(value, HitomiSearchSuggestion(value, "$namespace:$name", count))
             if (results.size == MAX_RESULTS) break
         }
