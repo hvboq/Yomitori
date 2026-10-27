@@ -131,18 +131,20 @@ internal class OnlineTranslatedPageLoader(
         var pendingAcknowledgement: CompletableDeferred<Unit>? = null
         try {
             for (command in commands) {
+                if (command is Command.Select && !isCurrent(command.request)) continue
                 pendingAcknowledgement = (command as? Command.Stop)?.complete
                 active?.cancelAndJoin()
                 active = null
                 when (command) {
                     is Command.Select -> {
+                        // A newer request may arrive while the previous native call drains.
+                        if (!isCurrent(command.request)) continue
                         if (!command.request.translate) {
                             captured(command.request.page)?.entry?.directory?.path?.let {
                                 attempted.remove(it)
                                 terminalResults.remove(it)
                             }
                         }
-                        if (!isCurrent(command.request)) continue
                         releaseSelected()
                         mutableProgress.value = null
                         active = scope.launch { process(command.request) }
@@ -224,7 +226,7 @@ internal class OnlineTranslatedPageLoader(
 
     /** Only the reader's selected-page event (or explicit retry) may request page inference. */
     fun select(page: ReaderPage, translate: Boolean, explicitRetry: Boolean = false, retryVersion: Long = 0L) {
-        val next = synchronized(monitor) {
+        synchronized(monitor) {
             if (isRecycled || pages.getOrNull(page.index) !== page) return
             val old = requested
             if (!explicitRetry && old?.page === page && old.translate == translate &&
@@ -235,9 +237,10 @@ internal class OnlineTranslatedPageLoader(
             generation++
             selectedPage = page
             if (explicitRetry) explicitlyStopped.remove(page.index)
-            Request(page, translate, explicitRetry, generation, retryVersion).also { requested = it }
+            val next = Request(page, translate, explicitRetry, generation, retryVersion).also { requested = it }
+            // The non-blocking enqueue must have the same order as the state change.
+            commands.trySend(Command.Select(next))
         }
-        commands.trySend(Command.Select(next))
     }
 
     /** Preserve the visible-page lease while stopping inference; the Stop UI waits for drain. */
@@ -247,20 +250,20 @@ internal class OnlineTranslatedPageLoader(
             selectedPage?.let { explicitlyStopped.add(it.index) }
             generation++
             requested = null
+            commands.trySend(Command.Stop())
         }
-        commands.trySend(Command.Stop())
     }
 
     /** Chapter/reader ownership handoff. A new loader must not infer before this returns. */
     suspend fun stopAndJoin(keepSelection: Boolean = false): Long {
         val done = CompletableDeferred<Unit>()
-        val stoppedGeneration = synchronized(monitor) {
+        val (stoppedGeneration, submitted) = synchronized(monitor) {
             generation++
             requested = null
             if (!keepSelection) selectedPage = null
-            generation
+            generation to commands.trySend(Command.Stop(done, releaseSelection = !keepSelection)).isSuccess
         }
-        if (commands.trySend(Command.Stop(done, releaseSelection = !keepSelection)).isSuccess) {
+        if (submitted) {
             done.await()
         } else {
             controller.join()

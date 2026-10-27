@@ -16,33 +16,41 @@ internal suspend fun <T : Any> runTranslationUntilStopped(
     shouldStop: () -> Boolean,
     discard: (T) -> Unit = {},
     block: suspend () -> T,
-): T? = coroutineScope {
-    if (shouldStop()) return@coroutineScope null
+): T? {
+    // Own a produced result until coroutineScope itself returns successfully. Its final
+    // cancellation check can reject a result after the body and child cleanup have finished.
     var produced: T? = null
     var delivered = false
-    val work = async { block().also { produced = it } }
-    val monitor = launch {
-        while (work.isActive) {
-            if (shouldStop()) {
-                work.cancel()
-                break
+    return try {
+        val result = coroutineScope {
+            if (shouldStop()) return@coroutineScope null
+            val work = async { block().also { produced = it } }
+            val monitor = launch {
+                while (work.isActive) {
+                    if (shouldStop()) {
+                        work.cancel()
+                        break
+                    }
+                    delay(100)
+                }
             }
-            delay(100)
+            try {
+                val value = work.await()
+                currentCoroutineContext().ensureActive()
+                if (shouldStop()) null else value
+            } catch (cancelled: CancellationException) {
+                currentCoroutineContext().ensureActive() // Parent cancellation must propagate.
+                if (shouldStop()) null else throw cancelled
+            } finally {
+                monitor.cancel()
+                withContext(NonCancellable) {
+                    work.cancelAndJoin()
+                    monitor.join()
+                }
+            }
         }
-    }
-    try {
-        val result = work.await()
-        currentCoroutineContext().ensureActive()
-        if (shouldStop()) null else result.also { delivered = true }
-    } catch (cancelled: CancellationException) {
-        currentCoroutineContext().ensureActive() // Parent cancellation must propagate.
-        if (shouldStop()) null else throw cancelled
+        result.also { delivered = it != null }
     } finally {
-        monitor.cancel()
-        withContext(NonCancellable) {
-            work.cancelAndJoin()
-            monitor.join()
-        }
         if (!delivered) produced?.let(discard)
     }
 }

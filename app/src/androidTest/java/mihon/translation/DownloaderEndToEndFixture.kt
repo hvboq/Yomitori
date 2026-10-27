@@ -33,6 +33,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import mihon.testprovider.SafAliasDocumentsProvider
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
@@ -342,33 +343,77 @@ internal class DownloaderEndToEndFixture(
         if (downloadStarted && manager?.isRunning == true) manager?.downloaderStop()
         // Never restore DI while an owned callback could still capture an unrelated production object.
         for (owner in scopeOwners.asReversed()) withTimeout(10_000) { scopeJob(owner).cancelAndJoin() }
-        cachedDescriptorProbe?.close()
-        chapterCache?.let { (field(it, "diskCache") as Closeable).close() }
-        server.close()
-        registration?.close()
-        leases.asReversed().forEach { it.close() }
-        beforeWork?.let {
-            val after = WorkManager.getInstance(target).getWorkInfosForUniqueWork("Downloader").get(5, TimeUnit.SECONDS)
-            assertEquals("DOWNLOADER_E2E_WORKER_NOT_SCHEDULED", it, after.associate { info -> info.id to info.state })
+        var failure: Throwable? = null
+        fun fatal(error: Throwable) = error is VirtualMachineError || error is ThreadDeath || error is LinkageError
+        suspend fun cleanup(action: suspend () -> Unit) {
+            try {
+                action()
+            } catch (error: Throwable) {
+                val previous = failure
+                if (previous == null) {
+                    failure = error
+                } else if (fatal(error) && !fatal(previous)) {
+                    error.addSuppressed(previous)
+                    failure = error
+                } else if (previous !== error) {
+                    previous.addSuppressed(error)
+                }
+            }
+        }
+        cleanup { cachedDescriptorProbe?.close() }
+        cleanup { chapterCache?.let { (field(it, "diskCache") as Closeable).close() } }
+        cleanup { server.close() }
+        cleanup { registration?.close() }
+        leases.asReversed().forEach { lease -> cleanup { lease.close() } }
+        cleanup {
+            beforeWork?.let {
+                val after = WorkManager.getInstance(
+                    target,
+                ).getWorkInfosForUniqueWork("Downloader").get(5, TimeUnit.SECONDS)
+                assertEquals(
+                    "DOWNLOADER_E2E_WORKER_NOT_SCHEDULED",
+                    it,
+                    after.associate { info ->
+                        info.id to info.state
+                    },
+                )
+            }
         }
         // IDs were absent before this exclusive fixture. Cancel only its download notifications.
-        if (notificationsWereAbsent) {
-            val notifications = target.getSystemService(NotificationManager::class.java)
-            downloadNotifications().forEach { notifications.cancel(it) }
-            assertTrue("DOWNLOADER_E2E_NO_DOWNLOAD_NOTIFICATION_LEFT", downloadNotifications().isEmpty())
+        cleanup {
+            if (notificationsWereAbsent) {
+                val notifications = target.getSystemService(NotificationManager::class.java)
+                downloadNotifications().forEach { notifications.cancel(it) }
+                val removed = withTimeoutOrNull(5_000) {
+                    while (downloadNotifications().isNotEmpty()) delay(25)
+                    true
+                } ?: false
+                assertTrue("DOWNLOADER_E2E_NO_DOWNLOAD_NOTIFICATION_LEFT", removed)
+            }
         }
         for (name in preferenceNames) {
-            check(name.startsWith("$prefix-"))
-            check(target.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit())
-            check(target.deleteSharedPreferences(name))
+            cleanup {
+                check(name.startsWith("$prefix-"))
+                check(target.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit())
+            }
+            cleanup {
+                check(name.startsWith("$prefix-"))
+                check(target.deleteSharedPreferences(name))
+            }
         }
-        session?.close()
-        check(root.canonicalFile == root.absoluteFile && root.parentFile.canonicalFile == target.cacheDir.canonicalFile)
-        check(root.name == prefix && root.name.startsWith("downloader-e2e-"))
-        val entries = root.walkTopDown().toList()
-        check(entries.size <= 100 && entries.all { it.canonicalFile == it.absoluteFile })
-        check(root.deleteRecursively() && !root.exists())
-        NativeDiagnosticIdleGuard.requireIdle(target)
+        cleanup { session?.close() }
+        cleanup {
+            check(
+                root.canonicalFile == root.absoluteFile &&
+                    root.parentFile.canonicalFile == target.cacheDir.canonicalFile,
+            )
+            check(root.name == prefix && root.name.startsWith("downloader-e2e-"))
+            val entries = root.walkTopDown().toList()
+            check(entries.size <= 100 && entries.all { it.canonicalFile == it.absoluteFile })
+            check(root.deleteRecursively() && !root.exists())
+        }
+        cleanup { NativeDiagnosticIdleGuard.requireIdle(target) }
+        failure?.let { throw it }
         cleaned = true
     }
 
