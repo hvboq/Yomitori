@@ -411,6 +411,7 @@ class OnlineSelectedPageLoaderTest {
                 pages.forEach { ready(it) }
                 loader.select(pages[0], translate = true)
                 val oldJob = withTimeout(5000) { firstEntered.await() }
+                val reloadAfterCapture = pages[0].reloadFlow.value
                 val old = checkNotNull(loader.resolvePage(pages[0]))
                 val oldDirectory = File(checkNotNull(old.chapterDir.uri.path))
                 loader.select(pages[1], translate = true)
@@ -431,7 +432,7 @@ class OnlineSelectedPageLoaderTest {
                 assertEquals(1, maximum.get())
                 assertEquals(0, active.get())
                 assertNull(loader.resolvePage(pages[1]))
-                assertEquals(0, pages[0].reloadFlow.value)
+                assertEquals(reloadAfterCapture, pages[0].reloadFlow.value)
                 assertEquals(2, checkNotNull(loader.progress.value).pageIndex)
                 assertNotNull(loader.resolvePage(pages[2]))
             } finally {
@@ -565,6 +566,7 @@ class OnlineSelectedPageLoaderTest {
                 ready(page)
                 loader.select(page, translate = true)
                 val ownedJob = withTimeout(5000) { entered.await() }
+                val reloadAfterCapture = page.reloadFlow.value
                 val drained = async(Dispatchers.IO) { loader.stopAndJoin() }
                 await { ownedJob.isCancelled }
                 assertFalse(drained.isCompleted)
@@ -578,7 +580,7 @@ class OnlineSelectedPageLoaderTest {
                 assertTrue(exited.isCompleted)
                 assertEquals(1, calls.get())
                 assertNull(loader.progress.value)
-                assertEquals(0, page.reloadFlow.value)
+                assertEquals(reloadAfterCapture, page.reloadFlow.value)
                 withTimeout(5000) { loader.stopAndJoin() }
             } finally {
                 release.complete(Unit)
@@ -623,6 +625,7 @@ class OnlineSelectedPageLoaderTest {
                     first.loader.select(firstPage, translate = false)
                     await { first.loader.resolvePage(firstPage) != null }
                     OnlineSelectedPageFixture.settled(first.loader)
+                    val reloadAfterCapture = firstPage.reloadFlow.value
                     val stored = checkNotNull(first.loader.resolvePage(firstPage))
                     val directory = File(checkNotNull(stored.chapterDir.uri.path))
                     val manual = async(Dispatchers.IO) {
@@ -673,7 +676,7 @@ class OnlineSelectedPageLoaderTest {
                     assertEquals(1, maximum.get())
                     assertEquals(0, active.get())
                     assertNull(first.loader.progress.value)
-                    assertEquals(0, firstPage.reloadFlow.value)
+                    assertEquals(reloadAfterCapture, firstPage.reloadFlow.value)
                 } finally {
                     release.complete(Unit)
                     firstLoad.cancelAndJoin()

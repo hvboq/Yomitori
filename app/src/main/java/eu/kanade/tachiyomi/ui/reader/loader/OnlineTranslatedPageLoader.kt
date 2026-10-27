@@ -503,11 +503,14 @@ internal class OnlineTranslatedPageLoader(
         }
         if (!valid || !cacheStore.exists(hit.entry)) return@withContext
         val page = hit.page
-        if (page.uri != hit.entry.uri) page.clearOriginalPreview()
+        val authorityChanged = page.uri != hit.entry.uri
+        val replacesReadyImage = authorityChanged && page.status == Page.State.Ready
+        if (authorityChanged) page.clearOriginalPreview()
         page.stream = { cacheStore.open(hit.entry) }
         page.uri = hit.entry.uri
         page.status = Page.State.Ready
-        if (reload) page.reload()
+        // Ready-to-Ready is conflated even when the cached display differs from the HTTP original.
+        if (reload || replacesReadyImage) page.reload()
     }
 
     private suspend fun releaseSelected() = captureMutex.withLock {
