@@ -19,7 +19,7 @@ class HitomiDohDnsTest {
     @Test
     fun `resolver addresses reject private local reserved and IPv6 ULA targets`() {
         listOf(
-            "0.0.0.0", "127.0.0.1", "10.0.0.1", "PRIVATE_VALUE_REMOVED", "169.254.1.1", "172.16.0.1",
+            "0.0.0.0", "127.0.0.1", "10.0.0.1", "100.64.0.1", "169.254.1.1", "172.16.0.1",
             "192.168.1.1", "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "224.0.0.1",
             "255.255.255.255", "::1", "fc00::1", "fd00::1", "fe80::1", "ff02::1", "2001:db8::1",
         ).forEach { HitomiDohDns.isPublicAddress(InetAddress.getByName(it)) shouldBe false }
