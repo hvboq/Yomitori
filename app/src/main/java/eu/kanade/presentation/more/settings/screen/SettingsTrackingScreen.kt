@@ -179,7 +179,10 @@ object SettingsTrackingScreen : SearchableSettings {
                         logout = { dialog = LogoutDialog(trackerManager.hikka) },
                     ),
                     Preference.PreferenceItem.InfoPreference(stringResource(MR.strings.tracking_info)),
-                ),
+                ).filter { preference ->
+                    preference !is Preference.PreferenceItem.TrackerPreference ||
+                        trackerManager.isAvailable(preference.tracker.id)
+                },
             ),
             Preference.PreferenceGroup(
                 title = stringResource(MR.strings.enhanced_services),

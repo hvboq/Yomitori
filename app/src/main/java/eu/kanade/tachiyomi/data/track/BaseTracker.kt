@@ -54,7 +54,8 @@ abstract class BaseTracker(
     }
 
     override val isLoggedIn: Boolean
-        get() = getUsername().isNotEmpty() &&
+        get() = TrackCredentialAvailability.current.isAvailable(id) &&
+            getUsername().isNotEmpty() &&
             getPassword().isNotEmpty()
 
     override val isLoggedInFlow: Flow<Boolean> by lazy {
@@ -62,7 +63,7 @@ abstract class BaseTracker(
             trackPreferences.trackUsername(this).changes(),
             trackPreferences.trackPassword(this).changes(),
         ) { username, password ->
-            username.isNotEmpty() && password.isNotEmpty()
+            TrackCredentialAvailability.current.isAvailable(id) && username.isNotEmpty() && password.isNotEmpty()
         }
     }
 

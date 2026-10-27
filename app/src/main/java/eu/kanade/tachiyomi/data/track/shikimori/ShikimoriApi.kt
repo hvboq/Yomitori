@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.track.shikimori
 
 import android.net.Uri
 import androidx.core.net.toUri
+import eu.kanade.tachiyomi.BuildConfig
 import eu.kanade.tachiyomi.data.database.models.Track
 import eu.kanade.tachiyomi.data.track.model.TrackSearch
 import eu.kanade.tachiyomi.data.track.shikimori.dto.SMAddMangaResponse
@@ -227,8 +228,8 @@ class ShikimoriApi(
 
         private const val REDIRECT_URL = "mihon://shikimori-auth"
 
-        private const val CLIENT_ID = "PB9dq8DzI405s7wdtwTdirYqHiyVMh--djnP7lBUqSA"
-        private const val CLIENT_SECRET = ""
+        private const val CLIENT_ID = BuildConfig.SHIKIMORI_CLIENT_ID
+        private const val CLIENT_SECRET = BuildConfig.SHIKIMORI_CLIENT_SECRET
 
         fun authUrl(): Uri = LOGIN_URL.toUri().buildUpon()
             .appendQueryParameter("client_id", CLIENT_ID)

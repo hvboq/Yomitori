@@ -29,6 +29,34 @@ val yakuyomiKeystore = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
+// Optional tracker application credentials. Never copy upstream credentials into this local file.
+val trackingCredentials = Properties().apply {
+    val f = rootProject.file("api-keys.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+fun String.asBuildConfigString(): String = buildString {
+    append('"')
+    for (character in this@asBuildConfigString) {
+        when (character) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            '\b' -> append("\\b")
+            '\u000C' -> append("\\f")
+            else -> if (character.code < 32 || character.code == 127) {
+                append('\\')
+                append(character.code.toString(8).padStart(3, '0'))
+            } else {
+                append(character)
+            }
+        }
+    }
+    append('"')
+}
+
 // Keep destructive UI fixtures out of both the user's release and normal debug stores.
 val isolatedAudit = providers.gradleProperty("yomitoriIsolatedAudit")
     .map { value ->
@@ -49,14 +77,21 @@ android {
     defaultConfig {
         applicationId = "app.yomitori.yakuyomi"
 
-        versionCode = 116
-        versionName = "0.23.0-yomitori.50"
+        versionCode = 117
+        versionName = "0.23.0-yomitori.51"
 
         buildConfigField("String", "COMMIT_COUNT", "\"${getLatestCommitCount()}\"")
         buildConfigField("String", "COMMIT_SHA", "\"${getLatestCommitSha()}\"")
         buildConfigField("String", "BUILD_TIME", "\"${getBuildTime(useLatestCommitTime = false)}\"")
         buildConfigField("boolean", "TELEMETRY_INCLUDED", "${Config.includeTelemetry}")
         buildConfigField("boolean", "UPDATER_ENABLED", "${Config.enableUpdater}")
+
+        for (tracker in listOf("BANGUMI", "HIKKA", "KITSU", "SHIKIMORI")) {
+            for (credential in listOf("CLIENT_ID", "CLIENT_SECRET")) {
+                val field = "${tracker}_$credential"
+                buildConfigField("String", field, trackingCredentials.getProperty(field, "").asBuildConfigString())
+            }
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.track.hikka
 
 import android.net.Uri
 import androidx.core.net.toUri
+import eu.kanade.tachiyomi.BuildConfig
 import eu.kanade.tachiyomi.data.database.models.Track
 import eu.kanade.tachiyomi.data.track.hikka.dto.HKManga
 import eu.kanade.tachiyomi.data.track.hikka.dto.HKMangaPagination
@@ -187,10 +188,8 @@ class HikkaApi(
         const val BASE_API_URL = "https://api.hikka.io"
         const val BASE_URL = "https://hikka.io"
         private const val SCOPE = "readlist,read:user-details"
-        private const val CLIENT_REFERENCE = "598ef1f5-b9d2-4e66-8b65-06949d5e14fc"
-        private const val CLIENT_SECRET = "" +
-            "61sZs8KECEWVXtMUDtq8QC4t9WX4DwWWYLXEVlgnlUXGT1fWCb-18c" +
-            "Zd2m8Co-8HN6JQcjoP-B"
+        private const val CLIENT_REFERENCE = BuildConfig.HIKKA_CLIENT_ID
+        private const val CLIENT_SECRET = BuildConfig.HIKKA_CLIENT_SECRET
 
         fun authUrl(): Uri = "$BASE_URL/oauth".toUri().buildUpon()
             .appendQueryParameter("reference", CLIENT_REFERENCE)

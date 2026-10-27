@@ -177,7 +177,7 @@ object AboutScreen : Screen() {
                         LinkIcon(
                             label = "GitHub",
                             icon = CustomIcons.Github,
-                            url = "https://github.com/joyeli/Yakuyomi",
+                            url = "https://github.com/hvboq/Yomitori",
                         )
                         // 基於 mihon（Apache-2.0）：保留原專案歸屬連結。
                         LinkIcon(

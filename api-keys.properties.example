@@ -1,0 +1,13 @@
+# Optional credentials for applications you register with each tracking provider.
+# Copy to api-keys.properties (ignored by Git). Missing/blank pairs disable that tracker.
+# Configured values are embedded in your APK; keep all values blank in public builds.
+# HIKKA_CLIENT_ID is Hikka's application client reference.
+# This file does not configure the reader's translation server or its user-entered API key.
+BANGUMI_CLIENT_ID=
+BANGUMI_CLIENT_SECRET=
+HIKKA_CLIENT_ID=
+HIKKA_CLIENT_SECRET=
+KITSU_CLIENT_ID=
+KITSU_CLIENT_SECRET=
+SHIKIMORI_CLIENT_ID=
+SHIKIMORI_CLIENT_SECRET=

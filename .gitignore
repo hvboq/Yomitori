@@ -16,6 +16,8 @@ local.properties
 # macOS specific files
 .DS_Store
 api-keys.properties
+# Optional local telemetry configuration; never publish service credentials.
+app/google-services.json
 # Release signing (keep secret — never commit)
 keystore.properties
 *.jks

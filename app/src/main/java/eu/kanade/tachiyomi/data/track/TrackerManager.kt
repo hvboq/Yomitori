@@ -18,23 +18,26 @@ class TrackerManager {
     companion object {
         const val ANILIST = 2L
         const val KITSU = 3L
+        const val SHIKIMORI = 4L
+        const val BANGUMI = 5L
         const val KAVITA = 8L
+        const val HIKKA = 10L
         const val MANGABAKA = 11L
     }
 
     val myAnimeList = MyAnimeList(1L)
     val aniList = Anilist(ANILIST)
     val kitsu = Kitsu(KITSU)
-    val shikimori = Shikimori(4L)
-    val bangumi = Bangumi(5L)
+    val shikimori = Shikimori(SHIKIMORI)
+    val bangumi = Bangumi(BANGUMI)
     val komga = Komga(6L)
     val mangaUpdates = MangaUpdates(7L)
     val kavita = Kavita(KAVITA)
     val suwayomi = Suwayomi(9L)
-    val hikka = Hikka(10L)
+    val hikka = Hikka(HIKKA)
     val mangaBaka = MangaBaka(MANGABAKA)
 
-    val trackers = listOf(
+    private val allTrackers = listOf(
         myAnimeList,
         aniList,
         kitsu,
@@ -48,6 +51,11 @@ class TrackerManager {
         mangaBaka,
     )
 
+    // Keep the full registry for saved records and backup validation, even when login is unavailable.
+    val trackers = allTrackers.filter { isAvailable(it.id) }
+
+    fun isAvailable(id: Long): Boolean = TrackCredentialAvailability.current.isAvailable(id)
+
     fun loggedInTrackers() = trackers.filter { it.isLoggedIn }
 
     fun loggedInTrackersFlow() = combine(trackers.map { it.isLoggedInFlow }) {
@@ -56,7 +64,7 @@ class TrackerManager {
         }
     }
 
-    fun get(id: Long) = trackers.find { it.id == id }
+    fun get(id: Long) = allTrackers.find { it.id == id }
 
-    fun getAll(ids: Set<Long>) = trackers.filter { it.id in ids }
+    fun getAll(ids: Set<Long>) = allTrackers.filter { it.id in ids }
 }

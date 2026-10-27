@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.ui.setting.track
 
 import android.net.Uri
 import androidx.lifecycle.lifecycleScope
+import eu.kanade.tachiyomi.data.track.TrackerManager
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
@@ -44,6 +45,7 @@ class TrackLoginActivity : BaseOAuthLoginActivity() {
     }
 
     private suspend fun handleBangumi(code: String?) {
+        if (!trackerManager.isAvailable(TrackerManager.BANGUMI)) return
         if (code != null) {
             trackerManager.bangumi.login(code)
         } else {
@@ -76,6 +78,7 @@ class TrackLoginActivity : BaseOAuthLoginActivity() {
     }
 
     private suspend fun handleShikimori(code: String?) {
+        if (!trackerManager.isAvailable(TrackerManager.SHIKIMORI)) return
         if (code != null) {
             trackerManager.shikimori.login(code)
         } else {
@@ -84,6 +87,7 @@ class TrackLoginActivity : BaseOAuthLoginActivity() {
     }
 
     private suspend fun handleHikka(reference: String?) {
+        if (!trackerManager.isAvailable(TrackerManager.HIKKA)) return
         if (reference != null) {
             trackerManager.hikka.login(reference)
         } else {
